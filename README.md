@@ -243,23 +243,3 @@ Important Security Notes ⚠️
 2. Rotate your tokens if accidentally exposed
 3. Use environment variables on all hosting platforms
 4. Keep your OWNER_ID and ADMIN_ID private
-
-Quick Setup Command
-
-Here's a one-liner to create the repository structure:
-
-```bash
-# Create directory structure
-mkdir -p universal-file-host-bot/{src,.github/workflows}
-cd universal-file-host-bot
-
-# Move your main.py to src/
-cp /path/to/your/main.py src/
-
-# Create all the configuration files (as shown above)
-# Then initialize git
-git init
-git add .
-git commit -m "Initial commit"
-gh repo create universal-file-host-bot --public --source=. --remote=origin --push
-```
