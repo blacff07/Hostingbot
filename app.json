@@ -1,0 +1,42 @@
+{
+  "name": "Universal File Host Bot",
+  "description": "Telegram bot for hosting files and executing code in 30+ languages",
+  "repository": "https://github.com/YOUR_USERNAME/universal-file-host-bot",
+  "logo": "https://raw.githubusercontent.com/YOUR_USERNAME/universal-file-host-bot/main/logo.png",
+  "keywords": ["telegram", "bot", "file-hosting", "code-execution", "python"],
+  "env": {
+    "TELEGRAM_BOT_TOKEN": {
+      "description": "Your Telegram Bot Token from @BotFather",
+      "required": true
+    },
+    "OWNER_ID": {
+      "description": "Your Telegram User ID (owner)",
+      "required": true
+    },
+    "ADMIN_ID": {
+      "description": "Admin Telegram User ID",
+      "required": true
+    },
+    "BOT_USERNAME": {
+      "description": "Your bot's username (with @)",
+      "required": true,
+      "value": "@YourBotUsername"
+    },
+    "UPDATE_CHANNEL": {
+      "description": "Telegram channel for updates",
+      "required": false,
+      "value": "https://t.me/YourChannel"
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "formation": {
+    "bot": {
+      "quantity": 1,
+      "size": "free"
+    }
+  }
+}
