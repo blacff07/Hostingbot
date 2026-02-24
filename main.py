@@ -103,12 +103,12 @@ def keep_alive():
     t.start()
     print("🌐 Flask Keep-Alive server started.")
 
-# --- Configuration ---
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'Put Your Token Here Don't Put token before this')
-OWNER_ID = int(os.getenv('OWNER_ID', '6350914711'))
-ADMIN_ID = int(os.getenv('ADMIN_ID', '6350914711'))
-YOUR_USERNAME = os.getenv('BOT_USERNAME', '@UnknownGuy6666')
-UPDATE_CHANNEL = os.getenv('UPDATE_CHANNEL', 'https://t.me/CyberTricks_X')
+# CONFIGURATION
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'Put Your Token Here')
+OWNER_ID = int(os.getenv('OWNER_ID', '8637611080,8306709243'))
+ADMIN_ID = int(os.getenv('ADMIN_ID', '8637611080,8306709243'))
+YOUR_USERNAME = os.getenv('BOT_USERNAME', '@NotBlac')
+UPDATE_CHANNEL = os.getenv('UPDATE_CHANNEL', 'https://t.me/BlacScriptz')
 
 # Enhanced folder setup
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
