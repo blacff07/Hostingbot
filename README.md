@@ -26,11 +26,11 @@ Click any of the buttons above to deploy instantly!
 
 ### Manual Deployment
 
-1. **Clone the repository**
+**Clone the repository**
    ```bash
    git clone https://github.com/YOUR_USERNAME/universal-file-host-bot.git
    cd universal-file-host-bot
-```
+   ```
 
 1. Install dependencies
    ```bash
