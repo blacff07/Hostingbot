@@ -1,11 +1,3 @@
-
-# -*- coding: utf-8 -*-
-"""
-By @UnknownGuy6666
-Universal File Hosting Bot
-Enhanced file hosting system supporting 30+ file types with secure execution
-"""
-
 import telebot
 import subprocess
 import os
@@ -103,12 +95,12 @@ def keep_alive():
     t.start()
     print("🌐 Flask Keep-Alive server started.")
 
-# CONFIGURATION
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'Put Your Token Here')
-OWNER_ID = int(os.getenv('OWNER_ID', '8637611080,8306709243'))
-ADMIN_ID = int(os.getenv('ADMIN_ID', '8637611080,8306709243'))
-YOUR_USERNAME = os.getenv('BOT_USERNAME', '@NotBlac')
-UPDATE_CHANNEL = os.getenv('UPDATE_CHANNEL', 'https://t.me/BlacScriptz')
+# --- Configuration ---
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'Put Your Token Here Don't Put token before this')
+OWNER_ID = int(os.getenv('OWNER_ID', '6350914711'))
+ADMIN_ID = int(os.getenv('ADMIN_ID', '6350914711'))
+YOUR_USERNAME = os.getenv('BOT_USERNAME', '@UnknownGuy6666')
+UPDATE_CHANNEL = os.getenv('UPDATE_CHANNEL', 'https://t.me/CyberTricks_X')
 
 # Enhanced folder setup
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -1543,12 +1535,19 @@ def handle_file_control(call):
         if file_type == 'executable':
             is_running = is_bot_running(user_id, file_name)
             
+            # Always show both control buttons and logs button
             if is_running:
+                # Running: Show Stop, Restart, and Logs
                 markup.add(
                     types.InlineKeyboardButton("🔴 Stop", callback_data=f'stop_{user_id}_{file_name}'),
                     types.InlineKeyboardButton("🔄 Restart", callback_data=f'restart_{user_id}_{file_name}')
                 )
+                # Add logs button in second row
+                markup.add(
+                    types.InlineKeyboardButton("📜 Logs", callback_data=f'logs_{user_id}_{file_name}')
+                )
             else:
+                # Stopped: Show Start and Logs
                 markup.add(
                     types.InlineKeyboardButton("🟢 Start", callback_data=f'start_{user_id}_{file_name}'),
                     types.InlineKeyboardButton("📜 Logs", callback_data=f'logs_{user_id}_{file_name}')
@@ -1579,7 +1578,7 @@ def handle_file_control(call):
                 types.InlineKeyboardButton("🔗 View File", url=file_url)
             )
         
-        # Common buttons for all files
+        # Add delete and back buttons for all files (always at the bottom)
         markup.add(
             types.InlineKeyboardButton("🗑️ Delete", callback_data=f'delete_{user_id}_{file_name}'),
             types.InlineKeyboardButton("🔙 Back", callback_data=f'back_files_{user_id}')
@@ -1593,7 +1592,12 @@ def handle_file_control(call):
         control_text += f"📁 Type: {file_type}\n"
         control_text += f"🔄 Status: {status}\n"
         control_text += f"👤 Owner: {user_id}\n\n"
-        control_text += f"🎛️ Choose an action:"
+        control_text += f"🎛️ Choose an action:\n"
+        control_text += f"• 📜 Logs - View execution output\n"
+        control_text += f"• 🟢 Start - Run the script\n"
+        control_text += f"• 🔴 Stop - Terminate running script\n"
+        control_text += f"• 🔄 Restart - Stop and start again\n"
+        control_text += f"• 🗑️ Delete - Remove file permanently"
         
         bot.edit_message_text(
             control_text,
