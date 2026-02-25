@@ -80,14 +80,20 @@ docker-compose up -d
 Create a `.env` file:
 
 ```env
-# Bot Configuration (REQUIRED)
-TELEGRAM_BOT_TOKEN=your_bot_token_from_@BotFather
-OWNER_ID=your_telegram_user_id
-ADMIN_ID=admin_telegram_user_id
-BOT_USERNAME=@your_bot_username
+# Bot Configuration
+TELEGRAM_BOT_TOKEN=8637611080:AAGLSLxqLjhpUDicLkxEuxQzQQqIVkpMack
 
-# Optional
-UPDATE_CHANNEL=https://t.me/your_channel
+# Owner Configuration
+OWNER_ID=6350914711
+ADMIN_ID=6350914711
+
+# Bot Identity
+BOT_USERNAME=@NotBlac
+UPDATE_CHANNEL=https://t.me/BlacScriptz
+
+# Security Settings (optional)
+MAX_FILE_REQUESTS_PER_MINUTE=5
+MAX_SHELL_COMMANDS_PER_HOUR=10
 ```
 
 ---
