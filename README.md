@@ -243,3 +243,9 @@ Important Security Notes ⚠️
 2. Rotate your tokens if accidentally exposed
 3. Use environment variables on all hosting platforms
 4. Keep your OWNER_ID and ADMIN_ID private
+
+## 👤 Author
+
+**@NotBlac**
+- Telegram: [@NotBlac](https://t.me/NotBlac)
+- Channel: [@BlacScriptz](https://t.me/BlacScriptz)
