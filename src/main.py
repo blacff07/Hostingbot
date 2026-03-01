@@ -96,7 +96,7 @@ def keep_alive():
     print("🌐 Flask Keep-Alive server started.")
 
 # --- Configuration ---
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'Put Your Token Here Don't Put token before this')
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'Put Your Token Here')
 OWNER_ID = int(os.getenv('OWNER_ID', '6350914711'))
 ADMIN_ID = int(os.getenv('ADMIN_ID', '6350914711'))
 YOUR_USERNAME = os.getenv('BOT_USERNAME', '@UnknownGuy6666')
