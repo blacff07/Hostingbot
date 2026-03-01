@@ -97,10 +97,10 @@ def keep_alive():
 
 # --- Configuration ---
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'Put Your Token Here')
-OWNER_ID = int(os.getenv('OWNER_ID', '6350914711'))
-ADMIN_ID = int(os.getenv('ADMIN_ID', '6350914711'))
-YOUR_USERNAME = os.getenv('BOT_USERNAME', '@UnknownGuy6666')
-UPDATE_CHANNEL = os.getenv('UPDATE_CHANNEL', 'https://t.me/CyberTricks_X')
+OWNER_ID = int(os.getenv('OWNER_ID', '8537538760'))
+ADMIN_ID = int(os.getenv('ADMIN_ID', '8537538760'))
+YOUR_USERNAME = os.getenv('BOT_USERNAME', '@NotBlac')
+UPDATE_CHANNEL = os.getenv('UPDATE_CHANNEL', 'https://t.me/BlacScriptz')
 
 # Enhanced folder setup
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -670,6 +670,9 @@ def execute_script(user_id, script_path, message_for_updates=None):
                 'language': lang_info['name'],
                 'icon': lang_info['icon']
             }
+
+            # Log success
+            logger.info(f"Script started: {script_key} with PID {process.pid}")
 
             # Success message
             if message_for_updates:
@@ -1501,6 +1504,51 @@ def clone_bot_button(message):
 
     safe_reply_to(message, clone_text)
 
+# --- Helper for building file control markup ---
+def build_file_control_markup(user_id, file_name, file_type):
+    """Return inline keyboard markup for a file's control panel."""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+
+    if file_type == 'executable':
+        is_running = is_bot_running(user_id, file_name)
+
+        if is_running:
+            markup.add(
+                types.InlineKeyboardButton("🔴 Stop", callback_data=f'stop_{user_id}_{file_name}'),
+                types.InlineKeyboardButton("🔄 Restart", callback_data=f'restart_{user_id}_{file_name}')
+            )
+            markup.add(
+                types.InlineKeyboardButton("📜 Logs", callback_data=f'logs_{user_id}_{file_name}')
+            )
+        else:
+            markup.add(
+                types.InlineKeyboardButton("🟢 Start", callback_data=f'start_{user_id}_{file_name}'),
+                types.InlineKeyboardButton("📜 Logs", callback_data=f'logs_{user_id}_{file_name}')
+            )
+    else:
+        # Hosted files
+        file_hash = hashlib.md5(f"{user_id}_{file_name}".encode()).hexdigest()
+        domain = os.environ.get('REPL_SLUG', 'universal-file-host')
+        owner = os.environ.get('REPL_OWNER', 'replit-user')
+        try:
+            replit_url = f"https://{domain}.{owner}.repl.co"
+            test_response = requests.get(f"{replit_url}/health", timeout=2)
+            if test_response.status_code != 200:
+                replit_url = f"https://{domain}-{owner}.replit.app"
+        except:
+            replit_url = f"https://{domain}-{owner}.replit.app"
+        file_url = f"{replit_url}/file/{file_hash}"
+        markup.add(
+            types.InlineKeyboardButton("🔗 View File", url=file_url)
+        )
+
+    # Delete and Back buttons for all files
+    markup.add(
+        types.InlineKeyboardButton("🗑️ Delete", callback_data=f'delete_{user_id}_{file_name}'),
+        types.InlineKeyboardButton("🔙 Back", callback_data=f'back_files_{user_id}')
+    )
+    return markup
+
 # --- Inline Button Callback Handlers ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith('control_'))
 def handle_file_control(call):
@@ -1529,63 +1577,14 @@ def handle_file_control(call):
 
         file_name, file_type = file_info
 
-        # Create control buttons based on file type
-        markup = types.InlineKeyboardMarkup(row_width=2)
+        # Get markup using helper
+        markup = build_file_control_markup(user_id, file_name, file_type)
 
+        # Determine status text
         if file_type == 'executable':
-            is_running = is_bot_running(user_id, file_name)
-
-            # Always show both control buttons and logs button
-            if is_running:
-                # Running: Show Stop, Restart, and Logs
-                markup.add(
-                    types.InlineKeyboardButton("🔴 Stop", callback_data=f'stop_{user_id}_{file_name}'),
-                    types.InlineKeyboardButton("🔄 Restart", callback_data=f'restart_{user_id}_{file_name}')
-                )
-                # Add logs button in second row
-                markup.add(
-                    types.InlineKeyboardButton("📜 Logs", callback_data=f'logs_{user_id}_{file_name}')
-                )
-            else:
-                # Stopped: Show Start and Logs
-                markup.add(
-                    types.InlineKeyboardButton("🟢 Start", callback_data=f'start_{user_id}_{file_name}'),
-                    types.InlineKeyboardButton("📜 Logs", callback_data=f'logs_{user_id}_{file_name}')
-                )
+            status = "🟢 Running" if is_bot_running(user_id, file_name) else "⭕ Stopped"
         else:
-            # For hosted files, show access link
-            file_hash = hashlib.md5(f"{user_id}_{file_name}".encode()).hexdigest()
-
-            # Get the current domain from environment or use default
-            domain = os.environ.get('REPL_SLUG', 'universal-file-host')
-            owner = os.environ.get('REPL_OWNER', 'replit-user')
-
-            # Try different URL formats
-            try:
-                replit_url = f"https://{domain}.{owner}.repl.co"
-                # Test if we can access our own health endpoint
-                test_response = requests.get(f"{replit_url}/health", timeout=2)
-                if test_response.status_code != 200:
-                    # Fallback to .replit.app domain
-                    replit_url = f"https://{domain}-{owner}.replit.app"
-            except:
-                # Use default replit.app domain
-                replit_url = f"https://{domain}-{owner}.replit.app"
-
-            file_url = f"{replit_url}/file/{file_hash}"
-
-            markup.add(
-                types.InlineKeyboardButton("🔗 View File", url=file_url)
-            )
-
-        # Add delete and back buttons for all files (always at the bottom)
-        markup.add(
-            types.InlineKeyboardButton("🗑️ Delete", callback_data=f'delete_{user_id}_{file_name}'),
-            types.InlineKeyboardButton("🔙 Back", callback_data=f'back_files_{user_id}')
-        )
-
-        # Show file details
-        status = "🟢 Running" if file_type == 'executable' and is_bot_running(user_id, file_name) else "⭕ Stopped" if file_type == 'executable' else "📁 Hosted"
+            status = "📁 Hosted"
 
         control_text = f"🔧 File Control Panel\n\n"
         control_text += f"📄 File: {file_name}\n"
@@ -1625,7 +1624,6 @@ def handle_start_file(call):
             bot.answer_callback_query(call.id, "🚫 Access denied!")
             return
 
-        # Get file path
         user_folder = get_user_folder(user_id)
         file_path = os.path.join(user_folder, file_name)
 
@@ -1633,19 +1631,39 @@ def handle_start_file(call):
             bot.answer_callback_query(call.id, "❌ File not found!")
             return
 
-        # Check if already running
         if is_bot_running(user_id, file_name):
             bot.answer_callback_query(call.id, "⚠️ Already running!")
             return
 
-        # Start the script
+        # Execute the script
         success, result = execute_script(user_id, file_path)
 
         if success:
             bot.answer_callback_query(call.id, "🟢 Started successfully!")
-            # Refresh the control panel
-            call.data = f'control_{user_id}_{file_name}'
-            handle_file_control(call)
+            # Small delay to ensure process is registered
+            time.sleep(0.5)
+            # Refresh the control panel manually
+            file_type = 'executable'  # We know it's executable because start button exists
+            markup = build_file_control_markup(user_id, file_name, file_type)
+            status = "🟢 Running" if is_bot_running(user_id, file_name) else "⭕ Stopped"
+            control_text = f"🔧 File Control Panel\n\n"
+            control_text += f"📄 File: {file_name}\n"
+            control_text += f"📁 Type: {file_type}\n"
+            control_text += f"🔄 Status: {status}\n"
+            control_text += f"👤 Owner: {user_id}\n\n"
+            control_text += f"🎛️ Choose an action:\n"
+            control_text += f"• 📜 Logs - View execution output\n"
+            control_text += f"• 🟢 Start - Run the script\n"
+            control_text += f"• 🔴 Stop - Terminate running script\n"
+            control_text += f"• 🔄 Restart - Stop and start again\n"
+            control_text += f"• 🗑️ Delete - Remove file permanently"
+
+            bot.edit_message_text(
+                control_text,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=markup
+            )
         else:
             bot.answer_callback_query(call.id, f"❌ Start failed: {result}")
 
@@ -1679,8 +1697,27 @@ def handle_stop_file(call):
 
                 bot.answer_callback_query(call.id, "🔴 Stopped successfully!")
                 # Refresh the control panel
-                call.data = f'control_{user_id}_{file_name}'
-                handle_file_control(call)
+                time.sleep(0.5)
+                markup = build_file_control_markup(user_id, file_name, 'executable')
+                status = "⭕ Stopped"
+                control_text = f"🔧 File Control Panel\n\n"
+                control_text += f"📄 File: {file_name}\n"
+                control_text += f"📁 Type: executable\n"
+                control_text += f"🔄 Status: {status}\n"
+                control_text += f"👤 Owner: {user_id}\n\n"
+                control_text += f"🎛️ Choose an action:\n"
+                control_text += f"• 📜 Logs - View execution output\n"
+                control_text += f"• 🟢 Start - Run the script\n"
+                control_text += f"• 🔴 Stop - Terminate running script\n"
+                control_text += f"• 🔄 Restart - Stop and start again\n"
+                control_text += f"• 🗑️ Delete - Remove file permanently"
+
+                bot.edit_message_text(
+                    control_text,
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    reply_markup=markup
+                )
             except Exception as e:
                 bot.answer_callback_query(call.id, f"❌ Stop failed: {str(e)}")
         else:
@@ -1725,9 +1762,27 @@ def handle_restart_file(call):
 
             if success:
                 bot.answer_callback_query(call.id, "🔄 Restarted successfully!")
-                # Refresh the control panel
-                call.data = f'control_{user_id}_{file_name}'
-                handle_file_control(call)
+                time.sleep(0.5)
+                markup = build_file_control_markup(user_id, file_name, 'executable')
+                status = "🟢 Running"
+                control_text = f"🔧 File Control Panel\n\n"
+                control_text += f"📄 File: {file_name}\n"
+                control_text += f"📁 Type: executable\n"
+                control_text += f"🔄 Status: {status}\n"
+                control_text += f"👤 Owner: {user_id}\n\n"
+                control_text += f"🎛️ Choose an action:\n"
+                control_text += f"• 📜 Logs - View execution output\n"
+                control_text += f"• 🟢 Start - Run the script\n"
+                control_text += f"• 🔴 Stop - Terminate running script\n"
+                control_text += f"• 🔄 Restart - Stop and start again\n"
+                control_text += f"• 🗑️ Delete - Remove file permanently"
+
+                bot.edit_message_text(
+                    control_text,
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    reply_markup=markup
+                )
             else:
                 bot.answer_callback_query(call.id, f"❌ Restart failed: {result}")
         else:
