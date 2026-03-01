@@ -1539,6 +1539,7 @@ def handle_file_control(call):
                 markup.add(
                     types.InlineKeyboardButton("🔴 Stop", callback_data=f'stop_{user_id}_{file_name}'),
                     types.InlineKeyboardButton("🔄 Restart", callback_data=f'restart_{user_id}_{file_name}')
+                    types.InlineKeyboardButton("📜 Logs", callback_data=f'logs_{user_id}_{file_name}')
                 )
             else:
                 markup.add(
