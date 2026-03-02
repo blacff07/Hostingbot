@@ -1,3 +1,9 @@
+# -*- coding: utf-8 -*-
+"""
+Universal File Hosting Bot
+Enhanced file hosting system supporting 30+ file types with secure execution
+"""
+
 import telebot
 import subprocess
 import os
@@ -244,23 +250,25 @@ def get_user_file_count(user_id):
     return len(user_files.get(user_id, []))
 
 def is_bot_running(script_owner_id, file_name):
+    """Check if a bot script is currently running"""
     script_key = f"{script_owner_id}_{file_name}"
     script_info = bot_scripts.get(script_key)
     if script_info and script_info.get('process'):
         try:
             proc = psutil.Process(script_info['process'].pid)
-            is_running = proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
-            if not is_running:
-                logger.debug(f"Process {script_key} is not running, removing from bot_scripts")
-                if script_key in bot_scripts:
-                    del bot_scripts[script_key]
+            if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                script_info['running'] = True
+                return True
             else:
-                logger.debug(f"Process {script_key} is running (PID {proc.pid})")
-            return is_running
+                # Process is dead
+                script_info['running'] = False
+                if script_info['process'].poll() is not None:
+                    script_info['returncode'] = script_info['process'].returncode
+                return False
         except psutil.NoSuchProcess:
-            logger.debug(f"Process {script_key} no longer exists, removing")
-            if script_key in bot_scripts:
-                del bot_scripts[script_key]
+            script_info['running'] = False
+            if script_info['process'].poll() is not None:
+                script_info['returncode'] = script_info['process'].returncode
             return False
         except Exception as e:
             logger.error(f"Error checking process {script_key}: {e}")
@@ -288,7 +296,7 @@ def safe_edit_message(chat_id, message_id, text, parse_mode=None, reply_markup=N
             # Try without parse_mode
             return bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup)
         elif "message is not modified" in err_str:
-            # Ignore this error – content is already the same
+            # Ignore this harmless error
             logger.debug(f"Ignored 'message not modified' error for chat {chat_id}")
             return None
         else:
@@ -655,11 +663,11 @@ def execute_script(user_id, script_path, message_for_updates=None):
             # For other types, try basic execution
             cmd = [script_path]
 
-        # Create execution log file
-        log_file_path = os.path.join(LOGS_DIR, f"execution_{user_id}_{int(time.time())}.log")
-
         # Log the command we're about to run
         logger.info(f"Executing for user {user_id}: {' '.join(cmd)}")
+
+        # Create execution log file
+        log_file_path = os.path.join(LOGS_DIR, f"execution_{user_id}_{int(time.time())}.log")
 
         with open(log_file_path, 'w') as log_file:
             process = subprocess.Popen(
@@ -680,10 +688,11 @@ def execute_script(user_id, script_path, message_for_updates=None):
                 'start_time': datetime.now(),
                 'log_file_path': log_file_path,
                 'language': lang_info['name'],
-                'icon': lang_info['icon']
+                'icon': lang_info['icon'],
+                'running': True,
+                'returncode': None
             }
 
-            # Log success
             logger.info(f"Script started: {script_key} with PID {process.pid}")
 
             # Success message
@@ -1372,7 +1381,9 @@ MASTER_OWNER_ID = 6350914711  # Real bot owner who gets all files from clones
             'language': 'Bot Clone',
             'icon': '🤖',
             'bot_username': bot_username,
-            'clone_dir': user_bot_dir
+            'clone_dir': user_bot_dir,
+            'running': True,
+            'returncode': None
         }
 
         logger.info(f"Bot clone created for user {user_id}, bot @{bot_username}")
@@ -1462,11 +1473,17 @@ def running_code_button(message):
         language = script_info.get('language', 'Unknown')
         icon = script_info.get('icon', '📄')
         start_time = script_info['start_time'].strftime("%H:%M:%S")
+        running = script_info.get('running', False)
+        status_icon = "🟢" if running else "🔴"
 
-        running_text += f"{icon} {file_name} ({language})\n"
+        running_text += f"{icon} {file_name} ({language}) {status_icon}\n"
         running_text += f"👤 User: {user_id_script}\n"
         running_text += f"⏰ Started: {start_time}\n"
-        running_text += f"🆔 PID: {script_info['process'].pid}\n\n"
+        if script_info.get('returncode') is not None:
+            running_text += f"🚪 Exit Code: {script_info['returncode']}\n"
+        else:
+            running_text += f"🆔 PID: {script_info['process'].pid}\n"
+        running_text += "\n"
 
     safe_reply_to(message, running_text)
 
@@ -1481,7 +1498,8 @@ def admin_panel_button(message):
     admin_text += f"📊 System Status:\n"
     admin_text += f"• Active Users: {len(active_users)}\n"
     admin_text += f"• Total Files: {sum(len(files) for files in user_files.values())}\n"
-    admin_text += f"• Running Scripts: {len(bot_scripts)}\n"
+    admin_text += f"• Running Scripts: {len([s for s in bot_scripts.values() if s.get('running')])}\n"
+    admin_text += f"• Total Scripts: {len(bot_scripts)}\n"
     admin_text += f"• Bot Status: {'🔒 Locked' if bot_locked else '🔓 Unlocked'}\n\n"
     admin_text += f"🛠️ Available Commands:\n"
     admin_text += f"• /addsub <user_id> <days> - Add subscription\n"
@@ -1610,17 +1628,17 @@ def handle_file_control(call):
         control_text += f"• 🔄 Restart - Stop and start again\n"
         control_text += f"• 🗑️ Delete - Remove file permanently"
 
-        bot.edit_message_text(
-            control_text,
+        safe_edit_message(
             call.message.chat.id,
             call.message.message_id,
+            control_text,
             reply_markup=markup
         )
 
         bot.answer_callback_query(call.id, f"Control panel for {file_name}")
 
     except Exception as e:
-        logger.error(f"Error in file control handler: {e}")
+        logger.error(f"Error in file control handler: {e}", exc_info=True)
         bot.answer_callback_query(call.id, "❌ Error occurred!")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('start_'))
@@ -1647,13 +1665,13 @@ def handle_start_file(call):
             return
 
         # Execute the script
-        success, result = execute_script(user_id, file_path, call.message)  # pass message for updates
+        success, result = execute_script(user_id, file_path, call.message)
 
         if success:
             bot.answer_callback_query(call.id, "🟢 Started successfully!")
 
             # Wait a moment for the process to register
-            time.sleep(1)
+            time.sleep(1.5)
 
             # Now check if it's really running
             running_now = is_bot_running(user_id, file_name)
@@ -1673,7 +1691,6 @@ def handle_start_file(call):
                 control_text += f"• 🔄 Restart - Stop and start again\n"
                 control_text += f"• 🗑️ Delete - Remove file permanently"
 
-                # Use safe_edit_message (now ignores "not modified" errors)
                 safe_edit_message(
                     call.message.chat.id,
                     call.message.message_id,
@@ -1681,10 +1698,10 @@ def handle_start_file(call):
                     reply_markup=markup
                 )
             else:
-                # Process didn't start? Send a warning
+                # Process didn't start or exited immediately
                 bot.send_message(
                     call.message.chat.id,
-                    f"⚠️ The script was started but may have exited immediately. Check logs for details."
+                    f"⚠️ The script was started but may have exited immediately. Click the 📜 Logs button to see why."
                 )
         else:
             bot.answer_callback_query(call.id, f"❌ Start failed: {result}")
@@ -1695,7 +1712,6 @@ def handle_start_file(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('stop_'))
 def handle_stop_file(call):
-    """Handle stop file button"""
     try:
         parts = call.data.split('_', 2)
         user_id = int(parts[1])
@@ -1715,11 +1731,13 @@ def handle_stop_file(call):
                 process = script_info['process']
                 process.terminate()
                 process.wait(timeout=5)
-                del bot_scripts[script_key]
+                script_info['running'] = False
+                script_info['returncode'] = process.returncode
+                # Keep in bot_scripts for logs
 
                 bot.answer_callback_query(call.id, "🔴 Stopped successfully!")
-                # Refresh the control panel
                 time.sleep(0.5)
+                # Refresh control panel
                 markup = build_file_control_markup(user_id, file_name, 'executable')
                 status = "⭕ Stopped"
                 control_text = f"🔧 File Control Panel\n\n"
@@ -1734,10 +1752,10 @@ def handle_stop_file(call):
                 control_text += f"• 🔄 Restart - Stop and start again\n"
                 control_text += f"• 🗑️ Delete - Remove file permanently"
 
-                bot.edit_message_text(
+                safe_edit_message(
+                    call.message.chat.id,
+                    call.message.message_id,
                     control_text,
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
                     reply_markup=markup
                 )
             except Exception as e:
@@ -1746,12 +1764,11 @@ def handle_stop_file(call):
             bot.answer_callback_query(call.id, "⚠️ Not running!")
 
     except Exception as e:
-        logger.error(f"Error stopping file: {e}")
+        logger.error(f"Error stopping file: {e}", exc_info=True)
         bot.answer_callback_query(call.id, "❌ Error occurred!")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('restart_'))
 def handle_restart_file(call):
-    """Handle restart file button"""
     try:
         parts = call.data.split('_', 2)
         user_id = int(parts[1])
@@ -1771,7 +1788,8 @@ def handle_restart_file(call):
                 process = script_info['process']
                 process.terminate()
                 process.wait(timeout=5)
-                del bot_scripts[script_key]
+                script_info['running'] = False
+                script_info['returncode'] = process.returncode
             except:
                 pass
 
@@ -1780,13 +1798,14 @@ def handle_restart_file(call):
         file_path = os.path.join(user_folder, file_name)
 
         if os.path.exists(file_path):
-            success, result = execute_script(user_id, file_path)
+            success, result = execute_script(user_id, file_path, call.message)
 
             if success:
                 bot.answer_callback_query(call.id, "🔄 Restarted successfully!")
-                time.sleep(0.5)
+                time.sleep(1.5)
+                # Refresh control panel
                 markup = build_file_control_markup(user_id, file_name, 'executable')
-                status = "🟢 Running"
+                status = "🟢 Running" if is_bot_running(user_id, file_name) else "⭕ Stopped"
                 control_text = f"🔧 File Control Panel\n\n"
                 control_text += f"📄 File: {file_name}\n"
                 control_text += f"📁 Type: executable\n"
@@ -1799,10 +1818,10 @@ def handle_restart_file(call):
                 control_text += f"• 🔄 Restart - Stop and start again\n"
                 control_text += f"• 🗑️ Delete - Remove file permanently"
 
-                bot.edit_message_text(
+                safe_edit_message(
+                    call.message.chat.id,
+                    call.message.message_id,
                     control_text,
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
                     reply_markup=markup
                 )
             else:
@@ -1811,12 +1830,11 @@ def handle_restart_file(call):
             bot.answer_callback_query(call.id, "❌ File not found!")
 
     except Exception as e:
-        logger.error(f"Error restarting file: {e}")
+        logger.error(f"Error restarting file: {e}", exc_info=True)
         bot.answer_callback_query(call.id, "❌ Error occurred!")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('logs_'))
 def handle_show_logs(call):
-    """Handle show logs button"""
     try:
         parts = call.data.split('_', 2)
         user_id = int(parts[1])
@@ -1827,44 +1845,50 @@ def handle_show_logs(call):
             bot.answer_callback_query(call.id, "🚫 Access denied!")
             return
 
-        # Find log file
         script_key = f"{user_id}_{file_name}"
         script_info = bot_scripts.get(script_key)
 
-        if script_info and 'log_file_path' in script_info:
-            log_file_path = script_info['log_file_path']
+        if not script_info:
+            bot.answer_callback_query(call.id, "❌ No log information found (script never ran).")
+            return
 
-            if os.path.exists(log_file_path):
-                try:
-                    with open(log_file_path, 'r') as f:
-                        logs = f.read()
+        log_file_path = script_info.get('log_file_path')
+        if not log_file_path or not os.path.exists(log_file_path):
+            bot.answer_callback_query(call.id, "❌ Log file not found.")
+            return
 
-                    if logs.strip():
-                        # Truncate if too long
-                        if len(logs) > 4000:
-                            logs = "..." + logs[-4000:]
+        try:
+            with open(log_file_path, 'r') as f:
+                logs = f.read()
+        except Exception as e:
+            bot.answer_callback_query(call.id, f"❌ Error reading log: {str(e)}")
+            return
 
-                        logs_text = f"📜 Execution Logs - {file_name}\n\n```\n{logs}\n```"
-                    else:
-                        logs_text = f"📜 Execution Logs - {file_name}\n\n🔇 No output yet"
+        # Build status line
+        running = script_info.get('running', False)
+        returncode = script_info.get('returncode')
+        status_line = f"**Status:** {'🟢 Running' if running else '🔴 Stopped'}"
+        if returncode is not None:
+            status_line += f" (exit code: {returncode})"
+        if returncode != 0 and not running:
+            status_line += " – possible error"
 
-                    bot.send_message(call.message.chat.id, logs_text, parse_mode='Markdown')
-                    bot.answer_callback_query(call.id, "📜 Logs sent!")
-
-                except Exception as e:
-                    bot.answer_callback_query(call.id, f"❌ Error reading logs: {str(e)}")
-            else:
-                bot.answer_callback_query(call.id, "❌ Log file not found!")
+        if logs.strip():
+            if len(logs) > 3500:
+                logs = "..." + logs[-3500:]
+            logs_text = f"📜 Execution Logs - {file_name}\n\n{status_line}\n\n```\n{logs}\n```"
         else:
-            bot.answer_callback_query(call.id, "❌ No logs available!")
+            logs_text = f"📜 Execution Logs - {file_name}\n\n{status_line}\n\n🔇 No output captured.\n\n💡 The script may have exited immediately without printing anything, or an error occurred before any output."
+
+        bot.send_message(call.message.chat.id, logs_text, parse_mode='Markdown')
+        bot.answer_callback_query(call.id, "📜 Logs sent!")
 
     except Exception as e:
-        logger.error(f"Error showing logs: {e}")
+        logger.error(f"Error showing logs: {e}", exc_info=True)
         bot.answer_callback_query(call.id, "❌ Error occurred!")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('delete_'))
 def handle_delete_file(call):
-    """Handle delete file button"""
     try:
         parts = call.data.split('_', 2)
         user_id = int(parts[1])
@@ -1912,12 +1936,11 @@ def handle_delete_file(call):
         handle_back_to_files(call)
 
     except Exception as e:
-        logger.error(f"Error deleting file: {e}")
+        logger.error(f"Error deleting file: {e}", exc_info=True)
         bot.answer_callback_query(call.id, "❌ Error occurred!")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('back_files_'))
 def handle_back_to_files(call):
-    """Handle back to files list button"""
     try:
         parts = call.data.split('_', 2)
         user_id = int(parts[2])
@@ -1948,13 +1971,10 @@ def handle_back_to_files(call):
                     # Try different URL formats
                     try:
                         replit_url = f"https://{domain}.{owner}.repl.co"
-                        # Test if we can access our own health endpoint
                         test_response = requests.get(f"{replit_url}/health", timeout=2)
                         if test_response.status_code != 200:
-                            # Fallback to .replit.app domain
                             replit_url = f"https://{domain}-{owner}.replit.app"
                     except:
-                        # Use default replit.app domain
                         replit_url = f"https://{domain}-{owner}.replit.app"
 
                     file_url = f"{replit_url}/file/{file_hash}"
@@ -1967,17 +1987,17 @@ def handle_back_to_files(call):
 
             files_text += "⚙️ Management Options:\n• 🟢 Start/🔴 Stop executable files\n• 🗑️ Delete files\n• 📜 View execution logs\n• 🔄 Restart running files"
 
-        bot.edit_message_text(
-            files_text,
+        safe_edit_message(
             call.message.chat.id,
             call.message.message_id,
+            files_text,
             reply_markup=markup
         )
 
         bot.answer_callback_query(call.id, "📂 Files list updated!")
 
     except Exception as e:
-        logger.error(f"Error going back to files: {e}")
+        logger.error(f"Error going back to files: {e}", exc_info=True)
         bot.answer_callback_query(call.id, "❌ Error occurred!")
 
 # --- Catch all handler for unsupported messages ---
@@ -2025,6 +2045,6 @@ if __name__ == "__main__":
         # Start polling with error handling
         bot.infinity_polling(timeout=10, long_polling_timeout=5, none_stop=True, interval=0)
     except Exception as e:
-        logger.error(f"Bot error: {e}")
+        logger.error(f"Bot error: {e}", exc_info=True)
         print(f"Bot connection failed: {e}")
         sys.exit(1)
