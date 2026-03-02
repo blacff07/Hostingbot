@@ -244,7 +244,6 @@ def get_user_file_count(user_id):
     return len(user_files.get(user_id, []))
 
 def is_bot_running(script_owner_id, file_name):
-    """Check if a bot script is currently running"""
     script_key = f"{script_owner_id}_{file_name}"
     script_info = bot_scripts.get(script_key)
     if script_info and script_info.get('process'):
@@ -252,14 +251,19 @@ def is_bot_running(script_owner_id, file_name):
             proc = psutil.Process(script_info['process'].pid)
             is_running = proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
             if not is_running:
+                logger.debug(f"Process {script_key} is not running, removing from bot_scripts")
                 if script_key in bot_scripts:
                     del bot_scripts[script_key]
+            else:
+                logger.debug(f"Process {script_key} is running (PID {proc.pid})")
             return is_running
         except psutil.NoSuchProcess:
+            logger.debug(f"Process {script_key} no longer exists, removing")
             if script_key in bot_scripts:
                 del bot_scripts[script_key]
             return False
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error checking process {script_key}: {e}")
             return False
     return False
 
@@ -275,13 +279,18 @@ def safe_send_message(chat_id, text, parse_mode=None, reply_markup=None):
             raise e
 
 def safe_edit_message(chat_id, message_id, text, parse_mode=None, reply_markup=None):
-    """Safely edit message with fallback for parse errors"""
+    """Safely edit message with fallback for parse errors and ignore 'not modified' errors"""
     try:
         return bot.edit_message_text(text, chat_id, message_id, parse_mode=parse_mode, reply_markup=reply_markup)
     except Exception as e:
-        if "can't parse entities" in str(e):
-            # Edit without parse_mode if there's a parsing error
+        err_str = str(e)
+        if "can't parse entities" in err_str:
+            # Try without parse_mode
             return bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup)
+        elif "message is not modified" in err_str:
+            # Ignore this error – content is already the same
+            logger.debug(f"Ignored 'message not modified' error for chat {chat_id}")
+            return None
         else:
             raise e
 
@@ -1616,7 +1625,6 @@ def handle_file_control(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('start_'))
 def handle_start_file(call):
-    """Handle start file button"""
     try:
         parts = call.data.split('_', 2)
         user_id = int(parts[1])
@@ -1639,40 +1647,51 @@ def handle_start_file(call):
             return
 
         # Execute the script
-        success, result = execute_script(user_id, file_path)
+        success, result = execute_script(user_id, file_path, call.message)  # pass message for updates
 
         if success:
             bot.answer_callback_query(call.id, "🟢 Started successfully!")
-            # Small delay to ensure process is registered
-            time.sleep(0.5)
-            # Refresh the control panel manually
-            file_type = 'executable'  # We know it's executable because start button exists
-            markup = build_file_control_markup(user_id, file_name, file_type)
-            status = "🟢 Running" if is_bot_running(user_id, file_name) else "⭕ Stopped"
-            control_text = f"🔧 File Control Panel\n\n"
-            control_text += f"📄 File: {file_name}\n"
-            control_text += f"📁 Type: {file_type}\n"
-            control_text += f"🔄 Status: {status}\n"
-            control_text += f"👤 Owner: {user_id}\n\n"
-            control_text += f"🎛️ Choose an action:\n"
-            control_text += f"• 📜 Logs - View execution output\n"
-            control_text += f"• 🟢 Start - Run the script\n"
-            control_text += f"• 🔴 Stop - Terminate running script\n"
-            control_text += f"• 🔄 Restart - Stop and start again\n"
-            control_text += f"• 🗑️ Delete - Remove file permanently"
 
-            bot.edit_message_text(
-                control_text,
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                reply_markup=markup
-            )
+            # Wait a moment for the process to register
+            time.sleep(1)
+
+            # Now check if it's really running
+            running_now = is_bot_running(user_id, file_name)
+            if running_now:
+                # Rebuild control panel with new status
+                markup = build_file_control_markup(user_id, file_name, 'executable')
+                status = "🟢 Running"
+                control_text = f"🔧 File Control Panel\n\n"
+                control_text += f"📄 File: {file_name}\n"
+                control_text += f"📁 Type: executable\n"
+                control_text += f"🔄 Status: {status}\n"
+                control_text += f"👤 Owner: {user_id}\n\n"
+                control_text += f"🎛️ Choose an action:\n"
+                control_text += f"• 📜 Logs - View execution output\n"
+                control_text += f"• 🟢 Start - Run the script\n"
+                control_text += f"• 🔴 Stop - Terminate running script\n"
+                control_text += f"• 🔄 Restart - Stop and start again\n"
+                control_text += f"• 🗑️ Delete - Remove file permanently"
+
+                # Use safe_edit_message (now ignores "not modified" errors)
+                safe_edit_message(
+                    call.message.chat.id,
+                    call.message.message_id,
+                    control_text,
+                    reply_markup=markup
+                )
+            else:
+                # Process didn't start? Send a warning
+                bot.send_message(
+                    call.message.chat.id,
+                    f"⚠️ The script was started but may have exited immediately. Check logs for details."
+                )
         else:
             bot.answer_callback_query(call.id, f"❌ Start failed: {result}")
 
     except Exception as e:
-        logger.error(f"Error starting file: {e}")
-        bot.answer_callback_query(call.id, "❌ Error occurred!")
+        logger.error(f"Error starting file: {e}", exc_info=True)
+        bot.answer_callback_query(call.id, "❌ An error occurred.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('stop_'))
 def handle_stop_file(call):
