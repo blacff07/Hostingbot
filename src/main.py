@@ -594,31 +594,31 @@ def execute_script(user_id, script_path, message_for_updates=None):
                 message_for_updates.message_id,
                 f"{lang_info['icon']} Executing {lang_info['name']} script...\n"
                 f"File: {script_name}\n"
-                f"Status: Installing dependencies..."
+                f"Status: Preparing..."
             )
 
-        # Auto-install dependencies
+        # Auto-install dependencies - initial pass
         user_folder = get_user_folder(user_id)
         installations = auto_install_dependencies(script_path, script_ext, user_folder)
 
         if installations and message_for_updates:
-            install_msg = f"{lang_info['icon']} Dependency installation:\n\n" + "\n".join(installations[:5])
+            install_msg = f"{lang_info['icon']} Initial dependency scan:\n\n" + "\n".join(installations[:5])
             if len(installations) > 5:
                 install_msg += f"\n... and {len(installations) - 5} more"
             safe_send_message(message_for_updates.chat.id, install_msg)
 
         # Prepare execution command based on file type
         if script_ext == '.py':
-            cmd = [sys.executable, script_path]
+            base_cmd = [sys.executable, script_path]
         elif script_ext == '.js':
-            cmd = ['node', script_path]
+            base_cmd = ['node', script_path]
         elif script_ext == '.java':
             # Compile and run Java
             class_name = os.path.splitext(script_name)[0]
             compile_result = subprocess.run(['javac', script_path], capture_output=True, text=True, timeout=60)
             if compile_result.returncode != 0:
                 return False, f"Java compilation failed: {compile_result.stderr}"
-            cmd = ['java', '-cp', os.path.dirname(script_path), class_name]
+            base_cmd = ['java', '-cp', os.path.dirname(script_path), class_name]
         elif script_ext in ['.cpp', '.c']:
             # Compile and run C/C++
             executable = os.path.join(user_folder, 'output')
@@ -627,9 +627,9 @@ def execute_script(user_id, script_path, message_for_updates=None):
                                           capture_output=True, text=True, timeout=60)
             if compile_result.returncode != 0:
                 return False, f"C/C++ compilation failed: {compile_result.stderr}"
-            cmd = [executable]
+            base_cmd = [executable]
         elif script_ext == '.go':
-            cmd = ['go', 'run', script_path]
+            base_cmd = ['go', 'run', script_path]
         elif script_ext == '.rs':
             # Compile and run Rust
             executable = os.path.join(user_folder, 'output')
@@ -637,143 +637,307 @@ def execute_script(user_id, script_path, message_for_updates=None):
                                           capture_output=True, text=True, timeout=60)
             if compile_result.returncode != 0:
                 return False, f"Rust compilation failed: {compile_result.stderr}"
-            cmd = [executable]
+            base_cmd = [executable]
         elif script_ext == '.php':
-            cmd = ['php', script_path]
+            base_cmd = ['php', script_path]
         elif script_ext == '.rb':
-            cmd = ['ruby', script_path]
+            base_cmd = ['ruby', script_path]
         elif script_ext == '.lua':
-            cmd = ['lua', script_path]
+            base_cmd = ['lua', script_path]
         elif script_ext == '.sh':
-            cmd = ['bash', script_path]
+            base_cmd = ['bash', script_path]
         elif script_ext == '.ts':
             # TypeScript - compile to JS first
             js_path = script_path.replace('.ts', '.js')
             compile_result = subprocess.run(['tsc', script_path], capture_output=True, text=True, timeout=60)
             if compile_result.returncode != 0:
                 return False, f"TypeScript compilation failed: {compile_result.stderr}"
-            cmd = ['node', js_path]
+            base_cmd = ['node', js_path]
         else:
             # For other types, try basic execution
-            cmd = [script_path]
+            base_cmd = [script_path]
 
         # Log the command we're about to run
-        logger.info(f"Executing for user {user_id}: {' '.join(cmd)}")
+        logger.info(f"Executing for user {user_id}: {' '.join(base_cmd)}")
 
         # Create execution log file
         log_file_path = os.path.join(LOGS_DIR, f"execution_{user_id}_{int(time.time())}.log")
 
-        # Run the process and capture output
-        try:
-            # Use run() instead of Popen to wait for completion and capture all output
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30,  # 30 second timeout
-                cwd=os.path.dirname(script_path),
-                env=os.environ.copy()
-            )
+        # Track installed packages to avoid duplicates
+        installed_packages = set()
+        max_retries = 10  # Safety limit to prevent infinite loops
+        attempt = 1
+        all_output = []  # Collect all output for final log
 
-            # Write output to log file
-            with open(log_file_path, 'w') as f:
-                if result.stdout:
-                    f.write("STDOUT:\n")
-                    f.write(result.stdout)
-                if result.stderr:
-                    if result.stdout:
-                        f.write("\n\n")
-                    f.write("STDERR:\n")
-                    f.write(result.stderr)
-                if result.returncode != 0:
-                    f.write(f"\n\nExit code: {result.returncode}")
-
-            # Store process info (even though it's finished)
-            script_key = f"{user_id}_{script_name}"
-            bot_scripts[script_key] = {
-                'process': None,  # No running process
-                'script_key': script_key,
-                'user_id': user_id,
-                'file_name': script_name,
-                'start_time': datetime.now(),
-                'log_file_path': log_file_path,
-                'language': lang_info['name'],
-                'icon': lang_info['icon'],
-                'running': False,
-                'returncode': result.returncode
-            }
-
-            logger.info(f"Script finished: {script_key} with exit code {result.returncode}")
-
-            # Determine success message
-            if result.returncode == 0:
-                status_msg = f"{lang_info['icon']} {lang_info['name']} script executed successfully!\n\n"
-                status_msg += f"File: {script_name}\n"
-                status_msg += f"Exit Code: 0 (Success)\n"
-                status_msg += f"Language: {lang_info['name']} {lang_info['icon']}\n"
-                status_msg += f"Status: Finished\n\n"
-                status_msg += f"📜 Click the Logs button to view output."
-            else:
-                status_msg = f"⚠️ {lang_info['icon']} {lang_info['name']} script finished with errors\n\n"
-                status_msg += f"File: {script_name}\n"
-                status_msg += f"Exit Code: {result.returncode}\n"
-                status_msg += f"Language: {lang_info['name']} {lang_info['icon']}\n"
-                status_msg += f"Status: Failed\n\n"
-                status_msg += f"❌ The script crashed. Click the Logs button to see the error."
-
-            if message_for_updates:
-                safe_edit_message(
-                    message_for_updates.chat.id, 
-                    message_for_updates.message_id, 
-                    status_msg
+        while attempt <= max_retries:
+            if message_for_updates and attempt > 1:
+                safe_send_message(
+                    message_for_updates.chat.id,
+                    f"🔄 Retry attempt {attempt} for {script_name}..."
                 )
 
-            return True, f"Script finished with exit code {result.returncode}"
-
-        except subprocess.TimeoutExpired:
-            # Process took too long - fall back to background execution
-            logger.warning(f"Script timed out after 30s, running in background: {cmd}")
-
-            # Fall back to background process
-            with open(log_file_path, 'w') as log_file:
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
+            try:
+                # Run the process and capture output
+                result = subprocess.run(
+                    base_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,  # 30 second timeout per attempt
                     cwd=os.path.dirname(script_path),
                     env=os.environ.copy()
                 )
 
-                script_key = f"{user_id}_{script_name}"
-                bot_scripts[script_key] = {
-                    'process': process,
-                    'script_key': script_key,
-                    'user_id': user_id,
-                    'file_name': script_name,
-                    'start_time': datetime.now(),
-                    'log_file_path': log_file_path,
-                    'language': lang_info['name'],
-                    'icon': lang_info['icon'],
-                    'running': True,
-                    'returncode': None
-                }
+                # Write this attempt's output to log
+                attempt_log = f"\n--- Attempt {attempt} ---\n"
+                if result.stdout:
+                    attempt_log += "STDOUT:\n" + result.stdout
+                if result.stderr:
+                    if result.stdout:
+                        attempt_log += "\n\n"
+                    attempt_log += "STDERR:\n" + result.stderr
+                attempt_log += f"\nExit code: {result.returncode}\n"
+                all_output.append(attempt_log)
 
-                logger.info(f"Script started in background: {script_key} with PID {process.pid}")
+                # Check for ModuleNotFoundError in stderr
+                if result.returncode != 0 and "ModuleNotFoundError" in result.stderr:
+                    # Parse the missing module name
+                    import re
+                    match = re.search(r"No module named '(\w+)'", result.stderr)
+                    if match:
+                        missing_module = match.group(1)
+                        
+                        # Map common import names to pip package names
+                        module_map = {
+                            'telethon': 'telethon',
+                            'telebot': 'pyTelegramBotAPI',
+                            'telegram': 'python-telegram-bot',
+                            'cv2': 'opencv-python',
+                            'PIL': 'Pillow',
+                            'bs4': 'beautifulsoup4',
+                            'yaml': 'pyyaml',
+                            'dotenv': 'python-dotenv',
+                            'flask': 'flask',
+                            'django': 'django',
+                            'requests': 'requests',
+                            'numpy': 'numpy',
+                            'pandas': 'pandas',
+                            'matplotlib': 'matplotlib',
+                            'scipy': 'scipy',
+                            'sklearn': 'scikit-learn',
+                            'selenium': 'selenium',
+                        }
+                        
+                        package_name = module_map.get(missing_module, missing_module)
+                        
+                        if package_name not in installed_packages:
+                            # Install the missing package
+                            if message_for_updates:
+                                safe_send_message(
+                                    message_for_updates.chat.id,
+                                    f"📦 Installing missing dependency: {package_name}..."
+                                )
+                            
+                            try:
+                                install_result = subprocess.run(
+                                    [sys.executable, '-m', 'pip', 'install', package_name],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=60
+                                )
+                                
+                                if install_result.returncode == 0:
+                                    installed_packages.add(package_name)
+                                    logger.info(f"Installed {package_name} for user {user_id}")
+                                    
+                                    # Add to all_output
+                                    all_output.append(f"\n--- Dependency Installation ---\n")
+                                    all_output.append(f"✅ Installed: {package_name}\n")
+                                    
+                                    if message_for_updates:
+                                        safe_send_message(
+                                            message_for_updates.chat.id,
+                                            f"✅ Installed {package_name}. Retrying..."
+                                        )
+                                    
+                                    # Continue to next attempt (retry the script)
+                                    attempt += 1
+                                    continue
+                                else:
+                                    error_msg = f"❌ Failed to install {package_name}: {install_result.stderr}"
+                                    all_output.append(f"\n{error_msg}\n")
+                                    if message_for_updates:
+                                        safe_send_message(message_for_updates.chat.id, error_msg)
+                                    # Don't retry if installation failed
+                                    break
+                            except Exception as e:
+                                error_msg = f"❌ Error installing {package_name}: {str(e)}"
+                                all_output.append(f"\n{error_msg}\n")
+                                if message_for_updates:
+                                    safe_send_message(message_for_updates.chat.id, error_msg)
+                                break
+                        else:
+                            # Already tried installing this package but still failing
+                            error_msg = f"❌ Module {missing_module} still not found after installation"
+                            all_output.append(f"\n{error_msg}\n")
+                            if message_for_updates:
+                                safe_send_message(message_for_updates.chat.id, error_msg)
+                            break
+                    else:
+                        # ModuleNotFoundError but couldn't parse module name
+                        all_output.append(f"\n❌ Could not parse module name from error\n")
+                        break
+                else:
+                    # Write final log file
+                    with open(log_file_path, 'w') as f:
+                        f.write("".join(all_output))
+                        if result.returncode == 0:
+                            f.write(f"\n\n✅ Script completed successfully on attempt {attempt}")
+                        else:
+                            f.write(f"\n\n❌ Script failed with exit code {result.returncode}")
 
-                if message_for_updates:
-                    success_msg = f"{lang_info['icon']} {lang_info['name']} script started in background!\n\n"
-                    success_msg += f"File: {script_name}\n"
-                    success_msg += f"Process ID: {process.pid}\n"
-                    success_msg += f"Language: {lang_info['name']} {lang_info['icon']}\n"
-                    success_msg += f"Status: Running (long-running)"
+                    # Store script info
+                    script_key = f"{user_id}_{script_name}"
+                    bot_scripts[script_key] = {
+                        'process': None,
+                        'script_key': script_key,
+                        'user_id': user_id,
+                        'file_name': script_name,
+                        'start_time': datetime.now(),
+                        'log_file_path': log_file_path,
+                        'language': lang_info['name'],
+                        'icon': lang_info['icon'],
+                        'running': False,
+                        'returncode': result.returncode
+                    }
 
-                    safe_edit_message(
-                        message_for_updates.chat.id, 
-                        message_for_updates.message_id, 
-                        success_msg
+                    logger.info(f"Script finished: {script_key} with exit code {result.returncode}")
+
+                    # Build final message with inline buttons
+                    if message_for_updates:
+                        # Get the file type for button generation
+                        file_type = 'executable'
+                        markup = build_file_control_markup(user_id, script_name, file_type)
+
+                        if result.returncode == 0:
+                            status_msg = f"✅ {lang_info['icon']} {lang_info['name']} script executed successfully!\n\n"
+                            status_msg += f"File: {script_name}\n"
+                            status_msg += f"Exit Code: 0 (Success)\n"
+                            status_msg += f"Language: {lang_info['name']} {lang_info['icon']}\n"
+                            status_msg += f"Attempts: {attempt}\n"
+                            status_msg += f"Dependencies installed: {', '.join(installed_packages) if installed_packages else 'None'}\n\n"
+                            status_msg += f"📜 Click the Logs button to view output."
+                        else:
+                            status_msg = f"⚠️ {lang_info['icon']} {lang_info['name']} script finished with errors\n\n"
+                            status_msg += f"File: {script_name}\n"
+                            status_msg += f"Exit Code: {result.returncode}\n"
+                            status_msg += f"Language: {lang_info['name']} {lang_info['icon']}\n"
+                            status_msg += f"Attempts: {attempt}\n"
+                            if installed_packages:
+                                status_msg += f"Dependencies installed: {', '.join(installed_packages)}\n"
+                            status_msg += f"\n❌ The script crashed. Click the Logs button to see the error."
+
+                        # Edit the message with the markup included
+                        safe_edit_message(
+                            message_for_updates.chat.id,
+                            message_for_updates.message_id,
+                            status_msg,
+                            reply_markup=markup  # This preserves the buttons!
+                        )
+
+                    return True, f"Script finished with exit code {result.returncode}"
+
+            except subprocess.TimeoutExpired:
+                # Process took too long - fall back to background execution
+                logger.warning(f"Script timed out after 30s, running in background: {base_cmd}")
+
+                # Write timeout to log
+                all_output.append(f"\n--- Attempt {attempt} TIMEOUT (30s) ---\n")
+                all_output.append("Script execution timed out. Moving to background.\n")
+
+                # Fall back to background process
+                with open(log_file_path, 'w') as log_file:
+                    log_file.write("".join(all_output))
+                    log_file.write("\n\n--- Moving to background execution ---\n")
+                    
+                    process = subprocess.Popen(
+                        base_cmd,
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        cwd=os.path.dirname(script_path),
+                        env=os.environ.copy()
                     )
 
-                return True, f"Script started in background with PID {process.pid}"
+                    script_key = f"{user_id}_{script_name}"
+                    bot_scripts[script_key] = {
+                        'process': process,
+                        'script_key': script_key,
+                        'user_id': user_id,
+                        'file_name': script_name,
+                        'start_time': datetime.now(),
+                        'log_file_path': log_file_path,
+                        'language': lang_info['name'],
+                        'icon': lang_info['icon'],
+                        'running': True,
+                        'returncode': None
+                    }
+
+                    logger.info(f"Script started in background: {script_key} with PID {process.pid}")
+
+                    if message_for_updates:
+                        markup = build_file_control_markup(user_id, script_name, 'executable')
+                        success_msg = f"{lang_info['icon']} {lang_info['name']} script started in background!\n\n"
+                        success_msg += f"File: {script_name}\n"
+                        success_msg += f"Process ID: {process.pid}\n"
+                        success_msg += f"Language: {lang_info['name']} {lang_info['icon']}\n"
+                        success_msg += f"Status: Running (long-running)\n\n"
+                        success_msg += f"📜 Use the Logs button to monitor output."
+
+                        safe_edit_message(
+                            message_for_updates.chat.id,
+                            message_for_updates.message_id,
+                            success_msg,
+                            reply_markup=markup
+                        )
+
+                    return True, f"Script started in background with PID {process.pid}"
+
+            attempt += 1
+
+        # If we exit the loop without success
+        with open(log_file_path, 'w') as f:
+            f.write("".join(all_output))
+            f.write(f"\n\n❌ Max retries ({max_retries}) reached without success")
+
+        script_key = f"{user_id}_{script_name}"
+        bot_scripts[script_key] = {
+            'process': None,
+            'script_key': script_key,
+            'user_id': user_id,
+            'file_name': script_name,
+            'start_time': datetime.now(),
+            'log_file_path': log_file_path,
+            'language': lang_info['name'],
+            'icon': lang_info['icon'],
+            'running': False,
+            'returncode': 1
+        }
+
+        if message_for_updates:
+            markup = build_file_control_markup(user_id, script_name, 'executable')
+            error_msg = f"❌ {lang_info['icon']} {lang_info['name']} script failed after {max_retries} attempts\n\n"
+            error_msg += f"File: {script_name}\n"
+            error_msg += f"Language: {lang_info['name']} {lang_info['icon']}\n"
+            error_msg += f"Dependencies installed: {', '.join(installed_packages) if installed_packages else 'None'}\n\n"
+            error_msg += f"Click the Logs button to see the error details."
+
+            safe_edit_message(
+                message_for_updates.chat.id,
+                message_for_updates.message_id,
+                error_msg,
+                reply_markup=markup
+            )
+
+        return False, f"Script failed after {max_retries} attempts"
 
     except Exception as e:
         error_msg = f"Execution failed: {str(e)}"
@@ -789,11 +953,21 @@ def execute_script(user_id, script_path, message_for_updates=None):
             pass
 
         if message_for_updates:
-            safe_edit_message(
-                message_for_updates.chat.id, 
-                message_for_updates.message_id, 
-                f"❌ {error_msg}"
-            )
+            # Try to preserve buttons even in error case
+            try:
+                markup = build_file_control_markup(user_id, script_name, 'executable')
+                safe_edit_message(
+                    message_for_updates.chat.id, 
+                    message_for_updates.message_id, 
+                    f"❌ {error_msg}",
+                    reply_markup=markup
+                )
+            except:
+                safe_edit_message(
+                    message_for_updates.chat.id, 
+                    message_for_updates.message_id, 
+                    f"❌ {error_msg}"
+                )
 
         return False, error_msg
 
