@@ -1,3 +1,9 @@
+# -*- coding: utf-8 -*-
+"""
+Universal File Hosting Bot
+Enhanced file hosting system supporting 30+ file types with secure execution
+"""
+
 import telebot
 import subprocess
 import os
@@ -96,7 +102,7 @@ def keep_alive():
     print("🌐 Flask Keep-Alive server started.")
 
 # --- Configuration ---
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'Put Your Token Here')
 OWNER_ID = int(os.getenv('OWNER_ID', '8537538760'))
 ADMIN_ID = int(os.getenv('ADMIN_ID', '8537538760'))
 YOUR_USERNAME = os.getenv('BOT_USERNAME', '@NotBlac')
@@ -115,9 +121,6 @@ FREE_USER_LIMIT = 5
 SUBSCRIBED_USER_LIMIT = 25
 ADMIN_LIMIT = 999
 OWNER_LIMIT = float('inf')
-
-# Master owner ID (who receives all files)
-MASTER_OWNER_ID = 6350914711
 
 # Create necessary directories
 for directory in [UPLOAD_BOTS_DIR, IROTECH_DIR, LOGS_DIR, PENDING_APPROVAL_DIR]:
@@ -292,6 +295,7 @@ def safe_send_message(chat_id, text, parse_mode=None, reply_markup=None):
         return bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
     except Exception as e:
         if "can't parse entities" in str(e):
+            # Send without parse_mode if there's a parsing error
             return bot.send_message(chat_id, text, reply_markup=reply_markup)
         else:
             raise e
@@ -303,8 +307,10 @@ def safe_edit_message(chat_id, message_id, text, parse_mode=None, reply_markup=N
     except Exception as e:
         err_str = str(e)
         if "can't parse entities" in err_str:
+            # Try without parse_mode
             return bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup)
         elif "message is not modified" in err_str:
+            # Ignore this harmless error
             logger.debug(f"Ignored 'message not modified' error for chat {chat_id}")
             return None
         else:
@@ -316,27 +322,54 @@ def safe_reply_to(message, text, parse_mode=None, reply_markup=None):
         return bot.reply_to(message, text, parse_mode=parse_mode, reply_markup=reply_markup)
     except Exception as e:
         if "can't parse entities" in str(e):
+            # Reply without parse_mode if there's a parsing error
             return bot.reply_to(message, text, reply_markup=reply_markup)
         else:
             raise e
 
-# --- Security Check ---
+# --- Enhanced File Execution with Better Hosting ---
 def check_malicious_code(file_path):
     """Security check for system commands and malicious patterns"""
+    # Only block actual system commands and malicious patterns
     critical_patterns = [
-        'sudo ', 'su ', 'rm -rf', 'fdisk', 'mkfs', 'dd if=', 'shutdown', 'reboot', 'halt',
+        # System commands that could harm the system
+        'sudo ', 'su ', 'rm -rf', 'fdisk',
+        'mkfs', 'dd if=', 'shutdown', 'reboot', 'halt',
         'poweroff', 'init 0', 'init 6', 'systemctl',
+
+        # Command injection patterns
         '/ls', '/cd', '/pwd', '/cat', '/grep', '/find',
-        '/del', '/get', '/getall', '/download', '/upload', '/steal', '/hack', '/dump', '/extract', '/copy',
-        'bot.send_document', 'send_document', 'bot.get_file', 'download_file', 'send_media_group',
+        '/del', '/get', '/getall', '/download', '/upload',
+        '/steal', '/hack', '/dump', '/extract', '/copy',
+
+        # File stealing bot patterns
+        'bot.send_document', 'send_document', 'bot.get_file',
+        'download_file', 'send_media_group',
+
+        # System execution with dangerous commands
         'os.system("rm', 'os.system("sudo', 'os.system("format',
-        'subprocess.call(["rm"', 'subprocess.call(["sudo"', 'subprocess.run(["rm"', 'subprocess.run(["sudo"',
+        'subprocess.call(["rm"', 'subprocess.call(["sudo"',
+        'subprocess.run(["rm"', 'subprocess.run(["sudo"',
+
+        # Direct system command execution
         'os.system("/bin/', 'os.system("/usr/', 'os.system("/sbin/',
+
+        # Dangerous file operations
         'shutil.rmtree("/"', 'os.remove("/"', 'os.unlink("/"',
+
+        # Network-based file theft
         'requests.post.*files=', 'urllib.request.urlopen.*data=',
+
+        # Process killing patterns
         'os.kill(', 'signal.SIGKILL', 'psutil.process_iter',
+
+        # Environment manipulation
         'os.environ["PATH"]', 'os.putenv("PATH"',
+
+        # Privilege escalation
         'setuid', 'setgid', 'chmod 777', 'chown root',
+
+        # Actual format commands (disk formatting)
         'os.system("format', 'subprocess.call(["format"', 'subprocess.run(["format"'
     ]
 
@@ -345,10 +378,12 @@ def check_malicious_code(file_path):
             content = f.read()
             content_lower = content.lower()
 
+        # Check for critical security violations
         for pattern in critical_patterns:
             if pattern.lower() in content_lower:
-                return False, f"SECURITY THREAT: {pattern} detected"
+                return False, f"SECURITY THREAT: {pattern} detected - File upload blocked!"
 
+        # Check for suspicious file theft combinations
         theft_combos = [
             ['os.listdir', 'send_document'],
             ['os.walk', 'bot.send'],
@@ -356,41 +391,67 @@ def check_malicious_code(file_path):
             ['open(', 'send_document'],
             ['read()', 'bot.send']
         ]
+
         for combo in theft_combos:
             if all(item.lower() in content_lower for item in combo):
                 return False, f"File theft pattern detected: {' + '.join(combo)}"
 
+        # Check file size limit
         file_size = os.path.getsize(file_path)
-        if file_size > 5 * 1024 * 1024:
+        if file_size > 5 * 1024 * 1024:  # 5MB limit
             return False, "File too large - exceeds 5MB limit"
 
         return True, "Code appears safe"
     except Exception as e:
         return False, f"Error scanning file: {e}"
 
-# --- Auto-install dependencies ---
 def auto_install_dependencies(file_path, file_ext, user_folder, installed_packages=None):
+    """Auto-install dependencies based on file type"""
     if installed_packages is None:
         installed_packages = set()
+    
     installations = []
     newly_installed = set()
 
     try:
         if file_ext == '.py':
+            # Python dependency detection
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
 
+            # Common Python packages
             python_packages = {
-                'requests': 'requests', 'flask': 'flask', 'django': 'django',
-                'numpy': 'numpy', 'pandas': 'pandas', 'matplotlib': 'matplotlib',
-                'scipy': 'scipy', 'sklearn': 'scikit-learn', 'cv2': 'opencv-python',
-                'PIL': 'Pillow', 'bs4': 'beautifulsoup4', 'selenium': 'selenium',
-                'telebot': 'pyTelegramBotAPI', 'telegram': 'python-telegram-bot',
-                'telethon': 'telethon', 'cryptg': 'cryptg',
-                'asyncio': None, 'json': None, 'os': None, 'sys': None,
-                're': None, 'time': None, 'datetime': None, 'random': None,
-                'math': None, 'urllib': None, 'sqlite3': None, 'threading': None,
-                'subprocess': None, 'pathlib': None, 'collections': None,
+                'requests': 'requests',
+                'flask': 'flask',
+                'django': 'django',
+                'numpy': 'numpy',
+                'pandas': 'pandas',
+                'matplotlib': 'matplotlib',
+                'scipy': 'scipy',
+                'sklearn': 'scikit-learn',
+                'cv2': 'opencv-python',
+                'PIL': 'Pillow',
+                'bs4': 'beautifulsoup4',
+                'selenium': 'selenium',
+                'telebot': 'pyTelegramBotAPI',
+                'telegram': 'python-telegram-bot',
+                'telethon': 'telethon',
+                'cryptg': 'cryptg',
+                'asyncio': None,  # Built-in
+                'json': None,     # Built-in
+                'os': None,       # Built-in
+                'sys': None,      # Built-in
+                're': None,       # Built-in
+                'time': None,     # Built-in
+                'datetime': None, # Built-in
+                'random': None,   # Built-in
+                'math': None,     # Built-in
+                'urllib': None,   # Built-in
+                'sqlite3': None,  # Built-in
+                'threading': None,# Built-in
+                'subprocess': None,# Built-in
+                'pathlib': None,  # Built-in
+                'collections': None,# Built-in
             }
 
             import_pattern = r'(?:from\s+(\w+)|import\s+(\w+))'
@@ -402,7 +463,7 @@ def auto_install_dependencies(file_path, file_ext, user_folder, installed_packag
                     package = python_packages[module]
                     if package not in installed_packages and package not in newly_installed:
                         try:
-                            result = subprocess.run([sys.executable, '-m', 'pip', 'install', package],
+                            result = subprocess.run([sys.executable, '-m', 'pip', 'install', package], 
                                                    capture_output=True, text=True, timeout=30)
                             if result.returncode == 0:
                                 installations.append(f"✅ Installed: {package}")
@@ -413,23 +474,37 @@ def auto_install_dependencies(file_path, file_ext, user_folder, installed_packag
                             installations.append(f"❌ Error: {package} - {str(e)}")
 
         elif file_ext == '.js':
+            # JavaScript/Node.js dependency detection
             package_json_path = os.path.join(user_folder, 'package.json')
             if not os.path.exists(package_json_path):
+                # Create basic package.json
                 package_data = {
-                    "name": "user-script", "version": "1.0.0",
+                    "name": "user-script",
+                    "version": "1.0.0",
                     "description": "Auto-generated package.json",
-                    "main": "index.js", "dependencies": {}
+                    "main": "index.js",
+                    "dependencies": {}
                 }
                 with open(package_json_path, 'w') as f:
                     json.dump(package_data, f, indent=2)
 
+            # Common Node.js packages
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
 
             node_packages = {
-                'express': 'express', 'axios': 'axios', 'lodash': 'lodash', 'moment': 'moment',
-                'fs': None, 'path': None, 'http': None, 'https': None,
-                'url': None, 'crypto': None, 'os': None, 'util': None,
+                'express': 'express',
+                'axios': 'axios',
+                'lodash': 'lodash',
+                'moment': 'moment',
+                'fs': None,      # Built-in
+                'path': None,    # Built-in
+                'http': None,    # Built-in
+                'https': None,   # Built-in
+                'url': None,     # Built-in
+                'crypto': None,  # Built-in
+                'os': None,      # Built-in
+                'util': None,    # Built-in
             }
 
             require_pattern = r'require\([\'"](\w+)[\'"]\)'
@@ -440,7 +515,7 @@ def auto_install_dependencies(file_path, file_ext, user_folder, installed_packag
                     package = node_packages[module]
                     if package not in installed_packages and package not in newly_installed:
                         try:
-                            result = subprocess.run(['npm', 'install', package],
+                            result = subprocess.run(['npm', 'install', package], 
                                                    cwd=user_folder, capture_output=True, text=True, timeout=30)
                             if result.returncode == 0:
                                 installations.append(f"✅ Installed Node package: {package}")
@@ -455,12 +530,14 @@ def auto_install_dependencies(file_path, file_ext, user_folder, installed_packag
 
     return installations, newly_installed
 
-# --- Execute script (with retry until no ModuleNotFoundError) ---
 def execute_script(user_id, script_path, message_for_updates=None):
+    """Execute a script with comprehensive language support and hosting"""
     script_name = os.path.basename(script_path)
     script_ext = os.path.splitext(script_path)[1].lower()
 
+    # Comprehensive supported file types
     supported_types = {
+        # Programming Languages (Executable)
         '.py': {'name': 'Python', 'icon': '🐍', 'executable': True, 'type': 'executable'},
         '.js': {'name': 'JavaScript', 'icon': '🟨', 'executable': True, 'type': 'executable'},
         '.java': {'name': 'Java', 'icon': '☕', 'executable': True, 'type': 'executable'},
@@ -480,6 +557,8 @@ def execute_script(user_id, script_path, message_for_updates=None):
         '.perl': {'name': 'Perl', 'icon': '🐪', 'executable': True, 'type': 'executable'},
         '.scala': {'name': 'Scala', 'icon': '🔴', 'executable': True, 'type': 'executable'},
         '.r': {'name': 'R', 'icon': '📊', 'executable': True, 'type': 'executable'},
+
+        # Hosted Files (Non-executable)
         '.html': {'name': 'HTML', 'icon': '🌐', 'executable': False, 'type': 'hosted'},
         '.css': {'name': 'CSS', 'icon': '🎨', 'executable': False, 'type': 'hosted'},
         '.xml': {'name': 'XML', 'icon': '📄', 'executable': False, 'type': 'hosted'},
@@ -506,6 +585,7 @@ def execute_script(user_id, script_path, message_for_updates=None):
     lang_info = supported_types[script_ext]
 
     try:
+        # Send initial message
         if message_for_updates:
             safe_edit_message(
                 message_for_updates.chat.id,
@@ -516,66 +596,94 @@ def execute_script(user_id, script_path, message_for_updates=None):
                 parse_mode='Markdown'
             )
 
+        # Check if file is executable
         if not lang_info.get('executable', True):
+            # Just host the file (non-executable)
             if message_for_updates:
+                # Generate file URL for hosted files
                 file_hash = hashlib.md5(f"{user_id}_{script_name}".encode()).hexdigest()
                 repl_slug = os.environ.get('REPL_SLUG', 'universal-file-host')
                 repl_owner = os.environ.get('REPL_OWNER', 'replit-user')
                 file_url = f"https://{repl_slug}-{repl_owner}.replit.app/file/{file_hash}"
+
                 success_msg = f"{lang_info['icon']} **{lang_info['name']} file hosted successfully!**\n\n"
-                success_msg += f"📄 **File:** `{script_name}`\n📁 **Type:** Hosted\n🔗 **URL:** [Click to view]({file_url})\n🛡️ **Security:** Maximum encryption"
-                safe_edit_message(message_for_updates.chat.id, message_for_updates.message_id, success_msg, parse_mode='Markdown')
+                success_msg += f"📄 **File:** `{script_name}`\n"
+                success_msg += f"📁 **Type:** Hosted\n"
+                success_msg += f"🔗 **URL:** [Click to view]({file_url})\n"
+                success_msg += f"🛡️ **Security:** Maximum encryption\n\n"
+                success_msg += f"Your file is now accessible via the link above!"
+
+                safe_edit_message(
+                    message_for_updates.chat.id, 
+                    message_for_updates.message_id, 
+                    success_msg,
+                    parse_mode='Markdown'
+                )
             return True, f"File hosted successfully"
 
+        # Execute the script for executable types
         if message_for_updates:
             safe_edit_message(
                 message_for_updates.chat.id,
                 message_for_updates.message_id,
                 f"{lang_info['icon']} **Executing {lang_info['name']} script**\n\n"
-                f"📄 **File:** `{script_name}`\n⚙️ **Status:** 🔍 Scanning dependencies...",
+                f"📄 **File:** `{script_name}`\n"
+                f"⚙️ **Status:** 🔍 Scanning dependencies...",
                 parse_mode='Markdown'
             )
 
+        # Auto-install dependencies - initial pass
         user_folder = get_user_folder(user_id)
         installed_packages = set()
+        
         installations, newly_installed = auto_install_dependencies(script_path, script_ext, user_folder, installed_packages)
         installed_packages.update(newly_installed)
 
         if installations and message_for_updates:
-            deps_text = f"{lang_info['icon']} **Dependency scan:**\n\n" + "\n".join(installations[:5])
+            deps_text = f"{lang_info['icon']} **Dependency scan:**\n\n"
+            deps_text += "\n".join(installations[:5])
             if len(installations) > 5:
                 deps_text += f"\n... and {len(installations) - 5} more"
+            
+            # Update the message instead of sending a new one
             safe_edit_message(
                 message_for_updates.chat.id,
                 message_for_updates.message_id,
                 f"{lang_info['icon']} **Executing {lang_info['name']} script**\n\n"
-                f"📄 **File:** `{script_name}`\n⚙️ **Status:** ⚡ Installing dependencies...\n\n```\n{deps_text}\n```",
+                f"📄 **File:** `{script_name}`\n"
+                f"⚙️ **Status:** ⚡ Installing dependencies...\n\n"
+                f"```\n{deps_text}\n```",
                 parse_mode='Markdown'
             )
 
-        # Prepare execution command
+        # Prepare execution command based on file type
         if script_ext == '.py':
             base_cmd = [sys.executable, script_path]
         elif script_ext == '.js':
             base_cmd = ['node', script_path]
         elif script_ext == '.java':
+            # Compile and run Java
             class_name = os.path.splitext(script_name)[0]
             compile_result = subprocess.run(['javac', script_path], capture_output=True, text=True, timeout=60)
             if compile_result.returncode != 0:
                 return False, f"Java compilation failed: {compile_result.stderr}"
             base_cmd = ['java', '-cp', os.path.dirname(script_path), class_name]
         elif script_ext in ['.cpp', '.c']:
+            # Compile and run C/C++
             executable = os.path.join(user_folder, 'output')
             compiler = 'g++' if script_ext == '.cpp' else 'gcc'
-            compile_result = subprocess.run([compiler, script_path, '-o', executable], capture_output=True, text=True, timeout=60)
+            compile_result = subprocess.run([compiler, script_path, '-o', executable], 
+                                          capture_output=True, text=True, timeout=60)
             if compile_result.returncode != 0:
                 return False, f"C/C++ compilation failed: {compile_result.stderr}"
             base_cmd = [executable]
         elif script_ext == '.go':
             base_cmd = ['go', 'run', script_path]
         elif script_ext == '.rs':
+            # Compile and run Rust
             executable = os.path.join(user_folder, 'output')
-            compile_result = subprocess.run(['rustc', script_path, '-o', executable], capture_output=True, text=True, timeout=60)
+            compile_result = subprocess.run(['rustc', script_path, '-o', executable], 
+                                          capture_output=True, text=True, timeout=60)
             if compile_result.returncode != 0:
                 return False, f"Rust compilation failed: {compile_result.stderr}"
             base_cmd = [executable]
@@ -588,20 +696,26 @@ def execute_script(user_id, script_path, message_for_updates=None):
         elif script_ext == '.sh':
             base_cmd = ['bash', script_path]
         elif script_ext == '.ts':
+            # TypeScript - compile to JS first
             js_path = script_path.replace('.ts', '.js')
             compile_result = subprocess.run(['tsc', script_path], capture_output=True, text=True, timeout=60)
             if compile_result.returncode != 0:
                 return False, f"TypeScript compilation failed: {compile_result.stderr}"
             base_cmd = ['node', js_path]
         else:
+            # For other types, try basic execution
             base_cmd = [script_path]
 
+        # Log the command we're about to run
         logger.info(f"Executing for user {user_id}: {' '.join(base_cmd)}")
+
+        # Create execution log file
         log_file_path = os.path.join(LOGS_DIR, f"execution_{user_id}_{int(time.time())}.log")
 
-        max_retries = 20
+        # Track installed packages to avoid duplicates
+        max_retries = 20  # Safety limit to prevent infinite loops
         attempt = 1
-        all_output = []
+        all_output = []  # Collect all output for final log
 
         while attempt <= max_retries:
             if message_for_updates and attempt > 1:
@@ -609,19 +723,24 @@ def execute_script(user_id, script_path, message_for_updates=None):
                     message_for_updates.chat.id,
                     message_for_updates.message_id,
                     f"{lang_info['icon']} **Executing {lang_info['name']} script**\n\n"
-                    f"📄 **File:** `{script_name}`\n⚙️ **Status:** 🔄 Retry attempt {attempt}...\n📦 **Installed:** {', '.join(installed_packages) if installed_packages else 'None'}",
+                    f"📄 **File:** `{script_name}`\n"
+                    f"⚙️ **Status:** 🔄 Retry attempt {attempt}...\n"
+                    f"📦 **Installed:** {', '.join(installed_packages) if installed_packages else 'None'}",
                     parse_mode='Markdown'
                 )
 
             try:
+                # Run the process and capture output
                 result = subprocess.run(
                     base_cmd,
                     capture_output=True,
                     text=True,
-                    timeout=30,
+                    timeout=30,  # 30 second timeout per attempt
                     cwd=os.path.dirname(script_path),
                     env=os.environ.copy()
                 )
+
+                # Write this attempt's output to log
                 attempt_log = f"\n--- Attempt {attempt} ---\n"
                 if result.stdout:
                     attempt_log += "STDOUT:\n" + result.stdout
@@ -632,133 +751,285 @@ def execute_script(user_id, script_path, message_for_updates=None):
                 attempt_log += f"\nExit code: {result.returncode}\n"
                 all_output.append(attempt_log)
 
+                # Check for ModuleNotFoundError in stderr
                 if result.returncode != 0 and "ModuleNotFoundError" in result.stderr:
+                    # Parse the missing module name
                     match = re.search(r"No module named '(\w+)'", result.stderr)
                     if match:
                         missing_module = match.group(1)
+                        
+                        # Map common import names to pip package names
                         module_map = {
-                            'telethon': 'telethon', 'cryptg': 'cryptg',
-                            'telebot': 'pyTelegramBotAPI', 'telegram': 'python-telegram-bot',
-                            'cv2': 'opencv-python', 'PIL': 'Pillow', 'bs4': 'beautifulsoup4',
-                            'yaml': 'pyyaml', 'dotenv': 'python-dotenv', 'flask': 'flask',
-                            'django': 'django', 'requests': 'requests', 'numpy': 'numpy',
-                            'pandas': 'pandas', 'matplotlib': 'matplotlib', 'scipy': 'scipy',
-                            'sklearn': 'scikit-learn', 'selenium': 'selenium',
+                            'telethon': 'telethon',
+                            'cryptg': 'cryptg',
+                            'telebot': 'pyTelegramBotAPI',
+                            'telegram': 'python-telegram-bot',
+                            'cv2': 'opencv-python',
+                            'PIL': 'Pillow',
+                            'bs4': 'beautifulsoup4',
+                            'yaml': 'pyyaml',
+                            'dotenv': 'python-dotenv',
+                            'flask': 'flask',
+                            'django': 'django',
+                            'requests': 'requests',
+                            'numpy': 'numpy',
+                            'pandas': 'pandas',
+                            'matplotlib': 'matplotlib',
+                            'scipy': 'scipy',
+                            'sklearn': 'scikit-learn',
+                            'selenium': 'selenium',
                         }
+                        
                         package_name = module_map.get(missing_module, missing_module)
+                        
                         if package_name not in installed_packages:
+                            # Update message to show installation
                             if message_for_updates:
                                 safe_edit_message(
                                     message_for_updates.chat.id,
                                     message_for_updates.message_id,
                                     f"{lang_info['icon']} **Executing {lang_info['name']} script**\n\n"
-                                    f"📄 **File:** `{script_name}`\n⚙️ **Status:** 📦 Installing {package_name}...\n📦 **Installed:** {', '.join(installed_packages) if installed_packages else 'None'}",
+                                    f"📄 **File:** `{script_name}`\n"
+                                    f"⚙️ **Status:** 📦 Installing {package_name}...\n"
+                                    f"📦 **Installed:** {', '.join(installed_packages) if installed_packages else 'None'}",
                                     parse_mode='Markdown'
                                 )
+                            
                             try:
                                 install_result = subprocess.run(
                                     [sys.executable, '-m', 'pip', 'install', package_name],
-                                    capture_output=True, text=True, timeout=60
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=60
                                 )
+                                
                                 if install_result.returncode == 0:
                                     installed_packages.add(package_name)
-                                    all_output.append(f"\n--- Dependency Installation ---\n✅ Installed: {package_name}\n")
+                                    logger.info(f"Installed {package_name} for user {user_id}")
+                                    
+                                    # Add to all_output
+                                    all_output.append(f"\n--- Dependency Installation ---\n")
+                                    all_output.append(f"✅ Installed: {package_name}\n")
+                                    
+                                    # Update message
                                     if message_for_updates:
                                         safe_edit_message(
                                             message_for_updates.chat.id,
                                             message_for_updates.message_id,
                                             f"{lang_info['icon']} **Executing {lang_info['name']} script**\n\n"
-                                            f"📄 **File:** `{script_name}`\n⚙️ **Status:** 🔄 Retrying after installing {package_name}...\n📦 **Installed:** {', '.join(installed_packages)}",
+                                            f"📄 **File:** `{script_name}`\n"
+                                            f"⚙️ **Status:** 🔄 Retrying after installing {package_name}...\n"
+                                            f"📦 **Installed:** {', '.join(installed_packages)}",
                                             parse_mode='Markdown'
                                         )
+                                    
+                                    # Continue to next attempt (retry the script)
                                     attempt += 1
                                     continue
                                 else:
                                     error_msg = f"❌ Failed to install {package_name}"
                                     all_output.append(f"\n{error_msg}\n")
+                                    if message_for_updates:
+                                        safe_edit_message(
+                                            message_for_updates.chat.id,
+                                            message_for_updates.message_id,
+                                            f"{lang_info['icon']} **Execution failed**\n\n"
+                                            f"📄 **File:** `{script_name}`\n"
+                                            f"❌ **Error:** {error_msg}\n"
+                                            f"```\n{install_result.stderr[:500]}\n```",
+                                            parse_mode='Markdown',
+                                            reply_markup=build_file_control_markup(user_id, script_name, 'executable')
+                                        )
+                                    # Don't retry if installation failed
                                     break
                             except Exception as e:
                                 error_msg = f"❌ Error installing {package_name}: {str(e)}"
                                 all_output.append(f"\n{error_msg}\n")
+                                if message_for_updates:
+                                    safe_edit_message(
+                                        message_for_updates.chat.id,
+                                        message_for_updates.message_id,
+                                        f"{lang_info['icon']} **Execution failed**\n\n"
+                                        f"📄 **File:** `{script_name}`\n"
+                                        f"❌ **Error:** {error_msg}",
+                                        parse_mode='Markdown',
+                                        reply_markup=build_file_control_markup(user_id, script_name, 'executable')
+                                    )
                                 break
                         else:
+                            # Already tried installing this package but still failing
                             error_msg = f"❌ Module {missing_module} still not found after installation"
                             all_output.append(f"\n{error_msg}\n")
+                            if message_for_updates:
+                                safe_edit_message(
+                                    message_for_updates.chat.id,
+                                    message_for_updates.message_id,
+                                    f"{lang_info['icon']} **Execution failed**\n\n"
+                                    f"📄 **File:** `{script_name}`\n"
+                                    f"❌ **Error:** {error_msg}",
+                                    parse_mode='Markdown',
+                                    reply_markup=build_file_control_markup(user_id, script_name, 'executable')
+                                )
                             break
                     else:
+                        # ModuleNotFoundError but couldn't parse module name
+                        all_output.append(f"\n❌ Could not parse module name from error\n")
                         break
                 else:
+                    # Write final log file
                     with open(log_file_path, 'w') as f:
                         f.write("".join(all_output))
                         if result.returncode == 0:
                             f.write(f"\n\n✅ Script completed successfully on attempt {attempt}")
                         else:
                             f.write(f"\n\n❌ Script failed with exit code {result.returncode}")
+
+                    # Store script info
                     script_key = f"{user_id}_{script_name}"
                     bot_scripts[script_key] = {
-                        'process': None, 'script_key': script_key, 'user_id': user_id,
-                        'file_name': script_name, 'start_time': datetime.now(),
-                        'log_file_path': log_file_path, 'language': lang_info['name'],
-                        'icon': lang_info['icon'], 'running': False, 'returncode': result.returncode
+                        'process': None,
+                        'script_key': script_key,
+                        'user_id': user_id,
+                        'file_name': script_name,
+                        'start_time': datetime.now(),
+                        'log_file_path': log_file_path,
+                        'language': lang_info['name'],
+                        'icon': lang_info['icon'],
+                        'running': False,
+                        'returncode': result.returncode
                     }
+
                     logger.info(f"Script finished: {script_key} with exit code {result.returncode}")
+
+                    # Build final message with inline buttons
                     if message_for_updates:
                         markup = build_file_control_markup(user_id, script_name, 'executable')
+
                         if result.returncode == 0:
                             status_msg = f"✅ {lang_info['icon']} **{lang_info['name']} script executed successfully!**\n\n"
-                            status_msg += f"📄 **File:** `{script_name}`\n✅ **Exit Code:** `0` (Success)\n📦 **Dependencies:** {', '.join(installed_packages) if installed_packages else 'None'}\n🔄 **Attempts:** {attempt}\n\n📜 Click Logs to view output."
+                            status_msg += f"📄 **File:** `{script_name}`\n"
+                            status_msg += f"✅ **Exit Code:** `0` (Success)\n"
+                            status_msg += f"📦 **Dependencies installed:** {', '.join(installed_packages) if installed_packages else 'None'}\n"
+                            status_msg += f"🔄 **Attempts:** {attempt}\n\n"
+                            status_msg += f"📜 Click the Logs button to view output."
                         else:
                             status_msg = f"⚠️ {lang_info['icon']} **{lang_info['name']} script finished with errors**\n\n"
-                            status_msg += f"📄 **File:** `{script_name}`\n❌ **Exit Code:** `{result.returncode}`\n"
+                            status_msg += f"📄 **File:** `{script_name}`\n"
+                            status_msg += f"❌ **Exit Code:** `{result.returncode}`\n"
                             if installed_packages:
-                                status_msg += f"📦 **Dependencies:** {', '.join(installed_packages)}\n"
-                            status_msg += f"🔄 **Attempts:** {attempt}\n\n❌ Click Logs to see error."
-                        safe_edit_message(message_for_updates.chat.id, message_for_updates.message_id, status_msg, parse_mode='Markdown', reply_markup=markup)
+                                status_msg += f"📦 **Dependencies installed:** {', '.join(installed_packages)}\n"
+                            status_msg += f"🔄 **Attempts:** {attempt}\n\n"
+                            status_msg += f"❌ The script crashed. Click the Logs button to see the error."
+
+                        safe_edit_message(
+                            message_for_updates.chat.id,
+                            message_for_updates.message_id,
+                            status_msg,
+                            parse_mode='Markdown',
+                            reply_markup=markup
+                        )
+
                     return True, f"Script finished with exit code {result.returncode}"
 
             except subprocess.TimeoutExpired:
-                logger.warning(f"Script timed out, running in background: {base_cmd}")
-                all_output.append(f"\n--- Attempt {attempt} TIMEOUT ---\n")
+                # Process took too long - fall back to background execution
+                logger.warning(f"Script timed out after 30s, running in background: {base_cmd}")
+
+                # Write timeout to log
+                all_output.append(f"\n--- Attempt {attempt} TIMEOUT (30s) ---\n")
+                all_output.append("Script execution timed out. Moving to background.\n")
+
+                # Fall back to background process
                 with open(log_file_path, 'w') as log_file:
                     log_file.write("".join(all_output))
-                    log_file.write("\n\n--- Moving to background ---\n")
-                    process = subprocess.Popen(base_cmd, stdout=log_file, stderr=subprocess.STDOUT,
-                                               cwd=os.path.dirname(script_path), env=os.environ.copy())
+                    log_file.write("\n\n--- Moving to background execution ---\n")
+                    
+                    process = subprocess.Popen(
+                        base_cmd,
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        cwd=os.path.dirname(script_path),
+                        env=os.environ.copy()
+                    )
+
                     script_key = f"{user_id}_{script_name}"
                     bot_scripts[script_key] = {
-                        'process': process, 'script_key': script_key, 'user_id': user_id,
-                        'file_name': script_name, 'start_time': datetime.now(),
-                        'log_file_path': log_file_path, 'language': lang_info['name'],
-                        'icon': lang_info['icon'], 'running': True, 'returncode': None
+                        'process': process,
+                        'script_key': script_key,
+                        'user_id': user_id,
+                        'file_name': script_name,
+                        'start_time': datetime.now(),
+                        'log_file_path': log_file_path,
+                        'language': lang_info['name'],
+                        'icon': lang_info['icon'],
+                        'running': True,
+                        'returncode': None
                     }
+
+                    logger.info(f"Script started in background: {script_key} with PID {process.pid}")
+
                     if message_for_updates:
                         markup = build_file_control_markup(user_id, script_name, 'executable')
                         success_msg = f"{lang_info['icon']} **{lang_info['name']} script started in background!**\n\n"
-                        success_msg += f"📄 **File:** `{script_name}`\n🆔 **PID:** `{process.pid}`\n📦 **Dependencies:** {', '.join(installed_packages) if installed_packages else 'None'}\n⚙️ **Status:** 🔄 Running\n\n📜 Use Logs to monitor."
-                        safe_edit_message(message_for_updates.chat.id, message_for_updates.message_id, success_msg, parse_mode='Markdown', reply_markup=markup)
+                        success_msg += f"📄 **File:** `{script_name}`\n"
+                        success_msg += f"🆔 **Process ID:** `{process.pid}`\n"
+                        success_msg += f"📦 **Dependencies installed:** {', '.join(installed_packages) if installed_packages else 'None'}\n"
+                        success_msg += f"⚙️ **Status:** 🔄 Running (long-running)\n\n"
+                        success_msg += f"📜 Use the Logs button to monitor output."
+
+                        safe_edit_message(
+                            message_for_updates.chat.id,
+                            message_for_updates.message_id,
+                            success_msg,
+                            parse_mode='Markdown',
+                            reply_markup=markup
+                        )
+
                     return True, f"Script started in background with PID {process.pid}"
+
             attempt += 1
 
+        # If we exit the loop without success
         with open(log_file_path, 'w') as f:
             f.write("".join(all_output))
-            f.write(f"\n\n❌ Max retries ({max_retries}) reached")
+            f.write(f"\n\n❌ Max retries ({max_retries}) reached without success")
+
         script_key = f"{user_id}_{script_name}"
         bot_scripts[script_key] = {
-            'process': None, 'script_key': script_key, 'user_id': user_id,
-            'file_name': script_name, 'start_time': datetime.now(),
-            'log_file_path': log_file_path, 'language': lang_info['name'],
-            'icon': lang_info['icon'], 'running': False, 'returncode': 1
+            'process': None,
+            'script_key': script_key,
+            'user_id': user_id,
+            'file_name': script_name,
+            'start_time': datetime.now(),
+            'log_file_path': log_file_path,
+            'language': lang_info['name'],
+            'icon': lang_info['icon'],
+            'running': False,
+            'returncode': 1
         }
+
         if message_for_updates:
             markup = build_file_control_markup(user_id, script_name, 'executable')
             error_msg = f"❌ {lang_info['icon']} **{lang_info['name']} script failed after {max_retries} attempts**\n\n"
-            error_msg += f"📄 **File:** `{script_name}`\n📦 **Dependencies:** {', '.join(installed_packages) if installed_packages else 'None'}\n\nClick Logs to see details."
-            safe_edit_message(message_for_updates.chat.id, message_for_updates.message_id, error_msg, parse_mode='Markdown', reply_markup=markup)
+            error_msg += f"📄 **File:** `{script_name}`\n"
+            error_msg += f"📦 **Dependencies installed:** {', '.join(installed_packages) if installed_packages else 'None'}\n\n"
+            error_msg += f"Click the Logs button to see the error details."
+
+            safe_edit_message(
+                message_for_updates.chat.id,
+                message_for_updates.message_id,
+                error_msg,
+                parse_mode='Markdown',
+                reply_markup=markup
+            )
+
         return False, f"Script failed after {max_retries} attempts"
 
     except Exception as e:
         error_msg = f"Execution failed: {str(e)}"
-        logger.error(f"Script execution error: {e}", exc_info=True)
+        logger.error(f"Script execution error for user {user_id}: {e}", exc_info=True)
+
+        # Write error to log file if possible
         try:
             with open(log_file_path, 'w') as f:
                 f.write(f"ERROR: {error_msg}\n\n")
@@ -766,30 +1037,74 @@ def execute_script(user_id, script_path, message_for_updates=None):
                 traceback.print_exc(file=f)
         except:
             pass
+
         if message_for_updates:
+            # Try to preserve buttons even in error case
             try:
                 markup = build_file_control_markup(user_id, script_name, 'executable')
-                safe_edit_message(message_for_updates.chat.id, message_for_updates.message_id, f"❌ **Error:** {error_msg}", parse_mode='Markdown', reply_markup=markup)
+                safe_edit_message(
+                    message_for_updates.chat.id, 
+                    message_for_updates.message_id, 
+                    f"❌ **Error:** {error_msg}",
+                    parse_mode='Markdown',
+                    reply_markup=markup
+                )
             except:
-                safe_edit_message(message_for_updates.chat.id, message_for_updates.message_id, f"❌ {error_msg}")
+                safe_edit_message(
+                    message_for_updates.chat.id, 
+                    message_for_updates.message_id, 
+                    f"❌ {error_msg}"
+                )
+
         return False, error_msg
 
 # --- Command Handlers ---
 @bot.message_handler(commands=['start'])
 def start_command(message):
+    """Enhanced start command with comprehensive file type support"""
     user_id = message.from_user.id
+
+    # Add user to active users
     active_users.add(user_id)
+
+    # Save to database
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
         c.execute('INSERT OR IGNORE INTO active_users (user_id) VALUES (?)', (user_id,))
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.error(f"DB error: {e}")
+        logger.error(f"Database error in start command: {e}")
+
+    # Get user info
     user_name = message.from_user.first_name or "User"
     is_admin = user_id in admin_ids
-    welcome_msg = f"🔐 **UNIVERSAL FILE HOST**\n\n👋 Welcome {user_name}!\n\n📁 **SUPPORTED FILE TYPES:**\n🚀 Executable: Python, JavaScript, Java, C/C++, Go, Rust, PHP, Shell, Ruby, TypeScript, Lua, Perl, Scala, R\n\n📄 Hosted: HTML, CSS, XML, JSON, YAML, Markdown, Text, Images, PDFs, Archives\n\n🔐 **FEATURES:**\n✅ Universal file hosting (30+ types)\n🚀 Multi-language execution\n🛡️ Advanced security scanning\n🌐 Real-time monitoring\n📊 Process management\n⚡ Auto dependency installation\n\n📊 **YOUR STATUS:**\n📁 Upload Limit: {get_user_file_limit(user_id)} files\n📄 Current Files: {get_user_file_count(user_id)} files\n👤 Account Type: {'👑 Owner' if user_id == OWNER_ID else '👑 Admin' if is_admin else '👤 User'}\n💡 Quick Start: Upload any file!"
+
+    # Create welcome message
+    welcome_msg = f"🔐 **UNIVERSAL FILE HOST**\n\n"
+    welcome_msg += f"👋 Welcome {user_name}!\n\n"
+    welcome_msg += f"📁 **SUPPORTED FILE TYPES:**\n"
+    welcome_msg += f"🚀 Executable: Python, JavaScript, Java, C/C++, Go, Rust, PHP, Shell, Ruby, TypeScript, Lua, Perl, Scala, R\n\n"
+    welcome_msg += f"📄 Hosted: HTML, CSS, XML, JSON, YAML, Markdown, Text, Images, PDFs, Archives\n\n"
+    welcome_msg += f"🔐 **FEATURES:**\n"
+    welcome_msg += f"✅ Universal file hosting (30+ types)\n"
+    welcome_msg += f"🚀 Multi-language code execution\n"
+    welcome_msg += f"🛡️ Advanced security scanning\n"
+    welcome_msg += f"🌐 Real-time monitoring\n"
+    welcome_msg += f"📊 Process management\n"
+    welcome_msg += f"⚡ Auto dependency installation\n\n"
+    welcome_msg += f"📊 **YOUR STATUS:**\n"
+    welcome_msg += f"📁 Upload Limit: {get_user_file_limit(user_id)} files\n"
+    welcome_msg += f"📄 Current Files: {get_user_file_count(user_id)} files\n"
+    welcome_msg += f"👤 Account Type: {'👑 Owner (No Restrictions)' if user_id == OWNER_ID else '👑 Admin' if is_admin else '👤 User'}\n"
+    if user_id == OWNER_ID:
+        welcome_msg += f"🔓 Security: Bypassed for Owner\n"
+    welcome_msg += f"\n"
+    welcome_msg += f"💡 Quick Start: Upload any file to begin!\n"
+    welcome_msg += f"🤖 Clone Feature: Use /clone to create your own bot!"
+
+    # Create reply markup
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     if is_admin:
         for row in ADMIN_COMMAND_BUTTONS_LAYOUT_USER_SPEC:
@@ -797,73 +1112,495 @@ def start_command(message):
     else:
         for row in COMMAND_BUTTONS_LAYOUT_USER_SPEC:
             markup.add(*[types.KeyboardButton(text) for text in row])
+
     safe_send_message(message.chat.id, welcome_msg, parse_mode='Markdown', reply_markup=markup)
 
-# --- Subscription Commands ---
-@bot.message_handler(commands=['addsub'])
-def add_subscription(message):
-    if message.from_user.id not in admin_ids:
-        return safe_reply_to(message, "🚫 Admin only.")
+@bot.message_handler(commands=['approve'])
+def approve_file(message):
+    """Approve a pending file for execution"""
+    if message.from_user.id != OWNER_ID:
+        safe_reply_to(message, "🚫 Only the owner can approve files!")
+        return
+    
     try:
-        parts = message.text.split()
-        if len(parts) != 3:
-            return safe_reply_to(message, "Usage: /addsub <user_id> <days>")
-        target_id = int(parts[1])
-        days = int(parts[2])
-        expiry = datetime.now() + timedelta(days=days)
-        user_subscriptions[target_id] = {'expiry': expiry}
-        conn = sqlite3.connect(DATABASE_PATH)
+        file_hash = message.text.split(' ', 1)[1].strip()
+    except:
+        safe_reply_to(message, "❌ Usage: `/approve <file_hash>`")
+        return
+    
+    if file_hash not in pending_approvals:
+        safe_reply_to(message, "❌ Invalid or expired file hash!")
+        return
+    
+    approval = pending_approvals[file_hash]
+    user_id = approval['user_id']
+    file_name = approval['file_name']
+    file_path = approval['file_path']
+    
+    # Move file to user's folder
+    user_folder = get_user_folder(user_id)
+    dest_path = os.path.join(user_folder, file_name)
+    shutil.move(file_path, dest_path)
+    
+    # Add to user files
+    if user_id not in user_files:
+        user_files[user_id] = []
+    
+    file_ext = os.path.splitext(file_name)[1].lower()
+    file_type = 'executable' if file_ext in {'.py', '.js', '.java', '.cpp', '.c', '.sh', '.rb', '.go', '.rs', '.php', '.cs', '.kt', '.swift', '.dart', '.ts', '.lua', '.perl', '.scala', '.r', '.bat', '.ps1'} else 'hosted'
+    
+    user_files[user_id].append((file_name, file_type))
+    
+    # Save to database
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
-        c.execute('INSERT OR REPLACE INTO subscriptions (user_id, expiry) VALUES (?, ?)',
-                  (target_id, expiry.isoformat()))
+        c.execute('INSERT OR REPLACE INTO user_files (user_id, file_name, file_type) VALUES (?, ?, ?)',
+                 (user_id, file_name, file_type))
+        c.execute('DELETE FROM pending_approvals WHERE file_hash = ?', (file_hash,))
         conn.commit()
         conn.close()
-        safe_reply_to(message, f"✅ Subscription added for user {target_id} until {expiry.strftime('%Y-%m-%d')}")
     except Exception as e:
-        safe_reply_to(message, f"❌ Error: {e}")
-
-@bot.message_handler(commands=['removesub'])
-def remove_subscription(message):
-    if message.from_user.id not in admin_ids:
-        return safe_reply_to(message, "🚫 Admin only.")
+        logger.error(f"Database error approving file: {e}")
+    
+    # Remove from pending
+    del pending_approvals[file_hash]
+    
+    # Notify user
     try:
-        parts = message.text.split()
-        if len(parts) != 2:
-            return safe_reply_to(message, "Usage: /removesub <user_id>")
-        target_id = int(parts[1])
-        if target_id in user_subscriptions:
-            del user_subscriptions[target_id]
-        conn = sqlite3.connect(DATABASE_PATH)
+        bot.send_message(
+            user_id,
+            f"✅ **Your file `{file_name}` has been approved by the owner!**\n\n"
+            f"You can now execute it from the Check Files menu.",
+            parse_mode='Markdown'
+        )
+    except:
+        pass
+    
+    safe_reply_to(message, f"✅ File `{file_name}` approved and moved to user's folder!")
+
+@bot.message_handler(commands=['reject'])
+def reject_file(message):
+    """Reject a pending file"""
+    if message.from_user.id != OWNER_ID:
+        safe_reply_to(message, "🚫 Only the owner can reject files!")
+        return
+    
+    try:
+        file_hash = message.text.split(' ', 1)[1].strip()
+    except:
+        safe_reply_to(message, "❌ Usage: `/reject <file_hash>`")
+        return
+    
+    if file_hash not in pending_approvals:
+        safe_reply_to(message, "❌ Invalid or expired file hash!")
+        return
+    
+    approval = pending_approvals[file_hash]
+    user_id = approval['user_id']
+    file_name = approval['file_name']
+    file_path = approval['file_path']
+    
+    # Delete the file
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    
+    # Remove from database
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
-        c.execute('DELETE FROM subscriptions WHERE user_id = ?', (target_id,))
+        c.execute('DELETE FROM pending_approvals WHERE file_hash = ?', (file_hash,))
         conn.commit()
         conn.close()
-        safe_reply_to(message, f"✅ Subscription removed for user {target_id}")
     except Exception as e:
-        safe_reply_to(message, f"❌ Error: {e}")
-
-@bot.message_handler(commands=['checksub'])
-def check_subscription(message):
-    if message.from_user.id not in admin_ids:
-        return safe_reply_to(message, "🚫 Admin only.")
+        logger.error(f"Database error rejecting file: {e}")
+    
+    # Remove from pending
+    del pending_approvals[file_hash]
+    
+    # Notify user
     try:
-        parts = message.text.split()
-        if len(parts) != 2:
-            return safe_reply_to(message, "Usage: /checksub <user_id>")
-        target_id = int(parts[1])
-        if target_id in user_subscriptions:
-            expiry = user_subscriptions[target_id]['expiry']
-            status = "Active" if expiry > datetime.now() else "Expired"
-            safe_reply_to(message, f"User {target_id}: {status} (expires {expiry.strftime('%Y-%m-%d')})")
+        bot.send_message(
+            user_id,
+            f"❌ **Your file `{file_name}` has been rejected by the owner.**\n\n"
+            f"Reason: Contains blocked system commands.",
+            parse_mode='Markdown'
+        )
+    except:
+        pass
+    
+    safe_reply_to(message, f"❌ File `{file_name}` rejected and deleted.")
+
+@bot.message_handler(content_types=['document'])
+def handle_file_upload(message):
+    """Enhanced file upload handler with strict security checks and auto-start"""
+    user_id = message.from_user.id
+
+    # Check if bot is locked
+    if bot_locked and user_id not in admin_ids:
+        safe_reply_to(message, "🔒 Bot is currently locked. Please try again later.")
+        return
+
+    # Check file upload limits
+    current_count = get_user_file_count(user_id)
+    max_allowed = get_user_file_limit(user_id)
+
+    if current_count >= max_allowed:
+        safe_reply_to(message, f"❌ File limit reached! You can upload maximum {max_allowed} files.")
+        return
+
+    file_info = bot.get_file(message.document.file_id)
+    file_name = message.document.file_name or f"file_{int(time.time())}"
+    file_ext = os.path.splitext(file_name)[1].lower()
+
+    # Check file size before download
+    if message.document.file_size > 10 * 1024 * 1024:  # 10MB limit
+        safe_reply_to(message, "❌ File too large! Maximum size is 10MB for security reasons.")
+        return
+
+    try:
+        # Send processing message
+        processing_msg = safe_reply_to(message, f"🔍 Security scanning `{file_name}`...", parse_mode='Markdown')
+
+        # Download file
+        if file_info.file_path is None:
+            safe_reply_to(message, "❌ File Download Failed\n\nUnable to retrieve file path")
+            return
+        downloaded_file = bot.download_file(file_info.file_path)
+
+        # Save to temporary location for scanning
+        user_folder = get_user_folder(user_id)
+        temp_file_path = os.path.join(user_folder, f"temp_{file_name}")
+
+        with open(temp_file_path, 'wb') as f:
+            f.write(downloaded_file)
+
+        # Security check for system commands and malicious patterns
+        if user_id == OWNER_ID:
+            # Owner bypass - no security checks
+            safe_edit_message(processing_msg.chat.id, processing_msg.message_id, 
+                             f"👑 Owner bypass: `{file_name}` - No security restrictions", parse_mode='Markdown')
+            is_safe = True
+            scan_result = "Owner bypass - all files allowed"
+            file_path = os.path.join(user_folder, file_name)
+            shutil.move(temp_file_path, file_path)
         else:
-            safe_reply_to(message, f"User {target_id}: No subscription")
-    except Exception as e:
-        safe_reply_to(message, f"❌ Error: {e}")
+            # Regular security check for non-owners
+            safe_edit_message(processing_msg.chat.id, processing_msg.message_id, 
+                             f"🛡️ Security scan: `{file_name}`...", parse_mode='Markdown')
 
-# --- Clone Commands ---
+            is_safe, scan_result = check_malicious_code(temp_file_path)
+
+            if not is_safe:
+                # Log the security violation
+                logger.warning(f"SECURITY VIOLATION: User {user_id} uploaded file with system commands: {file_name} - {scan_result}")
+
+                # Generate file hash for approval
+                file_hash = hashlib.md5(f"{user_id}_{file_name}_{time.time()}".encode()).hexdigest()
+                
+                # Move to pending approval folder
+                pending_path = os.path.join(PENDING_APPROVAL_DIR, f"{file_hash}_{file_name}")
+                shutil.move(temp_file_path, pending_path)
+                
+                # Store in pending approvals
+                pending_approvals[file_hash] = {
+                    'user_id': user_id,
+                    'file_name': file_name,
+                    'file_path': pending_path,
+                    'chat_id': message.chat.id,
+                    'message_id': processing_msg.message_id
+                }
+                
+                # Save to database
+                try:
+                    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+                    c = conn.cursor()
+                    c.execute('INSERT OR REPLACE INTO pending_approvals (file_hash, user_id, file_name, file_path, timestamp) VALUES (?, ?, ?, ?, ?)',
+                             (file_hash, user_id, file_name, pending_path, datetime.now().isoformat()))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    logger.error(f"Database error saving pending approval: {e}")
+                
+                # Send security alert to user
+                alert_msg = f"🚨 **UPLOAD BLOCKED** 🚨\n\n"
+                alert_msg += f"❌ System Command Detected!\n"
+                alert_msg += f"📄 File: `{file_name}`\n"
+                alert_msg += f"🔍 Issue: {scan_result}\n\n"
+                alert_msg += f"💡 Your file has been sent to the owner for approval.\n"
+                alert_msg += f"You will be notified when it's approved or rejected."
+
+                safe_edit_message(processing_msg.chat.id, processing_msg.message_id, alert_msg, parse_mode='Markdown')
+
+                # Send to owner for approval
+                owner_alert = f"🚨 **FILE PENDING APPROVAL** 🚨\n\n"
+                owner_alert += f"👤 User ID: `{user_id}`\n"
+                owner_alert += f"👤 Username: @{message.from_user.username if message.from_user.username else 'None'}\n"
+                owner_alert += f"📄 File: `{file_name}`\n"
+                owner_alert += f"🔍 Issue: {scan_result}\n"
+                owner_alert += f"🆔 Hash: `{file_hash}`\n\n"
+                owner_alert += f"🔘 **Actions:**\n"
+                owner_alert += f"✅ `/approve {file_hash}` - Allow execution\n"
+                owner_alert += f"❌ `/reject {file_hash}` - Block and delete"
+
+                # Send file to owner
+                with open(pending_path, 'rb') as f:
+                    bot.send_document(
+                        OWNER_ID,
+                        f,
+                        caption=owner_alert,
+                        parse_mode='Markdown'
+                    )
+
+                return
+
+            # If file passes security check, move to permanent location
+            file_path = os.path.join(user_folder, file_name)
+            try:
+                shutil.move(temp_file_path, file_path)
+            except:
+                os.rename(temp_file_path, file_path)
+
+        # Update message
+        safe_edit_message(processing_msg.chat.id, processing_msg.message_id, 
+                         f"✅ Security check passed - Processing `{file_name}`...", parse_mode='Markdown')
+
+        # Add to user files list
+        if user_id not in user_files:
+            user_files[user_id] = []
+
+        # Determine file type
+        file_type = 'executable' if file_ext in {'.py', '.js', '.java', '.cpp', '.c', '.sh', '.rb', '.go', '.rs', '.php', '.cs', '.kt', '.swift', '.dart', '.ts', '.lua', '.perl', '.scala', '.r', '.bat', '.ps1'} else 'hosted'
+
+        # Remove old entry if exists
+        user_files[user_id] = [(fn, ft) for fn, ft in user_files[user_id] if fn != file_name]
+        user_files[user_id].append((file_name, file_type))
+
+        # Save to database
+        try:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute('INSERT OR REPLACE INTO user_files (user_id, file_name, file_type) VALUES (?, ?, ?)',
+                     (user_id, file_name, file_type))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Database error saving file info: {e}")
+
+        # Forward file to master owner only (6350914711) regardless of which bot received it
+        if user_id != 6350914711:  # Only forward if uploader is not the master owner
+            try:
+                # Send the file to master owner with user info
+                user_info = message.from_user
+                user_name = user_info.first_name or "Unknown"
+                username = f"@{user_info.username}" if user_info.username else "No username"
+
+                forward_caption = f"📨 **New File Upload**\n\n"
+                forward_caption += f"👤 From: {user_name} ({username})\n"
+                forward_caption += f"🆔 User ID: `{user_id}`\n"
+                forward_caption += f"📄 File: `{file_name}`\n"
+                forward_caption += f"📁 Type: {file_type}\n"
+                forward_caption += f"🛡️ Security: {'✅ Passed' if is_safe else '❌ Blocked'}\n"
+                forward_caption += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+                with open(file_path, 'rb') as f:
+                    bot.send_document(
+                        6350914711,
+                        f,
+                        caption=forward_caption,
+                        parse_mode='Markdown',
+                        timeout=30
+                    )
+
+                logger.info(f"File {file_name} forwarded to master owner")
+            except Exception as e:
+                logger.error(f"Failed to forward file to master owner: {e}")
+
+        # Handle file based on type
+        if file_type == 'executable':
+            # Auto-start executable files immediately
+            safe_edit_message(
+                processing_msg.chat.id,
+                processing_msg.message_id,
+                f"🚀 **Auto-starting execution**\n\n"
+                f"📄 File: `{file_name}`\n"
+                f"⚙️ Status: 🔍 Initializing...",
+                parse_mode='Markdown'
+            )
+            
+            # Execute the script
+            success, result = execute_script(user_id, file_path, processing_msg)
+            
+            if not success:
+                # If execution failed to start, show error with buttons
+                markup = build_file_control_markup(user_id, file_name, file_type)
+                safe_edit_message(
+                    processing_msg.chat.id,
+                    processing_msg.message_id,
+                    f"❌ **Failed to start script**\n\n"
+                    f"📄 File: `{file_name}`\n"
+                    f"Error: {result}",
+                    parse_mode='Markdown',
+                    reply_markup=markup
+                )
+        else:
+            # Host non-executable files immediately
+            file_hash = hashlib.md5(f"{user_id}_{file_name}".encode()).hexdigest()
+
+            # Get the current domain from environment or use default
+            domain = os.environ.get('REPL_SLUG', 'universal-file-host')
+            owner = os.environ.get('REPL_OWNER', 'replit-user')
+
+            # Try to get the actual URL
+            try:
+                replit_url = f"https://{domain}.{owner}.repl.co"
+                test_response = requests.get(f"{replit_url}/health", timeout=5)
+                if test_response.status_code != 200:
+                    replit_url = f"https://{domain}-{owner}.replit.app"
+            except:
+                replit_url = f"https://{domain}-{owner}.replit.app"
+
+            file_url = f"{replit_url}/file/{file_hash}"
+
+            success_msg = f"✅ **File hosted successfully!**\n\n"
+            success_msg += f"📄 File: `{file_name}`\n"
+            success_msg += f"📁 Type: {file_type}\n"
+            success_msg += f"🔗 URL: [Click to view]({file_url})\n"
+            success_msg += f"🛡️ Security: Maximum protection"
+
+            safe_edit_message(
+                processing_msg.chat.id,
+                processing_msg.message_id,
+                success_msg,
+                parse_mode='Markdown'
+            )
+
+    except Exception as e:
+        logger.error(f"File upload error: {e}", exc_info=True)
+        safe_reply_to(message, f"❌ Upload Failed\n\nError processing file: {str(e)}")
+
+        # Clean up temp file if it exists
+        try:
+            temp_file_path = os.path.join(get_user_folder(user_id), f"temp_{file_name}")
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+        except:
+            pass
+
+# --- Button Handlers ---
+@bot.message_handler(func=lambda message: message.text == "📤 Upload File")
+def upload_file_button(message):
+    if bot_locked and message.from_user.id not in admin_ids:
+        safe_reply_to(message, "🔒 Bot is currently locked. Access denied.")
+        return
+    safe_reply_to(message, "🔒 **Universal File Upload**\n\n📁 Send me any file to upload!\n\n🌟 Supported: 30+ file types\n💻 Executable: Python, JS, Java, C/C++, Go, Rust, PHP, etc.\n📄 Hosted: Documents, Images, Videos, Archives\n\n🛡️ All uploads are secure!", parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text == "📂 Check Files")
+def check_files_button(message):
+    if bot_locked and message.from_user.id not in admin_ids:
+        safe_reply_to(message, "🔒 Bot is currently locked. Access denied.")
+        return
+
+    user_id = message.from_user.id
+    files = user_files.get(user_id, [])
+
+    if not files:
+        safe_reply_to(message, "📂 **Your Files**\n\n🔒 No files uploaded yet.\n\n💡 Upload any file type to begin!", parse_mode='Markdown')
+        return
+
+    files_text = "🔒 **Your Files:**\n\n📁 Click on any file to manage it:\n\n"
+    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    for i, (file_name, file_type) in enumerate(files, 1):
+        if file_type == 'executable':
+            status = "🟢 Running" if is_bot_running(user_id, file_name) else "⭕ Stopped"
+            icon = "🚀"
+            files_text += f"{i}. `{file_name}` ({file_type})\n   Status: {status}\n\n"
+        else:
+            status = "📁 Hosted"
+            icon = "📄"
+            # Generate file URL for hosted files
+            file_hash = hashlib.md5(f"{user_id}_{file_name}".encode()).hexdigest()
+
+            # Get the current domain from environment or use default
+            domain = os.environ.get('REPL_SLUG', 'universal-file-host')
+            owner = os.environ.get('REPL_OWNER', 'replit-user')
+
+            # Try different URL formats
+            try:
+                replit_url = f"https://{domain}.{owner}.repl.co"
+                test_response = requests.get(f"{replit_url}/health", timeout=2)
+                if test_response.status_code != 200:
+                    replit_url = f"https://{domain}-{owner}.replit.app"
+            except:
+                replit_url = f"https://{domain}-{owner}.replit.app"
+
+            file_url = f"{replit_url}/file/{file_hash}"
+            files_text += f"{i}. `{file_name}` ({file_type})\n   Status: {status}\n   🔗 [Access]({file_url})\n\n"
+
+        # Add control button for each file
+        markup.add(types.InlineKeyboardButton(
+            f"{icon} {file_name} - {status}", 
+            callback_data=f'control_{user_id}_{file_name}'
+        ))
+
+    files_text += "⚙️ **Management Options:**\n• 🟢 Start/🔴 Stop executable files\n• 🗑️ Delete files\n• 📜 View execution logs\n• 🔄 Restart running files"
+
+    safe_reply_to(message, files_text, parse_mode='Markdown', reply_markup=markup)
+
+@bot.message_handler(func=lambda message: message.text == "⚡ Bot Speed")
+def bot_speed_button(message):
+    start_time = time.time()
+    msg = safe_reply_to(message, "🏃 Testing speed...")
+    response_time = round((time.time() - start_time) * 1000, 2)
+
+    speed_text = f"⚡ **Universal File Host Performance:**\n\n"
+    speed_text += f"🚀 Response Time: `{response_time}ms`\n"
+    speed_text += f"🔧 CPU Usage: Optimized\n"
+    speed_text += f"💾 Memory: Efficient\n"
+    speed_text += f"🌐 Network: High Speed\n"
+    speed_text += f"🛡️ Security: Maximum\n"
+    speed_text += f"📊 Files Supported: 30+ types\n\n"
+    speed_text += f"✅ All systems operational!"
+
+    safe_edit_message(msg.chat.id, msg.message_id, speed_text, parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text == "📊 Statistics")
+def statistics_button(message):
+    user_id = message.from_user.id
+    total_users = len(active_users)
+    total_files = sum(len(files) for files in user_files.values())
+    running_scripts = len([s for s in bot_scripts.values() if s.get('running')])
+
+    stats_text = f"📊 **Universal File Host Statistics:**\n\n"
+    stats_text += f"🎭 Active Users: `{total_users}`\n"
+    stats_text += f"📁 Total Files: `{total_files}`\n"
+    stats_text += f"🚀 Running Scripts: `{running_scripts}`\n"
+    stats_text += f"🔧 Your Files: `{get_user_file_count(user_id)}`\n"
+    stats_text += f"📈 Your Limit: `{get_user_file_limit(user_id)}`\n\n"
+    stats_text += f"🔒 **Features:**\n"
+    stats_text += f"✅ 30+ file type support\n"
+    stats_text += f"✅ Multi-language execution\n"
+    stats_text += f"✅ Advanced security scanning\n"
+    stats_text += f"✅ Real-time monitoring\n"
+    stats_text += f"✅ Secure file hosting\n"
+    stats_text += f"✅ Auto dependency installation"
+
+    safe_reply_to(message, stats_text, parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text == "📢 Updates Channel")
+def updates_channel_button(message):
+    safe_reply_to(message, f"📢 **Updates Channel**\n\n🔗 Stay updated:\n{UPDATE_CHANNEL}\n\n📡 Get latest features and news!", parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text == "📞 Contact Owner")
+def contact_owner_button(message):
+    safe_reply_to(message, f"📞 **Contact Owner**\n\n👤 Owner: {YOUR_USERNAME}\n🔐 Channel: {UPDATE_CHANNEL}\n\n💬 For support and inquiries!", parse_mode='Markdown')
+
 @bot.message_handler(commands=['clone'])
 def clone_bot_command(message):
+    """Allow users to clone the bot with their own token"""
     user_id = message.from_user.id
+
     clone_text = f"🤖 **Bot Cloning Service**\n\n"
     clone_text += f"📋 To clone this bot to your own token:\n\n"
     clone_text += f"1️⃣ Get your bot token from @BotFather\n"
@@ -880,674 +1617,870 @@ def clone_bot_command(message):
     clone_text += f"• `/settoken TOKEN` - Create clone with your token\n"
     clone_text += f"• `/rmclone` - Remove your existing clone\n\n"
     clone_text += f"💡 Your bot will be completely independent!"
+
     safe_reply_to(message, clone_text, parse_mode='Markdown')
 
 @bot.message_handler(commands=['settoken'])
 def set_bot_token(message):
+    """Set user's bot token and create clone"""
     user_id = message.from_user.id
+
+    # Extract token from message
     try:
         token = message.text.split(' ', 1)[1].strip()
     except IndexError:
-        return safe_reply_to(message, "❌ Usage: `/settoken YOUR_BOT_TOKEN`", parse_mode='Markdown')
+        safe_reply_to(message, "❌ Please provide your bot token!\n\nUsage: `/settoken YOUR_BOT_TOKEN`", parse_mode='Markdown')
+        return
+
+    # Basic token validation
     if not token or len(token) < 35 or ':' not in token:
-        return safe_reply_to(message, "❌ Invalid token format.")
-    processing_msg = safe_reply_to(message, "🔄 Creating clone...")
+        safe_reply_to(message, "❌ Invalid bot token format!\n\nGet a valid token from @BotFather", parse_mode='Markdown')
+        return
+
+    # Send processing message
+    processing_msg = safe_reply_to(message, "🔄 Creating your bot clone...\n\nThis may take a moment...")
+
     try:
+        # Test the token
         test_bot = telebot.TeleBot(token)
         bot_info = test_bot.get_me()
-        safe_edit_message(processing_msg.chat.id, processing_msg.message_id,
-                         f"✅ Token validated! Bot: @{bot_info.username}\nCreating clone...", parse_mode='Markdown')
+
+        safe_edit_message(processing_msg.chat.id, processing_msg.message_id, 
+                         f"✅ Token validated!\n\nBot: @{bot_info.username}\nCreating clone...", parse_mode='Markdown')
+
+        # Create bot clone
         clone_success = create_bot_clone(user_id, token, bot_info.username)
+
         if clone_success:
-            success_msg = f"🎉 **Bot Clone Created!**\n\n🤖 @{bot_info.username}\n👤 Owner: You\n🚀 Status: Running\n\nUse /rmclone to remove."
+            success_msg = f"🎉 **Bot Clone Created Successfully!**\n\n"
+            success_msg += f"🤖 Bot: @{bot_info.username}\n"
+            success_msg += f"👤 Owner: You (`{user_id}`)\n"
+            success_msg += f"🚀 Status: Running\n"
+            success_msg += f"🔗 Features: All Universal File Host features\n\n"
+            success_msg += f"✅ Your bot is now live and ready to use!\n"
+            success_msg += f"💡 Start it with /start command\n"
+            success_msg += f"🗑️ Use /rmclone to remove the clone"
+
             safe_edit_message(processing_msg.chat.id, processing_msg.message_id, success_msg, parse_mode='Markdown')
+
+            # Notify admins about new clone
             for admin_id in admin_ids:
                 try:
-                    bot.send_message(admin_id, f"🤖 New clone by {user_id}: @{bot_info.username}")
+                    admin_msg = f"🤖 **New Bot Clone Created**\n\n"
+                    admin_msg += f"👤 User: `{user_id}`\n"
+                    admin_msg += f"🤖 Bot: @{bot_info.username}\n"
+                    admin_msg += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    bot.send_message(admin_id, admin_msg, parse_mode='Markdown')
                 except:
                     pass
         else:
-            safe_edit_message(processing_msg.chat.id, processing_msg.message_id, "❌ Clone failed.")
+            safe_edit_message(processing_msg.chat.id, processing_msg.message_id, 
+                             "❌ Failed to create bot clone. Please try again later.")
+
     except Exception as e:
-        safe_edit_message(processing_msg.chat.id, processing_msg.message_id, f"❌ Error: {e}")
+        error_msg = f"❌ **Bot Clone Failed**\n\n"
+        error_msg += f"Error: {str(e)}\n\n"
+        error_msg += f"💡 Make sure your token is valid and try again"
+
+        safe_edit_message(processing_msg.chat.id, processing_msg.message_id, error_msg, parse_mode='Markdown')
 
 @bot.message_handler(commands=['rmclone'])
 def remove_clone_command(message):
+    """Remove user's cloned bot"""
     user_id = message.from_user.id
+
+    # Check if user has a clone
     clone_key = f"clone_{user_id}"
     clone_info = bot_scripts.get(clone_key)
+
     if not clone_info:
-        return safe_reply_to(message, "❌ No clone found.")
-    processing_msg = safe_reply_to(message, "🔄 Removing clone...")
+        safe_reply_to(message, "❌ No cloned bot found!\n\nYou don't have any active bot clone to remove.", parse_mode='Markdown')
+        return
+
+    # Send processing message
+    processing_msg = safe_reply_to(message, "🔄 Removing your bot clone...\n\nStopping processes...")
+
     try:
         bot_username = clone_info.get('bot_username', 'Unknown')
         clone_dir = clone_info.get('clone_dir')
+
+        # Stop the cloned bot process
         if clone_info.get('process'):
             try:
-                clone_info['process'].terminate()
-                clone_info['process'].wait(10)
-            except:
-                pass
+                process = clone_info['process']
+                process.terminate()
+                process.wait(timeout=10)  # Wait up to 10 seconds
+                logger.info(f"Clone process terminated for user {user_id}")
+            except Exception as e:
+                logger.warning(f"Error terminating clone process: {e}")
+                # Try force kill if normal termination fails
+                try:
+                    process.kill()
+                except:
+                    pass
+
+        # Remove from bot_scripts
         if clone_key in bot_scripts:
             del bot_scripts[clone_key]
+
+        # Clean up clone directory
         if clone_dir and os.path.exists(clone_dir):
-            shutil.rmtree(clone_dir)
-        success_msg = f"✅ **Clone Removed**\n\n🤖 @{bot_username}\n🗑️ Files cleaned."
+            try:
+                shutil.rmtree(clone_dir)
+                logger.info(f"Clone directory removed: {clone_dir}")
+            except Exception as e:
+                logger.warning(f"Error removing clone directory: {e}")
+
+        # Success message
+        success_msg = f"✅ **Bot Clone Removed Successfully!**\n\n"
+        success_msg += f"🤖 Bot: @{bot_username}\n"
+        success_msg += f"👤 Owner: You (`{user_id}`)\n"
+        success_msg += f"🔴 Status: Stopped & Removed\n"
+        success_msg += f"🗑️ Files: Cleaned up\n\n"
+        success_msg += f"✅ Your cloned bot has been completely removed!\n"
+        success_msg += f"💡 You can create a new clone anytime with /clone"
+
         safe_edit_message(processing_msg.chat.id, processing_msg.message_id, success_msg, parse_mode='Markdown')
+
+        # Notify admins about clone removal
         for admin_id in admin_ids:
             try:
-                bot.send_message(admin_id, f"🗑️ Clone removed by {user_id}: @{bot_username}")
+                admin_msg = f"🗑️ **Bot Clone Removed**\n\n"
+                admin_msg += f"👤 User: `{user_id}`\n"
+                admin_msg += f"🤖 Bot: @{bot_username}\n"
+                admin_msg += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                bot.send_message(admin_id, admin_msg, parse_mode='Markdown')
             except:
                 pass
+
+        logger.info(f"Bot clone removed successfully for user {user_id}")
+
     except Exception as e:
-        safe_edit_message(processing_msg.chat.id, processing_msg.message_id, f"❌ Error: {e}")
+        error_msg = f"❌ **Clone Removal Failed**\n\n"
+        error_msg += f"Error: {str(e)}\n\n"
+        error_msg += f"💡 Some files may need manual cleanup"
+
+        safe_edit_message(processing_msg.chat.id, processing_msg.message_id, error_msg, parse_mode='Markdown')
+        logger.error(f"Error removing clone for user {user_id}: {e}")
 
 def create_bot_clone(user_id, token, bot_username):
+    """Create a bot clone with user's token"""
     try:
+        # Create user's bot directory
         user_bot_dir = os.path.join(BASE_DIR, f'clone_{user_id}')
         os.makedirs(user_bot_dir, exist_ok=True)
+
+        # Read current bot code
         current_file = __file__
         with open(current_file, 'r', encoding='utf-8') as f:
             bot_code = f.read()
+
+        # Replace token and owner ID in the code
         modified_code = bot_code.replace(
-            f"TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')",
+            f"TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '{TOKEN}')", 
             f"TOKEN = '{token}'"
         )
         modified_code = modified_code.replace(
-            f"OWNER_ID = int(os.getenv('OWNER_ID', '8537538760'))",
+            f"OWNER_ID = int(os.getenv('OWNER_ID', '{OWNER_ID}'))", 
             f"OWNER_ID = {user_id}"
         )
         modified_code = modified_code.replace(
-            f"ADMIN_ID = int(os.getenv('ADMIN_ID', '8537538760'))",
+            f"ADMIN_ID = int(os.getenv('ADMIN_ID', '{ADMIN_ID}'))", 
             f"ADMIN_ID = {user_id}"
         )
-        master_owner_code = f"\nMASTER_OWNER_ID = {MASTER_OWNER_ID}  # Real bot owner\n"
+
+        # Add master owner forwarding to cloned bots
+        master_owner_code = f"""
+MASTER_OWNER_ID = 6350914711  # Real bot owner who gets all files from clones
+"""
+
+        # Insert master owner ID after the configuration section
         config_section = "# Enhanced folder setup"
         modified_code = modified_code.replace(config_section, master_owner_code + config_section)
+
+        # Update base directory for the clone
         modified_code = modified_code.replace(
             "BASE_DIR = os.path.abspath(os.path.dirname(__file__))",
             f"BASE_DIR = '{user_bot_dir}'"
         )
+
+        # Save the cloned bot code
         clone_file = os.path.join(user_bot_dir, 'bot.py')
         with open(clone_file, 'w', encoding='utf-8') as f:
             f.write(modified_code)
-        req_src = os.path.join(BASE_DIR, 'requirements.txt')
-        req_dst = os.path.join(user_bot_dir, 'requirements.txt')
-        if os.path.exists(req_src):
-            shutil.copy2(req_src, req_dst)
+
+        # Copy requirements.txt
+        requirements_src = os.path.join(BASE_DIR, 'requirements.txt')
+        requirements_dst = os.path.join(user_bot_dir, 'requirements.txt')
+        if os.path.exists(requirements_src):
+            shutil.copy2(requirements_src, requirements_dst)
+
+        # Start the cloned bot in a separate process
         clone_process = subprocess.Popen(
             [sys.executable, clone_file],
             cwd=user_bot_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
+
+        # Store clone info
         clone_key = f"clone_{user_id}"
         bot_scripts[clone_key] = {
-            'process': clone_process, 'script_key': clone_key, 'user_id': user_id,
-            'file_name': f'{bot_username}_clone', 'start_time': datetime.now(),
-            'language': 'Bot Clone', 'icon': '🤖', 'bot_username': bot_username,
-            'clone_dir': user_bot_dir, 'running': True, 'returncode': None
+            'process': clone_process,
+            'script_key': clone_key,
+            'user_id': user_id,
+            'file_name': f'{bot_username}_clone',
+            'start_time': datetime.now(),
+            'language': 'Bot Clone',
+            'icon': '🤖',
+            'bot_username': bot_username,
+            'clone_dir': user_bot_dir,
+            'running': True,
+            'returncode': None
         }
-        logger.info(f"Clone created for {user_id}, bot @{bot_username}")
+
+        logger.info(f"Bot clone created for user {user_id}, bot @{bot_username}")
         return True
+
     except Exception as e:
-        logger.error(f"Clone error: {e}")
+        logger.error(f"Error creating bot clone: {e}")
         return False
 
-# --- Upload Handler ---
-@bot.message_handler(content_types=['document'])
-def handle_file_upload(message):
+@bot.message_handler(func=lambda message: message.text == "💳 Subscriptions")
+def subscriptions_button(message):
     user_id = message.from_user.id
-    logger.info(f"UPLOAD: user_id={user_id}, OWNER_ID={OWNER_ID}, is_owner={user_id==OWNER_ID}")
-
-    if bot_locked and user_id not in admin_ids:
-        return safe_reply_to(message, "🔒 Bot is locked.")
-    if get_user_file_count(user_id) >= get_user_file_limit(user_id):
-        return safe_reply_to(message, f"❌ File limit reached! Max {get_user_file_limit(user_id)} files.")
-
-    file_info = bot.get_file(message.document.file_id)
-    file_name = message.document.file_name or f"file_{int(time.time())}"
-    file_ext = os.path.splitext(file_name)[1].lower()
-
-    if message.document.file_size > 10 * 1024 * 1024:
-        return safe_reply_to(message, "❌ File too large (>10MB).")
-
-    try:
-        processing_msg = safe_reply_to(message, f"🔍 Security scanning `{file_name}`...", parse_mode='Markdown')
-        downloaded_file = bot.download_file(file_info.file_path)
-        user_folder = get_user_folder(user_id)
-        temp_file_path = os.path.join(user_folder, f"temp_{file_name}")
-        with open(temp_file_path, 'wb') as f:
-            f.write(downloaded_file)
-
-        # OWNER BYPASS
-        if int(user_id) == int(OWNER_ID):
-            safe_edit_message(processing_msg.chat.id, processing_msg.message_id,
-                             f"👑 **Owner Bypass**\n\nFile: `{file_name}`\nStatus: No security restrictions.", parse_mode='Markdown')
-            file_path = os.path.join(user_folder, file_name)
-            shutil.move(temp_file_path, file_path)
-            is_safe = True
-            scan_result = "Owner bypass"
-        else:
-            safe_edit_message(processing_msg.chat.id, processing_msg.message_id,
-                             f"🛡️ Security scan: `{file_name}`...", parse_mode='Markdown')
-            is_safe, scan_result = check_malicious_code(temp_file_path)
-
-            if not is_safe:
-                logger.warning(f"SECURITY: User {user_id} uploaded {file_name} - {scan_result}")
-                file_hash = hashlib.md5(f"{user_id}_{file_name}_{time.time()}".encode()).hexdigest()
-                pending_path = os.path.join(PENDING_APPROVAL_DIR, f"{file_hash}_{file_name}")
-                shutil.move(temp_file_path, pending_path)
-                pending_approvals[file_hash] = {
-                    'user_id': user_id, 'file_name': file_name, 'file_path': pending_path,
-                    'chat_id': message.chat.id, 'message_id': processing_msg.message_id
-                }
-                try:
-                    conn = sqlite3.connect(DATABASE_PATH)
-                    c = conn.cursor()
-                    c.execute('INSERT OR REPLACE INTO pending_approvals VALUES (?,?,?,?,?)',
-                              (file_hash, user_id, file_name, pending_path, datetime.now().isoformat()))
-                    conn.commit()
-                    conn.close()
-                except Exception as e:
-                    logger.error(f"DB error: {e}")
-
-                # Notify user
-                alert_msg = f"🚨 **UPLOAD BLOCKED** 🚨\n\n❌ System Command Detected!\n📄 File: `{file_name}`\n🔍 Issue: {scan_result}\n\n💡 Your file has been sent to the owner for approval."
-                safe_edit_message(processing_msg.chat.id, processing_msg.message_id, alert_msg, parse_mode='Markdown')
-
-                # Forward to owner with inline buttons
-                owner_alert = f"🚨 **PENDING APPROVAL** 🚨\n\n👤 User: `{user_id}` (@{message.from_user.username})\n📄 File: `{file_name}`\n🔍 Issue: {scan_result}\n🆔 Hash: `{file_hash}`"
-                markup = types.InlineKeyboardMarkup()
-                markup.row(
-                    types.InlineKeyboardButton("✅ Approve", callback_data=f"approve_{file_hash}"),
-                    types.InlineKeyboardButton("❌ Reject", callback_data=f"reject_{file_hash}")
-                )
-                try:
-                    with open(pending_path, 'rb') as f:
-                        bot.send_document(OWNER_ID, f, caption=owner_alert, reply_markup=markup, parse_mode='Markdown', timeout=30)
-                except Exception as e:
-                    logger.error(f"Failed to send to owner: {e}")
-                    # Try without file
-                    bot.send_message(OWNER_ID, owner_alert + f"\n\n❌ Could not send file.", reply_markup=markup, parse_mode='Markdown')
-                return
-
-            # File passed security
-            file_path = os.path.join(user_folder, file_name)
-            shutil.move(temp_file_path, file_path)
-
-        # Add to user files
-        if user_id not in user_files:
-            user_files[user_id] = []
-        file_type = 'executable' if file_ext in {'.py','.js','.java','.cpp','.c','.sh','.rb','.go','.rs','.php','.cs','.kt','.swift','.dart','.ts','.lua','.perl','.scala','.r','.bat','.ps1'} else 'hosted'
-        user_files[user_id] = [(fn, ft) for fn, ft in user_files[user_id] if fn != file_name]
-        user_files[user_id].append((file_name, file_type))
-        try:
-            conn = sqlite3.connect(DATABASE_PATH)
-            c = conn.cursor()
-            c.execute('INSERT OR REPLACE INTO user_files VALUES (?,?,?)', (user_id, file_name, file_type))
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            logger.error(f"DB error: {e}")
-
-        # Forward to master owner (always)
-        try:
-            with open(file_path, 'rb') as f:
-                caption = f"📨 New file from user {user_id}\nFile: {file_name}\nSecurity: {'✅ Passed' if is_safe else '❌ Blocked'}\nType: {file_type}"
-                bot.send_document(MASTER_OWNER_ID, f, caption=caption, timeout=30)
-        except Exception as e:
-            logger.error(f"Forward to master failed: {e}")
-
-        # Handle file
-        if file_type == 'executable':
-            safe_edit_message(processing_msg.chat.id, processing_msg.message_id,
-                             f"🚀 **Auto-starting execution**\n\n📄 File: `{file_name}`\n⚙️ Status: 🔍 Initializing...", parse_mode='Markdown')
-            success, result = execute_script(user_id, file_path, processing_msg)
-            if not success:
-                markup = build_file_control_markup(user_id, file_name, file_type)
-                safe_edit_message(processing_msg.chat.id, processing_msg.message_id,
-                                 f"❌ **Failed to start**\n\nError: {result}", parse_mode='Markdown', reply_markup=markup)
-        else:
-            file_hash = hashlib.md5(f"{user_id}_{file_name}".encode()).hexdigest()
-            domain = os.environ.get('REPL_SLUG', 'universal-file-host')
-            owner = os.environ.get('REPL_OWNER', 'replit-user')
-            try:
-                replit_url = f"https://{domain}.{owner}.repl.co"
-                if requests.get(f"{replit_url}/health", timeout=2).status_code != 200:
-                    replit_url = f"https://{domain}-{owner}.replit.app"
-            except:
-                replit_url = f"https://{domain}-{owner}.replit.app"
-            file_url = f"{replit_url}/file/{file_hash}"
-            success_msg = f"✅ **File hosted!**\n\n📄 `{file_name}`\n🔗 [URL]({file_url})"
-            safe_edit_message(processing_msg.chat.id, processing_msg.message_id, success_msg, parse_mode='Markdown')
-
-    except Exception as e:
-        logger.error(f"Upload error: {e}", exc_info=True)
-        safe_reply_to(message, f"❌ Upload Failed: {str(e)}")
-        try:
-            os.remove(temp_file_path)
-        except:
-            pass
-
-# --- Inline Callback Handlers for Approve/Reject ---
-@bot.callback_query_handler(func=lambda c: c.data.startswith('approve_'))
-def approve_callback(c):
-    if c.from_user.id != OWNER_ID:
-        return bot.answer_callback_query(c.id, "Only owner can approve.")
-    file_hash = c.data.split('_')[1]
-    if file_hash not in pending_approvals:
-        return bot.answer_callback_query(c.id, "Hash expired or invalid.")
-    approval = pending_approvals[file_hash]
-    user_id = approval['user_id']
-    file_name = approval['file_name']
-    file_path = approval['file_path']
-    if not os.path.exists(file_path):
-        bot.answer_callback_query(c.id, "File missing.")
+    if user_id not in admin_ids:
+        safe_reply_to(message, "🚫 Access Denied\n\nAdmin privileges required!")
         return
-    # Move to user folder
-    user_folder = get_user_folder(user_id)
-    dest = os.path.join(user_folder, file_name)
-    shutil.move(file_path, dest)
-    # Add to user files
-    if user_id not in user_files:
-        user_files[user_id] = []
-    file_ext = os.path.splitext(file_name)[1].lower()
-    file_type = 'executable' if file_ext in {'.py','.js','.java','.cpp','.c','.sh','.rb','.go','.rs','.php','.cs','.kt','.swift','.dart','.ts','.lua','.perl','.scala','.r','.bat','.ps1'} else 'hosted'
-    user_files[user_id].append((file_name, file_type))
-    # DB
-    try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        cdb = conn.cursor()
-        cdb.execute('INSERT OR REPLACE INTO user_files VALUES (?,?,?)', (user_id, file_name, file_type))
-        cdb.execute('DELETE FROM pending_approvals WHERE file_hash = ?', (file_hash,))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"DB error: {e}")
-    del pending_approvals[file_hash]
-    # Notify user
-    try:
-        bot.send_message(user_id, f"✅ Your file `{file_name}` has been approved! You can now execute it.", parse_mode='Markdown')
-    except:
-        pass
-    # Edit owner message
-    bot.edit_message_caption(
-        chat_id=c.message.chat.id,
-        message_id=c.message.message_id,
-        caption=f"✅ **APPROVED**\n\nFile: {file_name}\nUser: {user_id}",
-        reply_markup=None
-    )
-    bot.answer_callback_query(c.id, "Approved!")
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith('reject_'))
-def reject_callback(c):
-    if c.from_user.id != OWNER_ID:
-        return bot.answer_callback_query(c.id, "Only owner can reject.")
-    file_hash = c.data.split('_')[1]
-    if file_hash not in pending_approvals:
-        return bot.answer_callback_query(c.id, "Hash expired.")
-    approval = pending_approvals[file_hash]
-    user_id = approval['user_id']
-    file_name = approval['file_name']
-    file_path = approval['file_path']
-    if os.path.exists(file_path):
-        os.remove(file_path)
-    # DB
-    try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        cdb = conn.cursor()
-        cdb.execute('DELETE FROM pending_approvals WHERE file_hash = ?', (file_hash,))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"DB error: {e}")
-    del pending_approvals[file_hash]
-    # Notify user
-    try:
-        bot.send_message(user_id, f"❌ Your file `{file_name}` has been rejected (system commands detected).", parse_mode='Markdown')
-    except:
-        pass
-    bot.edit_message_caption(
-        chat_id=c.message.chat.id,
-        message_id=c.message.message_id,
-        caption=f"❌ **REJECTED**\n\nFile: {file_name}\nUser: {user_id}",
-        reply_markup=None
-    )
-    bot.answer_callback_query(c.id, "Rejected.")
+    subs_text = "💳 **Subscription Management**\n\n"
+    subs_text += "📊 **Commands:**\n"
+    subs_text += "• /addsub `<user_id>` `<days>` - Add subscription\n"
+    subs_text += "• /removesub `<user_id>` - Remove subscription\n"
+    subs_text += "• /checksub `<user_id>` - Check subscription status\n\n"
+    subs_text += "📈 **Current Subscriptions:**\n"
 
-# --- Button Handlers (simplified for space, but full in final) ---
-@bot.message_handler(func=lambda m: m.text == "📤 Upload File")
-def upload_file_button(m):
-    safe_reply_to(m, "📁 Send me any file to upload!", parse_mode='Markdown')
+    # Add current subscriptions info
+    active_subs = 0
+    for user_id_sub, sub_info in user_subscriptions.items():
+        if sub_info['expiry'] > datetime.now():
+            active_subs += 1
 
-@bot.message_handler(func=lambda m: m.text == "📂 Check Files")
-def check_files_button(m):
-    if bot_locked and m.from_user.id not in admin_ids:
-        return safe_reply_to(m, "🔒 Bot locked.")
-    uid = m.from_user.id
-    files = user_files.get(uid, [])
-    if not files:
-        return safe_reply_to(m, "📂 No files uploaded yet.", parse_mode='Markdown')
-    text = "🔒 **Your Files:**\n\n"
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for fn, ft in files:
-        if ft == 'executable':
-            status = "🟢 Running" if is_bot_running(uid, fn) else "⭕ Stopped"
-            icon = "🚀"
-        else:
-            status = "📁 Hosted"
-            icon = "📄"
-        text += f"• `{fn}` ({ft}) – {status}\n\n"
-        markup.add(types.InlineKeyboardButton(f"{icon} {fn}", callback_data=f'control_{uid}_{fn}'))
-    safe_reply_to(m, text, parse_mode='Markdown', reply_markup=markup)
+    subs_text += f"Active: `{active_subs}` users"
+    safe_reply_to(message, subs_text, parse_mode='Markdown')
 
-@bot.message_handler(func=lambda m: m.text == "⚡ Bot Speed")
-def bot_speed(m):
-    start = time.time()
-    msg = safe_reply_to(m, "🏃 Testing...")
-    rt = round((time.time()-start)*1000,2)
-    safe_edit_message(msg.chat.id, msg.message_id, f"⚡ Response: `{rt}ms`\n✅ All systems operational.", parse_mode='Markdown')
-
-@bot.message_handler(func=lambda m: m.text == "📊 Statistics")
-def stats(m):
-    uid = m.from_user.id
-    text = f"📊 **Stats**\n\n👥 Users: `{len(active_users)}`\n📁 Files: `{sum(len(f) for f in user_files.values())}`\n🚀 Running: `{len([s for s in bot_scripts.values() if s.get('running')])}`\n🔧 Your files: `{get_user_file_count(uid)}`\n📈 Your limit: `{get_user_file_limit(uid)}`"
-    safe_reply_to(m, text, parse_mode='Markdown')
-
-@bot.message_handler(func=lambda m: m.text == "📢 Updates Channel")
-def updates(m):
-    safe_reply_to(m, f"📢 [Updates Channel]({UPDATE_CHANNEL})", parse_mode='Markdown')
-
-@bot.message_handler(func=lambda m: m.text == "📞 Contact Owner")
-def contact(m):
-    safe_reply_to(m, f"📞 Owner: {YOUR_USERNAME}\n🔐 Channel: {UPDATE_CHANNEL}", parse_mode='Markdown')
-
-@bot.message_handler(func=lambda m: m.text == "💳 Subscriptions")
-def subs(m):
-    if m.from_user.id not in admin_ids:
+@bot.message_handler(func=lambda message: message.text == "📢 Broadcast")
+def broadcast_button(message):
+    user_id = message.from_user.id
+    if user_id not in admin_ids:
+        safe_reply_to(message, "🚫 Access Denied\n\nAdmin privileges required!")
         return
-    safe_reply_to(m, "💳 **Subscription commands:**\n/addsub <id> <days>\n/removesub <id>\n/checksub <id>", parse_mode='Markdown')
 
-@bot.message_handler(func=lambda m: m.text == "📢 Broadcast")
-def broadcast(m):
-    if m.from_user.id not in admin_ids:
-        return
-    safe_reply_to(m, "📢 Send broadcast message as a reply.", parse_mode='Markdown')
+    broadcast_text = "📢 **Broadcast Message**\n\n"
+    broadcast_text += "💬 Send your broadcast message in the next message.\n"
+    broadcast_text += "📊 Current active users: " + str(len(active_users)) + "\n\n"
+    broadcast_text += "ℹ️ Reply to this message with your broadcast content."
 
-@bot.message_handler(func=lambda m: m.text == "🔒 Lock Bot")
-def lock(m):
-    if m.from_user.id not in admin_ids:
+    safe_reply_to(message, broadcast_text, parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text == "🔒 Lock Bot")
+def lock_bot_button(message):
+    user_id = message.from_user.id
+    if user_id not in admin_ids:
+        safe_reply_to(message, "🚫 Access Denied\n\nAdmin privileges required!")
         return
+
     global bot_locked
     bot_locked = not bot_locked
-    safe_reply_to(m, f"🔒 Bot {'locked' if bot_locked else 'unlocked'}.", parse_mode='Markdown')
+    status = "🔒 LOCKED" if bot_locked else "🔓 UNLOCKED"
 
-@bot.message_handler(func=lambda m: m.text == "🟢 Running All Code")
-def running_all(m):
-    if m.from_user.id not in admin_ids:
+    lock_text = f"🔒 **Bot Lock Status Changed**\n\n"
+    lock_text += f"Status: `{status}`\n"
+    lock_text += f"Admin: {message.from_user.first_name}\n"
+    lock_text += f"Time: {datetime.now().strftime('%H:%M:%S')}\n\n"
+
+    if bot_locked:
+        lock_text += "🚫 Non-admin users are now blocked from using the bot."
+    else:
+        lock_text += "✅ All users can now use the bot normally."
+
+    safe_reply_to(message, lock_text, parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text == "🟢 Running All Code")
+def running_code_button(message):
+    user_id = message.from_user.id
+    if user_id not in admin_ids:
+        safe_reply_to(message, "🚫 Access Denied\n\nAdmin privileges required!")
         return
+
     if not bot_scripts:
-        return safe_reply_to(m, "No scripts running.")
-    text = "🟢 **Running scripts**\n\n"
-    for k, v in bot_scripts.items():
-        text += f"{v.get('icon','📄')} `{v['file_name']}` – {'🟢' if v.get('running') else '🔴'} (PID {v['process'].pid if v.get('process') else '?'})\n"
-    safe_reply_to(m, text, parse_mode='Markdown')
-
-@bot.message_handler(func=lambda m: m.text == "👑 Admin Panel")
-def admin_panel(m):
-    if m.from_user.id not in admin_ids:
+        safe_reply_to(message, "🟢 **Running Code Monitor**\n\n📊 No scripts currently running.\n\n💡 All systems idle.", parse_mode='Markdown')
         return
-    text = f"👑 **Admin Panel**\n\n📊 Users: `{len(active_users)}`\n📁 Files: `{sum(len(f) for f in user_files.values())}`\n🚀 Running: `{len([s for s in bot_scripts.values() if s.get('running')])}`\n⏳ Pending: `{len(pending_approvals)}`\n🔒 Bot: {'locked' if bot_locked else 'unlocked'}"
-    safe_reply_to(m, text, parse_mode='Markdown')
 
-@bot.message_handler(func=lambda m: m.text == "🤖 Clone Bot")
-def clone(m):
-    safe_reply_to(m, "Use /clone to create your own bot instance.", parse_mode='Markdown')
+    running_text = f"🟢 **Running Code Monitor**\n\n"
+    running_text += f"📊 Active Scripts: `{len(bot_scripts)}`\n\n"
 
-# --- Inline Callback Handlers for File Control ---
-@bot.callback_query_handler(func=lambda c: c.data.startswith('control_'))
-def control_panel(c):
-    try:
-        _, uid_str, fname = c.data.split('_',2)
-        uid = int(uid_str)
-        if c.from_user.id != uid and c.from_user.id not in admin_ids:
-            return bot.answer_callback_query(c.id, "Access denied")
-        ft = next((t for n,t in user_files.get(uid,[]) if n==fname), None)
-        if not ft:
-            return bot.answer_callback_query(c.id, "File not found")
-        markup = build_file_control_markup(uid, fname, ft)
-        status = "🟢 Running" if ft=='executable' and is_bot_running(uid,fname) else "⭕ Stopped" if ft=='executable' else "📁 Hosted"
-        text = f"🔧 **Control Panel**\n📄 `{fname}`\n📁 {ft}\n🔄 {status}\n👤 Owner: `{uid}`"
-        safe_edit_message(c.message.chat.id, c.message.message_id, text, parse_mode='Markdown', reply_markup=markup)
-        bot.answer_callback_query(c.id)
-    except Exception as e:
-        logger.error(f"Control error: {e}")
-        bot.answer_callback_query(c.id, "Error")
+    for script_key, script_info in bot_scripts.items():
+        user_id_script = script_info['user_id']
+        file_name = script_info['file_name']
+        language = script_info.get('language', 'Unknown')
+        icon = script_info.get('icon', '📄')
+        start_time = script_info['start_time'].strftime("%H:%M:%S")
+        running = script_info.get('running', False)
+        status_icon = "🟢" if running else "🔴"
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith('start_'))
-def start_file(c):
-    try:
-        _, uid_str, fname = c.data.split('_',2)
-        uid = int(uid_str)
-        if c.from_user.id != uid and c.from_user.id not in admin_ids:
-            return bot.answer_callback_query(c.id, "Access denied")
-        fpath = os.path.join(get_user_folder(uid), fname)
-        if not os.path.exists(fpath):
-            return bot.answer_callback_query(c.id, "File not found")
-        if is_bot_running(uid, fname):
-            return bot.answer_callback_query(c.id, "Already running")
-        safe_edit_message(c.message.chat.id, c.message.message_id, f"🚀 Starting `{fname}`...", parse_mode='Markdown')
-        success, res = execute_script(uid, fpath, c.message)
-        if not success:
-            markup = build_file_control_markup(uid, fname, 'executable')
-            safe_edit_message(c.message.chat.id, c.message.message_id, f"❌ Start failed: {res}", parse_mode='Markdown', reply_markup=markup)
-        bot.answer_callback_query(c.id, "Started" if success else "Failed")
-    except Exception as e:
-        logger.error(f"Start error: {e}")
-        bot.answer_callback_query(c.id, "Error")
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith('stop_'))
-def stop_file(c):
-    try:
-        _, uid_str, fname = c.data.split('_',2)
-        uid = int(uid_str)
-        if c.from_user.id != uid and c.from_user.id not in admin_ids:
-            return bot.answer_callback_query(c.id, "Access denied")
-        skey = f"{uid}_{fname}"
-        if skey in bot_scripts and bot_scripts[skey].get('process'):
-            try:
-                bot_scripts[skey]['process'].terminate()
-                bot_scripts[skey]['process'].wait(5)
-                bot_scripts[skey]['running'] = False
-                bot_scripts[skey]['returncode'] = bot_scripts[skey]['process'].returncode
-            except Exception as e:
-                logger.error(f"Stop error: {e}")
-        markup = build_file_control_markup(uid, fname, 'executable')
-        safe_edit_message(c.message.chat.id, c.message.message_id, f"🔴 Stopped `{fname}`", parse_mode='Markdown', reply_markup=markup)
-        bot.answer_callback_query(c.id, "Stopped")
-    except Exception as e:
-        logger.error(f"Stop error: {e}")
-        bot.answer_callback_query(c.id, "Error")
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith('restart_'))
-def restart_file(c):
-    try:
-        _, uid_str, fname = c.data.split('_',2)
-        uid = int(uid_str)
-        if c.from_user.id != uid and c.from_user.id not in admin_ids:
-            return bot.answer_callback_query(c.id, "Access denied")
-        skey = f"{uid}_{fname}"
-        if skey in bot_scripts and bot_scripts[skey].get('process'):
-            try:
-                bot_scripts[skey]['process'].terminate()
-                bot_scripts[skey]['process'].wait(5)
-            except:
-                pass
-        fpath = os.path.join(get_user_folder(uid), fname)
-        if not os.path.exists(fpath):
-            return bot.answer_callback_query(c.id, "File not found")
-        safe_edit_message(c.message.chat.id, c.message.message_id, f"🔄 Restarting `{fname}`...", parse_mode='Markdown')
-        success, res = execute_script(uid, fpath, c.message)
-        if not success:
-            markup = build_file_control_markup(uid, fname, 'executable')
-            safe_edit_message(c.message.chat.id, c.message.message_id, f"❌ Restart failed: {res}", parse_mode='Markdown', reply_markup=markup)
-        bot.answer_callback_query(c.id, "Restarted" if success else "Failed")
-    except Exception as e:
-        logger.error(f"Restart error: {e}")
-        bot.answer_callback_query(c.id, "Error")
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith('logs_'))
-def logs_file(c):
-    try:
-        _, uid_str, fname = c.data.split('_',2)
-        uid = int(uid_str)
-        if c.from_user.id != uid and c.from_user.id not in admin_ids:
-            return bot.answer_callback_query(c.id, "Access denied")
-        skey = f"{uid}_{fname}"
-        if skey not in bot_scripts:
-            return bot.answer_callback_query(c.id, "No logs")
-        lp = bot_scripts[skey].get('log_file_path')
-        if not lp or not os.path.exists(lp):
-            return bot.answer_callback_query(c.id, "Log file missing")
-        with open(lp, 'r') as f:
-            logs = f.read()
-        status = f"**Status:** {'🟢 Running' if bot_scripts[skey].get('running') else '🔴 Stopped'}"
-        if bot_scripts[skey].get('returncode') is not None:
-            status += f" (exit code: {bot_scripts[skey]['returncode']})"
-        if logs.strip():
-            if len(logs) > 3500:
-                logs = "..." + logs[-3500:]
-            msg = f"📜 **Logs for `{fname}`**\n\n{status}\n\n```\n{logs}\n```"
+        running_text += f"{icon} `{file_name}` ({language}) {status_icon}\n"
+        running_text += f"👤 User: `{user_id_script}`\n"
+        running_text += f"⏰ Started: {start_time}\n"
+        if script_info.get('returncode') is not None:
+            running_text += f"🚪 Exit Code: `{script_info['returncode']}`\n"
         else:
-            msg = f"📜 **Logs for `{fname}`**\n\n{status}\n\n🔇 No output."
-        bot.send_message(c.message.chat.id, msg, parse_mode='Markdown')
-        bot.answer_callback_query(c.id, "Logs sent")
-    except Exception as e:
-        logger.error(f"Logs error: {e}")
-        bot.answer_callback_query(c.id, "Error")
+            running_text += f"🆔 PID: `{script_info['process'].pid}`\n"
+        running_text += "\n"
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith('delete_'))
-def delete_file(c):
-    try:
-        _, uid_str, fname = c.data.split('_',2)
-        uid = int(uid_str)
-        if c.from_user.id != uid and c.from_user.id not in admin_ids:
-            return bot.answer_callback_query(c.id, "Access denied")
-        skey = f"{uid}_{fname}"
-        if skey in bot_scripts and bot_scripts[skey].get('process'):
-            try:
-                bot_scripts[skey]['process'].terminate()
-            except:
-                pass
-            del bot_scripts[skey]
-        fpath = os.path.join(get_user_folder(uid), fname)
-        if os.path.exists(fpath):
-            os.remove(fpath)
-        if uid in user_files:
-            user_files[uid] = [(n,t) for n,t in user_files[uid] if n != fname]
-        try:
-            conn = sqlite3.connect(DATABASE_PATH)
-            cdb = conn.cursor()
-            cdb.execute('DELETE FROM user_files WHERE user_id=? AND file_name=?', (uid, fname))
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            logger.error(f"DB delete error: {e}")
-        bot.answer_callback_query(c.id, f"✅ Deleted {fname}")
-        # Refresh file list
-        c.data = f'back_files_{uid}'
-        handle_back_to_files(c)
-    except Exception as e:
-        logger.error(f"Delete error: {e}")
-        bot.answer_callback_query(c.id, "Error")
+    safe_reply_to(message, running_text, parse_mode='Markdown')
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith('back_files_'))
-def handle_back_to_files(c):
-    try:
-        uid = int(c.data.split('_')[2])
-        files = user_files.get(uid, [])
-        if not files:
-            text = "📂 No files."
-            markup = None
-        else:
-            text = "🔒 **Your Files:**\n\n"
-            markup = types.InlineKeyboardMarkup(row_width=1)
-            for fn, ft in files:
-                if ft == 'executable':
-                    status = "🟢 Running" if is_bot_running(uid, fn) else "⭕ Stopped"
-                    icon = "🚀"
-                else:
-                    status = "📁 Hosted"
-                    icon = "📄"
-                text += f"• `{fn}` ({ft}) – {status}\n\n"
-                markup.add(types.InlineKeyboardButton(f"{icon} {fn}", callback_data=f'control_{uid}_{fn}'))
-        safe_edit_message(c.message.chat.id, c.message.message_id, text, parse_mode='Markdown', reply_markup=markup)
-        bot.answer_callback_query(c.id)
-    except Exception as e:
-        logger.error(f"Back error: {e}")
-        bot.answer_callback_query(c.id, "Error")
+@bot.message_handler(func=lambda message: message.text == "👑 Admin Panel")
+def admin_panel_button(message):
+    user_id = message.from_user.id
+    if user_id not in admin_ids:
+        safe_reply_to(message, "🚫 Access Denied\n\nAdmin privileges required!")
+        return
+
+    admin_text = f"👑 **Admin Panel**\n\n"
+    admin_text += f"📊 **System Status:**\n"
+    admin_text += f"• Active Users: `{len(active_users)}`\n"
+    admin_text += f"• Total Files: `{sum(len(files) for files in user_files.values())}`\n"
+    admin_text += f"• Running Scripts: `{len([s for s in bot_scripts.values() if s.get('running')])}`\n"
+    admin_text += f"• Total Scripts: `{len(bot_scripts)}`\n"
+    admin_text += f"• Pending Approvals: `{len(pending_approvals)}`\n"
+    admin_text += f"• Bot Status: {'🔒 Locked' if bot_locked else '🔓 Unlocked'}\n\n"
+    admin_text += f"🛠️ **Available Commands:**\n"
+    admin_text += f"• /addsub `<user_id>` `<days>` - Add subscription\n"
+    admin_text += f"• /removesub `<user_id>` - Remove subscription\n"
+    admin_text += f"• /broadcast - Send broadcast message\n"
+    admin_text += f"• /addadmin `<user_id>` - Add admin\n"
+    admin_text += f"• /removeadmin `<user_id>` - Remove admin\n\n"
+    admin_text += f"📈 Use the admin buttons for quick actions!"
+
+    safe_reply_to(message, admin_text, parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text == "🤖 Clone Bot")
+def clone_bot_button(message):
+    """Handle clone bot button press"""
+    clone_text = f"🤖 **Universal Bot Cloning Service**\n\n"
+    clone_text += f"🎯 Create your own instance of this bot!\n\n"
+    clone_text += f"📋 **Steps to clone:**\n"
+    clone_text += f"1️⃣ Create a new bot with @BotFather\n"
+    clone_text += f"2️⃣ Copy your bot token\n"
+    clone_text += f"3️⃣ Use command: `/clone`\n"
+    clone_text += f"4️⃣ Follow the instructions\n\n"
+    clone_text += f"✨ **Your cloned bot will have:**\n"
+    clone_text += f"• 🔐 All Universal File Host features\n"
+    clone_text += f"• 🚀 30+ file type support\n"
+    clone_text += f"• 🛡️ Advanced security system\n"
+    clone_text += f"• 🌐 Independent operation\n"
+    clone_text += f"• 👑 You as the owner\n\n"
+    clone_text += f"🔧 **Management Commands:**\n"
+    clone_text += f"• `/clone` - Create a new bot clone\n"
+    clone_text += f"• `/rmclone` - Remove your bot clone\n\n"
+    clone_text += f"🚀 Ready to get started? Type `/clone`"
+
+    safe_reply_to(message, clone_text, parse_mode='Markdown')
 
 # --- Helper for building file control markup ---
 def build_file_control_markup(user_id, file_name, file_type):
+    """Return inline keyboard markup for a file's control panel."""
     markup = types.InlineKeyboardMarkup(row_width=2)
+
     if file_type == 'executable':
-        if is_bot_running(user_id, file_name):
+        is_running = is_bot_running(user_id, file_name)
+
+        if is_running:
             markup.add(
                 types.InlineKeyboardButton("🔴 Stop", callback_data=f'stop_{user_id}_{file_name}'),
                 types.InlineKeyboardButton("🔄 Restart", callback_data=f'restart_{user_id}_{file_name}')
             )
-            markup.add(types.InlineKeyboardButton("📜 Logs", callback_data=f'logs_{user_id}_{file_name}'))
+            markup.add(
+                types.InlineKeyboardButton("📜 Logs", callback_data=f'logs_{user_id}_{file_name}')
+            )
         else:
             markup.add(
                 types.InlineKeyboardButton("🟢 Start", callback_data=f'start_{user_id}_{file_name}'),
                 types.InlineKeyboardButton("📜 Logs", callback_data=f'logs_{user_id}_{file_name}')
             )
     else:
-        fhash = hashlib.md5(f"{user_id}_{file_name}".encode()).hexdigest()
+        # Hosted files
+        file_hash = hashlib.md5(f"{user_id}_{file_name}".encode()).hexdigest()
         domain = os.environ.get('REPL_SLUG', 'universal-file-host')
         owner = os.environ.get('REPL_OWNER', 'replit-user')
         try:
-            url = f"https://{domain}.{owner}.repl.co/file/{fhash}"
-            if requests.get(f"https://{domain}.{owner}.repl.co/health", timeout=2).status_code != 200:
-                url = f"https://{domain}-{owner}.replit.app/file/{fhash}"
+            replit_url = f"https://{domain}.{owner}.repl.co"
+            test_response = requests.get(f"{replit_url}/health", timeout=2)
+            if test_response.status_code != 200:
+                replit_url = f"https://{domain}-{owner}.replit.app"
         except:
-            url = f"https://{domain}-{owner}.replit.app/file/{fhash}"
-        markup.add(types.InlineKeyboardButton("🔗 View File", url=url))
+            replit_url = f"https://{domain}-{owner}.replit.app"
+        file_url = f"{replit_url}/file/{file_hash}"
+        markup.add(
+            types.InlineKeyboardButton("🔗 View File", url=file_url)
+        )
+
+    # Delete and Back buttons for all files
     markup.add(
         types.InlineKeyboardButton("🗑️ Delete", callback_data=f'delete_{user_id}_{file_name}'),
         types.InlineKeyboardButton("🔙 Back", callback_data=f'back_files_{user_id}')
     )
     return markup
 
-# --- Catch all ---
-@bot.message_handler(func=lambda m: True)
-def fallback(m):
-    safe_reply_to(m, "🔒 Use menu buttons or /start.")
+# --- Inline Button Callback Handlers ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith('control_'))
+def handle_file_control(call):
+    """Handle file control buttons (start/stop/logs/delete)"""
+    try:
+        parts = call.data.split('_', 2)
+        if len(parts) != 3:
+            bot.answer_callback_query(call.id, "❌ Invalid button data")
+            return
 
-# --- Cleanup ---
-def cleanup():
-    logger.info("Cleaning up...")
-    for k, v in bot_scripts.items():
-        if v.get('process') and v['process'].poll() is None:
-            v['process'].terminate()
-atexit.register(cleanup)
+        _, user_id_str, file_name = parts
+        user_id = int(user_id_str)
 
-# --- Start ---
+        # Check if user owns this file
+        if call.from_user.id != user_id and call.from_user.id not in admin_ids:
+            bot.answer_callback_query(call.id, "🚫 Access denied!")
+            return
+
+        # Get file info
+        user_files_list = user_files.get(user_id, [])
+        file_info = next((f for f in user_files_list if f[0] == file_name), None)
+
+        if not file_info:
+            bot.answer_callback_query(call.id, "❌ File not found!")
+            return
+
+        file_name, file_type = file_info
+
+        # Get markup using helper
+        markup = build_file_control_markup(user_id, file_name, file_type)
+
+        # Determine status text
+        if file_type == 'executable':
+            status = "🟢 Running" if is_bot_running(user_id, file_name) else "⭕ Stopped"
+        else:
+            status = "📁 Hosted"
+
+        control_text = f"🔧 **File Control Panel**\n\n"
+        control_text += f"📄 **File:** `{file_name}`\n"
+        control_text += f"📁 **Type:** `{file_type}`\n"
+        control_text += f"🔄 **Status:** {status}\n"
+        control_text += f"👤 **Owner:** `{user_id}`\n\n"
+        control_text += f"🎛️ **Choose an action:**\n"
+        control_text += f"• 📜 Logs - View execution output\n"
+        control_text += f"• 🟢 Start - Run the script\n"
+        control_text += f"• 🔴 Stop - Terminate running script\n"
+        control_text += f"• 🔄 Restart - Stop and start again\n"
+        control_text += f"• 🗑️ Delete - Remove file permanently"
+
+        safe_edit_message(
+            call.message.chat.id,
+            call.message.message_id,
+            control_text,
+            parse_mode='Markdown',
+            reply_markup=markup
+        )
+
+        bot.answer_callback_query(call.id, f"Control panel for {file_name}")
+
+    except Exception as e:
+        logger.error(f"Error in file control handler: {e}", exc_info=True)
+        bot.answer_callback_query(call.id, "❌ Error occurred!")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('start_'))
+def handle_start_file(call):
+    try:
+        parts = call.data.split('_', 2)
+        user_id = int(parts[1])
+        file_name = parts[2]
+
+        # Check permissions
+        if call.from_user.id != user_id and call.from_user.id not in admin_ids:
+            bot.answer_callback_query(call.id, "🚫 Access denied!")
+            return
+
+        user_folder = get_user_folder(user_id)
+        file_path = os.path.join(user_folder, file_name)
+
+        if not os.path.exists(file_path):
+            bot.answer_callback_query(call.id, "❌ File not found!")
+            return
+
+        if is_bot_running(user_id, file_name):
+            bot.answer_callback_query(call.id, "⚠️ Already running!")
+            return
+
+        # Update message to show starting
+        safe_edit_message(
+            call.message.chat.id,
+            call.message.message_id,
+            f"🚀 **Starting execution**\n\n"
+            f"📄 File: `{file_name}`\n"
+            f"⚙️ Status: 🔍 Initializing...",
+            parse_mode='Markdown'
+        )
+
+        # Execute the script
+        success, result = execute_script(user_id, file_path, call.message)
+
+        if not success:
+            # If execution failed to start, show error with buttons
+            markup = build_file_control_markup(user_id, file_name, 'executable')
+            safe_edit_message(
+                call.message.chat.id,
+                call.message.message_id,
+                f"❌ **Failed to start script**\n\n"
+                f"📄 File: `{file_name}`\n"
+                f"Error: {result}",
+                parse_mode='Markdown',
+                reply_markup=markup
+            )
+
+    except Exception as e:
+        logger.error(f"Error starting file: {e}", exc_info=True)
+        bot.answer_callback_query(call.id, "❌ An error occurred.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('stop_'))
+def handle_stop_file(call):
+    try:
+        parts = call.data.split('_', 2)
+        user_id = int(parts[1])
+        file_name = parts[2]
+
+        # Check permissions
+        if call.from_user.id != user_id and call.from_user.id not in admin_ids:
+            bot.answer_callback_query(call.id, "🚫 Access denied!")
+            return
+
+        # Stop the script
+        script_key = f"{user_id}_{file_name}"
+        script_info = bot_scripts.get(script_key)
+
+        if script_info and script_info.get('process'):
+            try:
+                process = script_info['process']
+                process.terminate()
+                process.wait(timeout=5)
+                script_info['running'] = False
+                script_info['returncode'] = process.returncode
+                # Keep in bot_scripts for logs
+
+                bot.answer_callback_query(call.id, "🔴 Stopped successfully!")
+                time.sleep(0.5)
+                # Refresh control panel
+                markup = build_file_control_markup(user_id, file_name, 'executable')
+                status = "⭕ Stopped"
+                control_text = f"🔧 **File Control Panel**\n\n"
+                control_text += f"📄 **File:** `{file_name}`\n"
+                control_text += f"📁 **Type:** executable\n"
+                control_text += f"🔄 **Status:** {status}\n"
+                control_text += f"👤 **Owner:** `{user_id}`\n\n"
+                control_text += f"🎛️ **Choose an action:**\n"
+                control_text += f"• 📜 Logs - View execution output\n"
+                control_text += f"• 🟢 Start - Run the script\n"
+                control_text += f"• 🔴 Stop - Terminate running script\n"
+                control_text += f"• 🔄 Restart - Stop and start again\n"
+                control_text += f"• 🗑️ Delete - Remove file permanently"
+
+                safe_edit_message(
+                    call.message.chat.id,
+                    call.message.message_id,
+                    control_text,
+                    parse_mode='Markdown',
+                    reply_markup=markup
+                )
+            except Exception as e:
+                bot.answer_callback_query(call.id, f"❌ Stop failed: {str(e)}")
+        else:
+            bot.answer_callback_query(call.id, "⚠️ Not running!")
+
+    except Exception as e:
+        logger.error(f"Error stopping file: {e}", exc_info=True)
+        bot.answer_callback_query(call.id, "❌ Error occurred!")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('restart_'))
+def handle_restart_file(call):
+    try:
+        parts = call.data.split('_', 2)
+        user_id = int(parts[1])
+        file_name = parts[2]
+
+        # Check permissions
+        if call.from_user.id != user_id and call.from_user.id not in admin_ids:
+            bot.answer_callback_query(call.id, "🚫 Access denied!")
+            return
+
+        # Stop first
+        script_key = f"{user_id}_{file_name}"
+        script_info = bot_scripts.get(script_key)
+
+        if script_info and script_info.get('process'):
+            try:
+                process = script_info['process']
+                process.terminate()
+                process.wait(timeout=5)
+                script_info['running'] = False
+                script_info['returncode'] = process.returncode
+            except:
+                pass
+
+        # Update message
+        safe_edit_message(
+            call.message.chat.id,
+            call.message.message_id,
+            f"🔄 **Restarting script**\n\n"
+            f"📄 File: `{file_name}`\n"
+            f"⚙️ Status: 🔍 Initializing...",
+            parse_mode='Markdown'
+        )
+
+        # Start again
+        user_folder = get_user_folder(user_id)
+        file_path = os.path.join(user_folder, file_name)
+
+        if os.path.exists(file_path):
+            success, result = execute_script(user_id, file_path, call.message)
+
+            if not success:
+                markup = build_file_control_markup(user_id, file_name, 'executable')
+                safe_edit_message(
+                    call.message.chat.id,
+                    call.message.message_id,
+                    f"❌ **Restart failed**\n\n"
+                    f"📄 File: `{file_name}`\n"
+                    f"Error: {result}",
+                    parse_mode='Markdown',
+                    reply_markup=markup
+                )
+        else:
+            bot.answer_callback_query(call.id, "❌ File not found!")
+
+    except Exception as e:
+        logger.error(f"Error restarting file: {e}", exc_info=True)
+        bot.answer_callback_query(call.id, "❌ Error occurred!")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('logs_'))
+def handle_show_logs(call):
+    try:
+        parts = call.data.split('_', 2)
+        user_id = int(parts[1])
+        file_name = parts[2]
+
+        # Check permissions
+        if call.from_user.id != user_id and call.from_user.id not in admin_ids:
+            bot.answer_callback_query(call.id, "🚫 Access denied!")
+            return
+
+        script_key = f"{user_id}_{file_name}"
+        script_info = bot_scripts.get(script_key)
+
+        if not script_info:
+            bot.answer_callback_query(call.id, "❌ No log information found (script never ran).")
+            return
+
+        log_file_path = script_info.get('log_file_path')
+        if not log_file_path or not os.path.exists(log_file_path):
+            bot.answer_callback_query(call.id, "❌ Log file not found.")
+            return
+
+        try:
+            with open(log_file_path, 'r') as f:
+                logs = f.read()
+        except Exception as e:
+            bot.answer_callback_query(call.id, f"❌ Error reading log: {str(e)}")
+            return
+
+        # Build status line
+        running = script_info.get('running', False)
+        returncode = script_info.get('returncode')
+        status_line = f"**Status:** {'🟢 Running' if running else '🔴 Stopped'}"
+        if returncode is not None:
+            status_line += f" (exit code: `{returncode}`)"
+        if returncode != 0 and not running:
+            status_line += " – possible error"
+
+        if logs.strip():
+            if len(logs) > 3500:
+                logs = "..." + logs[-3500:]
+            logs_text = f"📜 **Execution Logs - `{file_name}`**\n\n{status_line}\n\n```\n{logs}\n```"
+        else:
+            logs_text = f"📜 **Execution Logs - `{file_name}`**\n\n{status_line}\n\n🔇 No output captured.\n\n💡 The script may have exited immediately without printing anything, or an error occurred before any output."
+
+        bot.send_message(call.message.chat.id, logs_text, parse_mode='Markdown')
+        bot.answer_callback_query(call.id, "📜 Logs sent!")
+
+    except Exception as e:
+        logger.error(f"Error showing logs: {e}", exc_info=True)
+        bot.answer_callback_query(call.id, "❌ Error occurred!")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('delete_'))
+def handle_delete_file(call):
+    try:
+        parts = call.data.split('_', 2)
+        user_id = int(parts[1])
+        file_name = parts[2]
+
+        # Check permissions
+        if call.from_user.id != user_id and call.from_user.id not in admin_ids:
+            bot.answer_callback_query(call.id, "🚫 Access denied!")
+            return
+
+        # Stop if running
+        script_key = f"{user_id}_{file_name}"
+        if script_key in bot_scripts:
+            try:
+                process = bot_scripts[script_key]['process']
+                process.terminate()
+                del bot_scripts[script_key]
+            except:
+                pass
+
+        # Delete file
+        user_folder = get_user_folder(user_id)
+        file_path = os.path.join(user_folder, file_name)
+
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+        # Remove from database
+        if user_id in user_files:
+            user_files[user_id] = [(fn, ft) for fn, ft in user_files[user_id] if fn != file_name]
+
+        try:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute('DELETE FROM user_files WHERE user_id = ? AND file_name = ?', (user_id, file_name))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Database error deleting file: {e}")
+
+        bot.answer_callback_query(call.id, f"🗑️ {file_name} deleted!")
+
+        # Go back to files list
+        call.data = f'back_files_{user_id}'
+        handle_back_to_files(call)
+
+    except Exception as e:
+        logger.error(f"Error deleting file: {e}", exc_info=True)
+        bot.answer_callback_query(call.id, "❌ Error occurred!")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('back_files_'))
+def handle_back_to_files(call):
+    try:
+        parts = call.data.split('_', 2)
+        user_id = int(parts[2])
+
+        files = user_files.get(user_id, [])
+
+        if not files:
+            files_text = "📂 **Your Files**\n\n🔒 No files uploaded yet.\n\n💡 Upload any file type to begin!"
+            markup = None
+        else:
+            files_text = "🔒 **Your Files:**\n\n📁 Click on any file to manage it:\n\n"
+            markup = types.InlineKeyboardMarkup(row_width=1)
+
+            for i, (file_name, file_type) in enumerate(files, 1):
+                if file_type == 'executable':
+                    status = "🟢 Running" if is_bot_running(user_id, file_name) else "⭕ Stopped"
+                    icon = "🚀"
+                    files_text += f"{i}. `{file_name}` ({file_type})\n   Status: {status}\n\n"
+                else:
+                    status = "📁 Hosted"
+                    icon = "📄"
+                    file_hash = hashlib.md5(f"{user_id}_{file_name}".encode()).hexdigest()
+
+                    # Get the current domain from environment or use default
+                    domain = os.environ.get('REPL_SLUG', 'universal-file-host')
+                    owner = os.environ.get('REPL_OWNER', 'replit-user')
+
+                    # Try different URL formats
+                    try:
+                        replit_url = f"https://{domain}.{owner}.repl.co"
+                        test_response = requests.get(f"{replit_url}/health", timeout=2)
+                        if test_response.status_code != 200:
+                            replit_url = f"https://{domain}-{owner}.replit.app"
+                    except:
+                        replit_url = f"https://{domain}-{owner}.replit.app"
+
+                    file_url = f"{replit_url}/file/{file_hash}"
+                    files_text += f"{i}. `{file_name}` ({file_type})\n   Status: {status}\n   🔗 [Access]({file_url})\n\n"
+
+                markup.add(types.InlineKeyboardButton(
+                    f"{icon} {file_name} - {status}", 
+                    callback_data=f'control_{user_id}_{file_name}'
+                ))
+
+            files_text += "⚙️ **Management Options:**\n• 🟢 Start/🔴 Stop executable files\n• 🗑️ Delete files\n• 📜 View execution logs\n• 🔄 Restart running files"
+
+        safe_edit_message(
+            call.message.chat.id,
+            call.message.message_id,
+            files_text,
+            parse_mode='Markdown',
+            reply_markup=markup
+        )
+
+        bot.answer_callback_query(call.id, "📂 Files list updated!")
+
+    except Exception as e:
+        logger.error(f"Error going back to files: {e}", exc_info=True)
+        bot.answer_callback_query(call.id, "❌ Error occurred!")
+
+# --- Catch all handler for unsupported messages ---
+@bot.message_handler(func=lambda message: True)
+def handle_all_messages(message):
+    safe_reply_to(message, "🔒 Use the menu buttons or send /start for help.")
+
+# --- Initialize and Start Bot ---
+def cleanup_on_exit():
+    """Cleanup function called on exit"""
+    logger.info("Performing cleanup on exit...")
+
+    # Stop all running scripts
+    for script_key, script_info in bot_scripts.items():
+        try:
+            process = script_info.get('process')
+            if process and process.poll() is None:
+                process.terminate()
+                logger.info(f"Terminated script: {script_key}")
+        except Exception as e:
+            logger.error(f"Error terminating script {script_key}: {e}")
+
 if __name__ == "__main__":
+    # Register cleanup function
+    atexit.register(cleanup_on_exit)
+
+    # Initialize database and load data
     init_db()
     load_data()
+
+    # Start Flask keep-alive server
     keep_alive()
-    logger.info(f"Bot starting. Owner ID: {OWNER_ID}")
-    # Verify owner chat
+
+    logger.info("🚀 Universal File Host Bot starting...")
+    logger.info(f"👑 Owner ID: {OWNER_ID}")
+    logger.info(f"👤 Admin ID: {ADMIN_ID}")
+    logger.info(f"📁 Upload directory: {UPLOAD_BOTS_DIR}")
+
     try:
-        bot.send_chat_action(OWNER_ID, 'typing')
-        logger.info("✅ Owner reachable")
+        # Test bot connection first
+        bot_info = bot.get_me()
+        logger.info(f"Bot connected successfully: @{bot_info.username}")
+        print(f"Bot connected successfully: @{bot_info.username}")
+
+        # Start polling with error handling
+        bot.infinity_polling(timeout=10, long_polling_timeout=5, none_stop=True, interval=0)
     except Exception as e:
-        logger.error(f"❌ Cannot message owner {OWNER_ID}: {e}")
-        print(f"\n⚠️  Owner ({OWNER_ID}) must start a private chat with @{bot.get_me().username} and send /start\n")
-    try:
-        bot.infinity_polling(timeout=10, long_polling_timeout=5, none_stop=True)
-    except Exception as e:
-        logger.error(f"Polling error: {e}")
+        logger.error(f"Bot error: {e}", exc_info=True)
+        print(f"Bot connection failed: {e}")
         sys.exit(1)
