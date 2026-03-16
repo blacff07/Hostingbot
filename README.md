@@ -1,9 +1,9 @@
 # Universal File Host Bot 🤖
 
-[![Deploy on Heroku](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/YOUR_USERNAME/universal-file-host-bot)
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/YOUR_USERNAME/universal-file-host-bot)
-[![Deploy on Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/YOUR_USERNAME/universal-file-host-bot)
-[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?type=git&repository=github.com/YOUR_USERNAME/universal-file-host-bot)
+[![Deploy on Heroku](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/blacff07/Hostingbot)
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/blacff07/Hostingbot)
+[![Deploy on Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/blacff07/Hostingbot)
+[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?type=git&repository=github.com/blacff07/Hostingbot)
 
 A powerful Telegram bot for hosting files and executing code in **30+ programming languages** with advanced security features.
 
@@ -35,8 +35,8 @@ Click any deployment button above to deploy instantly.
 ### Clone Repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/universal-file-host-bot.git
-cd universal-file-host-bot
+git clone https://github.com/blacff07/Hostingbot.git
+cd Hostingbot
 ```
 
 ### Install Dependencies
@@ -81,19 +81,18 @@ Create a `.env` file:
 
 ```env
 # Bot Configuration
-TELEGRAM_BOT_TOKEN=8637611080:AAGLSLxqLjhpUDicLkxEuxQzQQqIVkpMack
+TELEGRAM_BOT_TOKEN=your_bot_token_here
 
 # Owner Configuration
-OWNER_ID=6350914711
-ADMIN_ID=6350914711
+OWNER_ID=your_telegram_id
+ADMIN_ID=your_telegram_id
 
 # Bot Identity
-BOT_USERNAME=@NotBlac
+BOT_USERNAME=@NottBlac
 UPDATE_CHANNEL=https://t.me/BlacScriptz
 
-# Security Settings (optional)
-MAX_FILE_REQUESTS_PER_MINUTE=5
-MAX_SHELL_COMMANDS_PER_HOUR=10
+# Hosting URL (set to your deployed app URL)
+HOST_URL=https://your-app.up.railway.app
 ```
 
 ---
@@ -186,10 +185,9 @@ MIT License — see LICENSE file.
 
 ## 👤 Author
 
-**@NotBlac**
-
-Telegram: https://t.me/NotBlac  
-Channel: https://t.me/BlacScriptz
+**Blac** — [@NottBlac](https://t.me/NottBlac)  
+Channel: https://t.me/BlacScriptz  
+Repo: https://github.com/blacff07/Hostingbot
 
 ---
 
