@@ -603,9 +603,27 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key):
 
                 if msg:
                     mk = build_control_markup(uid, name, 'executable')
-                    status_icon = "✅" if res.returncode == 0 else "⚠️"
-                    safe_edit(msg.chat.id, msg.message_id,
-                             f"{status_icon} *{lang}* — `{name}`\nExit: `{res.returncode}`", 'Markdown', mk)
+                    if res.returncode == 0:
+                        safe_edit(msg.chat.id, msg.message_id,
+                                 f"✅ *{lang}* — `{name}`\nExit: `0`", 'Markdown', mk)
+                    else:
+                        # Build error snippet from stderr/stdout
+                        err_output = (res.stderr or res.stdout or "").strip()
+                        # Try to extract traceback or syntax error block
+                        tb_match = re.search(
+                            r'((?:Traceback \(most recent call last\)|.*Error:).*)',
+                            err_output, re.DOTALL
+                        )
+                        snippet = tb_match.group(1).strip() if tb_match else err_output
+                        if len(snippet) > 1500:
+                            snippet = snippet[:1500] + "\n..."
+                        error_text = (
+                            f"❌ *{lang}* — `{name}`\n"
+                            f"Exit: `{res.returncode}`\n"
+                        )
+                        if snippet:
+                            error_text += f"\n```\n{snippet}\n```"
+                        safe_edit(msg.chat.id, msg.message_id, error_text, 'Markdown', mk)
                 return True, f"Exit {res.returncode}"
 
             except subprocess.TimeoutExpired:
