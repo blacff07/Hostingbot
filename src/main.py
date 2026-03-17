@@ -425,8 +425,9 @@ LANG_MAP = {
 }
 
 # ==================== CRASH MONITOR ====================
-def monitor_script(uid, key, name, process, log_path):
-    """Watches a background process; DMs user on crash with error snippet"""
+def monitor_script(uid, key, name, process, log_path, msg_chat_id=None, msg_id=None):
+    """Watches a background process; DMs user on crash with error snippet.
+       Also updates the launch message if it was stuck on deps."""
     try:
         process.wait()
         rc = process.returncode
@@ -434,25 +435,39 @@ def monitor_script(uid, key, name, process, log_path):
         scripts[key]['running'] = False
         scripts[key]['code'] = rc
 
+        # Update the original launch message if it was stuck showing deps/starting
+        if msg_chat_id and msg_id and rc not in (0, None):
+            try:
+                mk = build_control_markup(uid, name, 'executable')
+                safe_edit(msg_chat_id, msg_id,
+                         f"❌ *Crashed* — `{name}`\nExit: `{rc}`", 'Markdown', mk)
+            except: pass
+
         if rc not in (0, -1, None):
-            # Read last lines of log for error snippet
+            # Extract traceback from log - prefer stderr lines
             snippet = ""
             if log_path and os.path.exists(log_path):
                 with open(log_path, 'r', errors='ignore') as f:
-                    lines = f.readlines()
-                tail = lines[-20:] if len(lines) > 20 else lines
-                snippet = "".join(tail).strip()
-                if len(snippet) > 1500:
-                    snippet = "..." + snippet[-1500:]
+                    content = f.read()
+                # Try to isolate traceback block
+                tb_match = re.search(r'(Traceback \(most recent call last\).*?)(?:\n\n|\Z)', content, re.DOTALL)
+                if tb_match:
+                    snippet = tb_match.group(1).strip()
+                else:
+                    lines = content.splitlines()
+                    tail = lines[-25:] if len(lines) > 25 else lines
+                    snippet = "\n".join(tail).strip()
+                if len(snippet) > 1800:
+                    snippet = "..." + snippet[-1800:]
 
             text = (
                 f"⚠️ *Script Crashed*\n"
                 f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-                f"📄 File: `{name}`\n"
+                f"📄 `{name}`\n"
                 f"❌ Exit code: `{rc}`\n"
             )
             if snippet:
-                text += f"\n*Last output:*\n```\n{snippet}\n```"
+                text += f"\n*Traceback:*\n```\n{snippet}\n```"
 
             try: safe_send(uid, text, 'Markdown')
             except: pass
@@ -601,8 +616,13 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key):
                                 'start': datetime.now(), 'log': log_path, 'lang': lang,
                                 'icon': icon, 'running': True, 'code': None}
 
+                # Store msg info so monitor can update it on crash
+                msg_chat_id = msg.chat.id if msg else None
+                msg_id = msg.message_id if msg else None
+
                 # Start crash monitor thread
-                t = threading.Thread(target=monitor_script, args=(uid, key, name, p, log_path), daemon=True)
+                t = threading.Thread(target=monitor_script,
+                                     args=(uid, key, name, p, log_path, msg_chat_id, msg_id), daemon=True)
                 t.start()
 
                 if msg:
@@ -650,14 +670,16 @@ def _run_shell_cmd(message, cmd_text):
             conn.commit(); conn.close()
         except: pass
         result = f"`$ {full_cmd}`\n\n{output}\n`exit {process.returncode}`"
+        exit_mk = types.InlineKeyboardMarkup()
+        exit_mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
         if len(result) > 4096:
             tmp = os.path.join(LOGS_DIR, f"shell_{int(time.time())}.txt")
             with open(tmp, 'w') as f: f.write(f"$ {full_cmd}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}\n\nExit: {process.returncode}")
-            with open(tmp, 'rb') as f: bot.send_document(status.chat.id, f, caption=f"`$ {full_cmd}`", parse_mode='Markdown')
+            with open(tmp, 'rb') as f: bot.send_document(status.chat.id, f, caption=f"`$ {full_cmd}`", parse_mode='Markdown', reply_markup=exit_mk)
             os.remove(tmp)
             bot.delete_message(status.chat.id, status.message_id)
         else:
-            safe_edit(status.chat.id, status.message_id, result, 'Markdown')
+            safe_edit(status.chat.id, status.message_id, result, 'Markdown', exit_mk)
     except Exception as e:
         safe_edit(status.chat.id, status.message_id, f"❌ `{e}`", 'Markdown')
 
@@ -1085,7 +1107,8 @@ def handle_upload(message):
             conn.commit(); conn.close()
 
             safe_edit(status.chat.id, status.message_id,
-                     f"🚫 *Blocked*\n`{name}`\n⚠️ {scan}\n\nSent to owner for review", 'Markdown')
+                     f"🚫 *Blocked*\n`{name}`\n⚠️ {scan}\n\nSent to owner for review\n\n💳 *Buy Premium* to bypass security checks", 'Markdown',
+                     types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("💳 Buy Premium", url=OWNER_TG)))
 
             mk = types.InlineKeyboardMarkup()
             mk.row(types.InlineKeyboardButton("✅ Approve", callback_data=f"app_{fhash}"),
@@ -1308,7 +1331,6 @@ def cb_logs(c):
     if len(content) > 3500: content = "…" + content[-3500:]
     mk = types.InlineKeyboardMarkup()
     mk.add(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{uid}_{name}"))
-    mk.add(types.InlineKeyboardButton("🔙 Back", callback_data=f"file_{uid}_{name}"))
     bot.send_message(c.message.chat.id,
                      f"📜 *Logs:* `{name}`\n{status_txt}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n{content}\n```",
                      parse_mode='Markdown', reply_markup=mk)
@@ -1327,7 +1349,6 @@ def cb_refresh(c):
     if len(content) > 3500: content = "…" + content[-3500:]
     mk = types.InlineKeyboardMarkup()
     mk.add(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{uid}_{name}"))
-    mk.add(types.InlineKeyboardButton("🔙 Back", callback_data=f"file_{uid}_{name}"))
     safe_edit(c.message.chat.id, c.message.message_id,
              f"📜 *Logs:* `{name}`\n{status_txt}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n{content}\n```",
              'Markdown', mk)
@@ -1386,9 +1407,14 @@ def cb_back(c):
     bot.answer_callback_query(c.id)
 
 # ==================== BUTTON HANDLERS ====================
+def exit_shell_if_active(uid):
+    """Exit shell session silently when user presses any reply keyboard button"""
+    shell_sessions.pop(uid, None)
+
 @bot.message_handler(func=lambda m: m.text == "📂 Files")
 def btn_files(m):
     uid = m.from_user.id
+    exit_shell_if_active(uid)
     files = user_files.get(uid, [])
     if not files: return safe_reply(m, "📂 *No files*\nSend a file to upload it", 'Markdown')
     text = f"📂 *Files* ({len(files)})\n"
@@ -1403,6 +1429,7 @@ def btn_files(m):
 @bot.message_handler(func=lambda m: m.text == "👤 Profile")
 def btn_profile(m):
     uid = m.from_user.id
+    exit_shell_if_active(uid)
     tier = get_user_tier(uid)
     lim = get_user_limit(uid)
     lim_txt = "∞" if lim == float('inf') else str(lim)
@@ -1442,6 +1469,7 @@ def btn_profile(m):
 @bot.message_handler(func=lambda m: m.text == "📊 Stats")
 def btn_stats(m):
     uid = m.from_user.id
+    exit_shell_if_active(uid)
     running = len([s for s in scripts.values() if s.get('running') and not s['key'].startswith('clone_')])
     lim = get_user_limit(uid); lim_txt = "∞" if lim == float('inf') else str(lim)
 
@@ -1467,10 +1495,12 @@ def btn_stats(m):
 
 @bot.message_handler(func=lambda m: m.text == "❓ Help")
 def btn_help(m):
+    exit_shell_if_active(m.from_user.id)
     cmd_help(m)
 
 @bot.message_handler(func=lambda m: m.text == "📢 Channel")
 def btn_channel(m):
+    exit_shell_if_active(m.from_user.id)
     mk = types.InlineKeyboardMarkup()
     mk.add(types.InlineKeyboardButton("📢 Join @BlacScriptz", url=UPDATE_CHANNEL))
     text = (
@@ -1483,8 +1513,8 @@ def btn_channel(m):
 
 @bot.message_handler(func=lambda m: m.text == "📞 Contact")
 def btn_contact(m):
+    exit_shell_if_active(m.from_user.id)
     mk = types.InlineKeyboardMarkup(row_width=1)
-    mk.add(types.InlineKeyboardButton("💬 Contact Owner", url=OWNER_TG))
     mk.add(types.InlineKeyboardButton("💳 Buy Premium", url=OWNER_TG))
     mk.add(types.InlineKeyboardButton("🐛 Report a Bug", url=OWNER_TG))
     mk.add(types.InlineKeyboardButton("📢 Channel", url=UPDATE_CHANNEL))
@@ -1499,6 +1529,7 @@ def btn_contact(m):
 @bot.message_handler(func=lambda m: m.text == "💳 Subs")
 def btn_subs(m):
     if m.from_user.id not in admins: return
+    exit_shell_if_active(m.from_user.id)
     active = [(uid, sub) for uid, sub in subscriptions.items() if sub['expiry'] > datetime.now()]
     if not active: return safe_reply(m, "💳 *Subscriptions*\nNone active", 'Markdown')
     text = f"💳 *Subscriptions* ({len(active)} active)\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
@@ -1509,7 +1540,8 @@ def btn_subs(m):
 
 @bot.message_handler(func=lambda m: m.text == "🔒 Lock")
 def btn_lock(m):
-    if m.from_user.id != OWNER_ID: return  # Owner only
+    if m.from_user.id != OWNER_ID: return
+    exit_shell_if_active(m.from_user.id)
     global bot_locked
     bot_locked = not bot_locked
     icon = "🔒" if bot_locked else "🔓"
@@ -1518,6 +1550,7 @@ def btn_lock(m):
 @bot.message_handler(func=lambda m: m.text == "🟢 Running")
 def btn_running(m):
     if m.from_user.id not in admins: return
+    exit_shell_if_active(m.from_user.id)
     running = [s for s in scripts.values() if s.get('running') and not s['key'].startswith('clone_')]
     if not running: return safe_reply(m, "🟢 *No running scripts*", 'Markdown')
     text = f"🟢 *Running* ({len(running)})\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
@@ -1534,10 +1567,9 @@ def btn_running(m):
 @bot.message_handler(func=lambda m: m.text == "⏳ Pending")
 def btn_pending(m):
     if m.from_user.id not in admins: return
+    exit_shell_if_active(m.from_user.id)
     if not pending: return safe_reply(m, "⏳ *No pending approvals*", 'Markdown')
-    text = f"⏳ *Pending Approvals* ({len(pending)})\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
     for fhash, info in list(pending.items()):
-        text += f"📄 `{info['name']}`\nUser: `{info['uid']}`\n"
         mk = types.InlineKeyboardMarkup()
         mk.row(types.InlineKeyboardButton("✅ Approve", callback_data=f"app_{fhash}"),
                types.InlineKeyboardButton("❌ Reject", callback_data=f"rej_{fhash}"))
@@ -1549,16 +1581,16 @@ def btn_pending(m):
                                       caption=f"📄 `{info['name']}`\nUser: `{info['uid']}`",
                                       parse_mode='Markdown', reply_markup=mk)
             else:
-                safe_send(m.chat.id, f"📄 `{info['name']}`\nUser: `{info['uid']}`\n⚠️ File missing on disk",
+                safe_send(m.chat.id, f"📄 `{info['name']}`\nUser: `{info['uid']}`\n⚠️ File missing",
                           'Markdown', mk)
         except: pass
 
 @bot.message_handler(func=lambda m: m.text == "🤖 Clones")
 def btn_clones(m):
     if m.from_user.id not in admins: return
+    exit_shell_if_active(m.from_user.id)
     clones = {k: v for k, v in scripts.items() if k.startswith('clone_')}
     if not clones: return safe_reply(m, "🤖 *No active clones*", 'Markdown')
-    text = f"🤖 *Clones* ({len(clones)})\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
     for key, s in clones.items():
         secs = int((datetime.now() - s['start']).total_seconds())
         h, r = divmod(secs, 3600); mins, sec = divmod(r, 60)
@@ -1568,20 +1600,21 @@ def btn_clones(m):
         cpu_str, mem_str = ("?", "?")
         if s.get('process') and s['process'].poll() is None:
             cpu_str, mem_str = get_process_stats(s['process'].pid)
-        text += (
+        text = (
+            f"🤖 *Clone*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             f"{alive} @{s.get('bot', '?')}\n"
             f"Owner: `{s['uid']}`  •  PID: `{pid}`\n"
             f"Uptime: `{uptime}`\n"
-            f"CPU: `{cpu_str}`  •  RAM: `{mem_str}`\n"
+            f"CPU: `{cpu_str}`  •  RAM: `{mem_str}`"
         )
         mk = types.InlineKeyboardMarkup()
         mk.add(types.InlineKeyboardButton("🗑️ Remove", callback_data=f"rmclone_{s['uid']}"))
         safe_reply(m, text, 'Markdown', mk)
-        text = ""  # Reset for next clone
 
 @bot.message_handler(func=lambda m: m.text == "👑 Admin")
 def btn_admin(m):
     if m.from_user.id not in admins: return
+    exit_shell_if_active(m.from_user.id)
     total_running = len([s for s in scripts.values() if s.get('running') and not s['key'].startswith('clone_')])
     clones = len([s for s in scripts.values() if s['key'].startswith('clone_')])
     try:
@@ -1610,6 +1643,7 @@ def btn_shell(m):
 @bot.message_handler(func=lambda m: m.text == "📁 All Files")
 def btn_all_files(m):
     if m.from_user.id != OWNER_ID: return
+    exit_shell_if_active(m.from_user.id)
     if not user_files:
         return safe_reply(m, "📁 *No files uploaded yet*", 'Markdown')
     text = f"📁 *All User Files*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
