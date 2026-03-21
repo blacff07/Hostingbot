@@ -23,6 +23,7 @@ import threading
 import queue
 from pathlib import Path
 import traceback
+import socket
 
 # ==================== CONFIGURATION ====================
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -31,9 +32,6 @@ ADMIN_ID = int(os.getenv('ADMIN_ID', '8537538760'))
 BOT_USERNAME = os.getenv('BOT_USERNAME', '@NottBlac')
 UPDATE_CHANNEL = os.getenv('UPDATE_CHANNEL', 'https://t.me/BlacScriptz')
 OWNER_TG = 'https://t.me/NottBlac'
-# Set HOST_URL in your environment to your Render/Railway/etc URL
-# e.g. HOST_URL=https://your-app.onrender.com
-HOST_URL = os.environ.get('HOST_URL', '').rstrip('/')
 
 # Paths
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -43,6 +41,7 @@ DB_PATH = os.path.join(DB_DIR, 'bot.db')
 LOGS_DIR = os.path.join(BASE_DIR, 'logs')
 PENDING_DIR = os.path.join(BASE_DIR, 'pending')
 EXTRACT_DIR = os.path.join(BASE_DIR, 'extracted')
+SITES_DIR = os.path.join(BASE_DIR, 'sites')   # ZIP website folders
 
 # Limits
 FREE_LIMIT = 5
@@ -50,11 +49,45 @@ SUB_LIMIT = 25
 ADMIN_LIMIT = 999
 OWNER_LIMIT = float('inf')
 
-for d in [UPLOAD_DIR, DB_DIR, LOGS_DIR, PENDING_DIR, EXTRACT_DIR]:
+for d in [UPLOAD_DIR, DB_DIR, LOGS_DIR, PENDING_DIR, EXTRACT_DIR, SITES_DIR]:
     os.makedirs(d, exist_ok=True)
 
+# ==================== PLATFORM AUTO-DETECT ====================
+def detect_host_url():
+    """Auto-detect the public URL based on platform environment variables."""
+    # Render
+    if os.environ.get('RENDER_EXTERNAL_URL'):
+        return os.environ['RENDER_EXTERNAL_URL'].rstrip('/')
+    if os.environ.get('RENDER_SERVICE_NAME'):
+        name = os.environ['RENDER_SERVICE_NAME']
+        return f"https://{name}.onrender.com"
+    # Railway
+    if os.environ.get('RAILWAY_PUBLIC_DOMAIN'):
+        return f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN']}".rstrip('/')
+    if os.environ.get('RAILWAY_STATIC_URL'):
+        return os.environ['RAILWAY_STATIC_URL'].rstrip('/')
+    # Heroku
+    if os.environ.get('HEROKU_APP_NAME'):
+        return f"https://{os.environ['HEROKU_APP_NAME']}.herokuapp.com"
+    # Koyeb
+    if os.environ.get('KOYEB_PUBLIC_DOMAIN'):
+        return f"https://{os.environ['KOYEB_PUBLIC_DOMAIN']}".rstrip('/')
+    # Replit
+    if os.environ.get('REPL_SLUG') and os.environ.get('REPL_OWNER'):
+        return f"https://{os.environ['REPL_SLUG']}-{os.environ['REPL_OWNER']}.replit.app"
+    # Fly.io
+    if os.environ.get('FLY_APP_NAME'):
+        return f"https://{os.environ['FLY_APP_NAME']}.fly.dev"
+    # Manual override always wins if set
+    manual = os.environ.get('HOST_URL', '').rstrip('/')
+    if manual:
+        return manual
+    return None
+
+HOST_URL = detect_host_url()
+
 # ==================== FLASK ====================
-from flask import Flask, send_file, jsonify
+from flask import Flask, send_file, jsonify, abort
 from threading import Thread
 
 app = Flask(__name__)
@@ -78,10 +111,37 @@ def serve_file(file_hash):
     except Exception:
         return "Error", 500
 
+@app.route('/s/<slug>')
+@app.route('/s/<slug>/<path:subpath>')
+def serve_site(slug, subpath='index.html'):
+    """Serve ZIP-extracted websites at /s/<slug>/"""
+    site_dir = os.path.join(SITES_DIR, slug)
+    if not os.path.isdir(site_dir):
+        return "Site not found", 404
+    # Default to index.html
+    if subpath == 'index.html' or not subpath:
+        target = os.path.join(site_dir, 'index.html')
+        if not os.path.exists(target):
+            # Try to find any html file
+            for f in os.listdir(site_dir):
+                if f.endswith('.html'):
+                    target = os.path.join(site_dir, f)
+                    break
+    else:
+        target = os.path.join(site_dir, subpath)
+    # Security: stay within site dir
+    target = os.path.realpath(target)
+    if not target.startswith(os.path.realpath(site_dir)):
+        abort(403)
+    if os.path.exists(target) and os.path.isfile(target):
+        return send_file(target)
+    return "Not found", 404
+
 @app.route('/health')
 def health():
     return jsonify({"status": "ok", "time": datetime.now().isoformat(),
-                    "users": len(active_users), "files": sum(len(f) for f in user_files.values())})
+                    "users": len(active_users), "files": sum(len(f) for f in user_files.values()),
+                    "platform": HOST_URL or "local"})
 
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
@@ -93,11 +153,15 @@ def keep_alive():
     t.start()
 
 def get_file_url(uid, name):
-    """Build hosted file URL using HOST_URL env var."""
     if not HOST_URL:
         return None
     fhash = hashlib.md5(f"{uid}_{name}".encode()).hexdigest()
     return f"{HOST_URL}/file/{fhash}"
+
+def get_site_url(slug):
+    if not HOST_URL:
+        return None
+    return f"{HOST_URL}/s/{slug}/"
 
 # ==================== BOT ====================
 bot = telebot.TeleBot(TOKEN)
@@ -114,6 +178,16 @@ shell_sessions = {}
 exec_locks = {}
 exec_locks_mutex = threading.Lock()
 broadcast_pending = {}
+# user_envs: uid -> {name: {KEY: VALUE}}
+user_envs = {}
+# site_slugs: uid -> {filename: slug}
+site_slugs = {}
+# clone_stats: key -> {users: set, files: int, runs: int}
+clone_stats = {}
+# waiting_slug: uid -> {'name': filename, 'uid': uid}
+waiting_slug = {}
+# waiting_env_key / waiting_env_val: for env set flow
+waiting_env = {}  # uid -> {'step': 'key'|'val', 'name': filename, 'key': KEY}
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -137,6 +211,8 @@ def init_db():
         c.execute('CREATE TABLE IF NOT EXISTS admins (uid INTEGER PRIMARY KEY)')
         c.execute('CREATE TABLE IF NOT EXISTS pending (hash TEXT PRIMARY KEY, uid INTEGER, name TEXT, path TEXT, time TEXT)')
         c.execute('CREATE TABLE IF NOT EXISTS cmd_log (id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, cmd TEXT, time TEXT, output TEXT)')
+        c.execute('CREATE TABLE IF NOT EXISTS user_envs (uid INTEGER, filename TEXT, key TEXT, value TEXT, PRIMARY KEY (uid, filename, key))')
+        c.execute('CREATE TABLE IF NOT EXISTS site_slugs (uid INTEGER, filename TEXT, slug TEXT, PRIMARY KEY (uid, filename))')
         c.execute('INSERT OR IGNORE INTO admins VALUES (?)', (OWNER_ID,))
         if ADMIN_ID != OWNER_ID:
             c.execute('INSERT OR IGNORE INTO admins VALUES (?)', (ADMIN_ID,))
@@ -152,7 +228,7 @@ def clear_old_data():
             try: kill_process_tree(info['process'].pid)
             except: pass
     scripts.clear()
-    for d in [UPLOAD_DIR, EXTRACT_DIR, PENDING_DIR]:
+    for d in [UPLOAD_DIR, EXTRACT_DIR, PENDING_DIR, SITES_DIR]:
         if os.path.exists(d): shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d, exist_ok=True)
     try:
@@ -160,10 +236,12 @@ def clear_old_data():
         conn.execute('DELETE FROM files')
         conn.execute('DELETE FROM pending')
         conn.execute('DELETE FROM cmd_log')
+        conn.execute('DELETE FROM site_slugs')
         conn.commit(); conn.close()
     except: pass
     user_files.clear()
     pending.clear()
+    site_slugs.clear()
     logger.info("Old data cleared")
 
 def load_data():
@@ -184,6 +262,12 @@ def load_data():
         c.execute('SELECT hash, uid, name, path FROM pending')
         for h, uid, name, path in c.fetchall():
             pending[h] = {'uid': uid, 'name': name, 'path': path}
+        c.execute('SELECT uid, filename, key, value FROM user_envs')
+        for uid, filename, key, val in c.fetchall():
+            user_envs.setdefault(uid, {}).setdefault(filename, {})[key] = val
+        c.execute('SELECT uid, filename, slug FROM site_slugs')
+        for uid, filename, slug in c.fetchall():
+            site_slugs.setdefault(uid, {})[filename] = slug
         conn.close()
         logger.info(f"Data loaded: {len(active_users)} users")
     except Exception as e:
@@ -229,8 +313,10 @@ def stop_script(uid, name):
     key = f"{uid}_{name}"
     if key in scripts and scripts[key].get('process'):
         try:
-            kill_process_tree(scripts[key]['process'].pid)
+            # Flag as intentional BEFORE killing so monitor thread ignores it
+            scripts[key]['stopped_intentionally'] = True
             scripts[key]['running'] = False
+            kill_process_tree(scripts[key]['process'].pid)
             return True
         except: pass
     return False
@@ -293,27 +379,62 @@ def get_user_first_seen(uid):
         c = conn.cursor()
         c.execute('SELECT first_seen FROM users WHERE uid=?', (uid,))
         row = c.fetchone(); conn.close()
-        if row and row[0]:
-            return datetime.fromisoformat(row[0]).strftime('%Y-%m-%d')
+        if row and row[0]: return datetime.fromisoformat(row[0]).strftime('%Y-%m-%d')
     except: pass
     return "Unknown"
 
 def extract_error_snippet(stderr, stdout=""):
-    """Extract the most useful error block from stderr/stdout."""
     text = (stderr or stdout or "").strip()
-    if not text:
-        return ""
-    # Try to isolate Traceback block
+    if not text: return ""
     tb = re.search(r'(Traceback \(most recent call last\).*)', text, re.DOTALL)
     if tb:
         snippet = tb.group(1).strip()
     else:
-        # Grab last N lines
         lines = text.splitlines()
         snippet = "\n".join(lines[-30:]).strip()
     if len(snippet) > 1800:
         snippet = "..." + snippet[-1800:]
     return snippet
+
+def get_user_env(uid, filename):
+    """Build env dict for a script, merging system env with user-defined vars."""
+    env = os.environ.copy()
+    user_defined = user_envs.get(uid, {}).get(filename, {})
+    env.update(user_defined)
+    return env
+
+def save_env_var(uid, filename, key, value):
+    user_envs.setdefault(uid, {}).setdefault(filename, {})[key] = value
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute('INSERT OR REPLACE INTO user_envs VALUES (?,?,?,?)', (uid, filename, key, value))
+        conn.commit(); conn.close()
+    except: pass
+
+def delete_env_var(uid, filename, key):
+    if uid in user_envs and filename in user_envs[uid]:
+        user_envs[uid][filename].pop(key, None)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute('DELETE FROM user_envs WHERE uid=? AND filename=? AND key=?', (uid, filename, key))
+        conn.commit(); conn.close()
+    except: pass
+
+def save_slug(uid, filename, slug):
+    site_slugs.setdefault(uid, {})[filename] = slug
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute('INSERT OR REPLACE INTO site_slugs VALUES (?,?,?)', (uid, filename, slug))
+        conn.commit(); conn.close()
+    except: pass
+
+def slug_exists(slug, exclude_uid=None, exclude_file=None):
+    for uid, files in site_slugs.items():
+        for fn, sl in files.items():
+            if sl == slug:
+                if uid == exclude_uid and fn == exclude_file: continue
+                return True
+    return False
 
 # ==================== SECURITY ====================
 def check_malicious(file_path):
@@ -333,18 +454,17 @@ def check_malicious(file_path):
     except: return True, "Safe"
 
 def scan_zip_contents(zip_path):
-    """Scan all code files inside ZIP before extracting."""
     try:
         with zipfile.ZipFile(zip_path, 'r') as zf:
             for name in zf.namelist():
                 ext = os.path.splitext(name)[1].lower()
-                if ext in ('.py', '.js', '.sh', '.rb', '.php', '.lua', '.ts', '.bat', '.ps1'):
+                if ext in ('.py','.js','.sh','.rb','.php','.lua','.ts','.bat','.ps1'):
                     try:
                         with zf.open(name) as f:
                             content = f.read(512*1024).decode('utf-8', errors='ignore').lower()
-                        patterns = ['sudo ', 'rm -rf', 'fdisk', 'mkfs', 'dd if=', 'shutdown',
-                                    'reboot', 'halt', 'poweroff', 'init 0', 'init 6',
-                                    'shutil.rmtree("/"', 'setuid', 'setgid', 'chmod 777', 'chown root']
+                        patterns = ['sudo ','rm -rf','fdisk','mkfs','dd if=','shutdown',
+                                    'reboot','halt','poweroff','init 0','init 6',
+                                    'shutil.rmtree("/")','setuid','setgid','chmod 777','chown root']
                         for p in patterns:
                             if p.lower() in content:
                                 return False, f"Blocked in `{os.path.basename(name)}`: `{p}`"
@@ -352,6 +472,14 @@ def scan_zip_contents(zip_path):
         return True, "Safe"
     except zipfile.BadZipFile: return False, "Invalid ZIP file"
     except: return True, "Safe"
+
+def is_website_zip(zip_path):
+    """Returns True if ZIP contains index.html — treat as static website."""
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            names = [os.path.basename(n).lower() for n in zf.namelist()]
+            return 'index.html' in names
+    except: return False
 
 # ==================== DEPENDENCY INSTALLER ====================
 def install_deps(file_path, ext, folder, installed=None):
@@ -361,50 +489,92 @@ def install_deps(file_path, ext, folder, installed=None):
         if ext == '.py':
             with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
             pkg_map = {
-                'requests': 'requests', 'flask': 'flask', 'django': 'django',
-                'numpy': 'numpy', 'pandas': 'pandas', 'matplotlib': 'matplotlib',
-                'scipy': 'scipy', 'sklearn': 'scikit-learn', 'cv2': 'opencv-python',
-                'PIL': 'Pillow', 'bs4': 'beautifulsoup4', 'selenium': 'selenium',
-                'telebot': 'pyTelegramBotAPI', 'telegram': 'python-telegram-bot',
-                'telethon': 'telethon', 'cryptg': 'cryptg', 'yaml': 'pyyaml',
-                'dotenv': 'python-dotenv', 'psutil': 'psutil', 'cryptography': 'cryptography',
-                'aiohttp': 'aiohttp', 'fastapi': 'fastapi', 'uvicorn': 'uvicorn',
-                'sqlalchemy': 'sqlalchemy', 'pymongo': 'pymongo', 'redis': 'redis',
-                'pydantic': 'pydantic'
+                'requests':'requests','flask':'flask','django':'django',
+                'numpy':'numpy','pandas':'pandas','matplotlib':'matplotlib',
+                'scipy':'scipy','sklearn':'scikit-learn','cv2':'opencv-python',
+                'PIL':'Pillow','bs4':'beautifulsoup4','selenium':'selenium',
+                'telebot':'pyTelegramBotAPI','telegram':'python-telegram-bot',
+                'telethon':'telethon','cryptg':'cryptg','yaml':'pyyaml',
+                'dotenv':'python-dotenv','psutil':'psutil','cryptography':'cryptography',
+                'aiohttp':'aiohttp','fastapi':'fastapi','uvicorn':'uvicorn',
+                'sqlalchemy':'sqlalchemy','pymongo':'pymongo','redis':'redis','pydantic':'pydantic'
             }
             imports = re.findall(r'(?:from\s+(\w+)|import\s+(\w+))', content)
             for imp in imports:
                 mod = imp[0] or imp[1]
                 if mod in pkg_map and pkg_map[mod] and pkg_map[mod] not in installed and pkg_map[mod] not in new:
                     try:
-                        res = subprocess.run([sys.executable, '-m', 'pip', 'install', '--quiet', pkg_map[mod]],
-                                             capture_output=True, text=True, timeout=30)
+                        res = subprocess.run([sys.executable,'-m','pip','install','--quiet',pkg_map[mod]],
+                                             capture_output=True,text=True,timeout=30)
                         if res.returncode == 0: msgs.append(f"✅ {pkg_map[mod]}"); new.add(pkg_map[mod])
                         else: msgs.append(f"❌ {pkg_map[mod]}")
                     except: msgs.append(f"⚠️ {pkg_map[mod]}")
         elif ext == '.js':
             pjson = os.path.join(folder, 'package.json')
             if not os.path.exists(pjson):
-                with open(pjson, 'w') as f: json.dump({"name": "script", "version": "1.0.0"}, f)
-            with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
-            node_map = {'express': 'express', 'axios': 'axios', 'lodash': 'lodash',
-                        'moment': 'moment', 'dotenv': 'dotenv', 'ws': 'ws',
-                        'mongoose': 'mongoose', 'mysql': 'mysql', 'pg': 'pg'}
-            requires = re.findall(r"require\(['\"]([^'\"]+)['\"]\)", content)
+                with open(pjson,'w') as f: json.dump({"name":"script","version":"1.0.0"},f)
+            with open(file_path,'r',encoding='utf-8') as f: content = f.read()
+            node_map = {'express':'express','axios':'axios','lodash':'lodash',
+                        'moment':'moment','dotenv':'dotenv','ws':'ws',
+                        'mongoose':'mongoose','mysql':'mysql','pg':'pg'}
+            requires = re.findall(r"require\(['\"]([^'\"]+)['\"]\)",content)
             for mod in requires:
                 base = mod.split('/')[0]
                 if base in node_map and node_map[base] not in installed and node_map[base] not in new:
                     try:
-                        res = subprocess.run(['npm', 'install', '--silent', node_map[base]],
-                                             cwd=folder, capture_output=True, text=True, timeout=30)
+                        res = subprocess.run(['npm','install','--silent',node_map[base]],
+                                             cwd=folder,capture_output=True,text=True,timeout=30)
                         if res.returncode == 0: msgs.append(f"✅ {node_map[base]}"); new.add(node_map[base])
                         else: msgs.append(f"❌ {node_map[base]}")
                     except: msgs.append(f"⚠️ {node_map[base]}")
     except: pass
     return msgs, new
 
+# ==================== ZIP WEBSITE HANDLER ====================
+def handle_zip_website(zip_path, uid, zip_name, msg=None):
+    """Extract ZIP as static website, serve at /s/<slug>/"""
+    # Determine slug
+    existing_slug = site_slugs.get(uid, {}).get(zip_name)
+    if existing_slug:
+        slug = existing_slug
+    else:
+        # Auto-generate slug from filename
+        base = os.path.splitext(zip_name)[0]
+        slug = re.sub(r'[^a-z0-9\-]', '-', base.lower()).strip('-') or hashlib.md5(f"{uid}_{zip_name}".encode()).hexdigest()[:8]
+        # Ensure uniqueness
+        orig = slug; counter = 1
+        while slug_exists(slug, uid, zip_name):
+            slug = f"{orig}-{counter}"; counter += 1
+        save_slug(uid, zip_name, slug)
+
+    site_dir = os.path.join(SITES_DIR, slug)
+    if os.path.exists(site_dir): shutil.rmtree(site_dir)
+    os.makedirs(site_dir)
+
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        zf.extractall(site_dir)
+
+    # Flatten one level if everything is inside a subdirectory
+    entries = os.listdir(site_dir)
+    if len(entries) == 1 and os.path.isdir(os.path.join(site_dir, entries[0])):
+        sub = os.path.join(site_dir, entries[0])
+        for item in os.listdir(sub):
+            shutil.move(os.path.join(sub, item), site_dir)
+        os.rmdir(sub)
+
+    url = get_site_url(slug)
+    if msg:
+        mk = types.InlineKeyboardMarkup()
+        if url:
+            mk.add(types.InlineKeyboardButton("🌐 Open Website", url=url))
+        mk.add(types.InlineKeyboardButton("🔗 Set Custom Slug", callback_data=f"setslug_{uid}_{zip_name}"))
+        safe_edit(msg.chat.id, msg.message_id,
+                 f"🌐 *Website Hosted*\n`{zip_name}`\n\nSlug: `{slug}`\nURL: `{url or 'Set HOST_URL env var'}`",
+                 'Markdown', mk)
+    return True, url or slug
+
 # ==================== ZIP HANDLER ====================
-def handle_zip(zip_path, uid, extract_to, msg=None):
+def handle_zip(zip_path, uid, extract_to, msg=None, zip_name=None):
     try:
         os.makedirs(extract_to, exist_ok=True)
         with zipfile.ZipFile(zip_path, 'r') as zf: zf.extractall(extract_to)
@@ -432,24 +602,28 @@ STATIC_EXTS = {'.html','.css','.txt','.json','.md','.jpg','.jpeg',
                '.png','.gif','.pdf','.sql','.csv','.xml','.yaml','.yml',
                '.toml','.env','.log','.mp3','.mp4'}
 LANG_MAP = {
-    '.py':('Python','🐍'), '.js':('JavaScript','🟨'), '.java':('Java','☕'),
-    '.cpp':('C++','🔧'), '.c':('C','🔧'), '.sh':('Shell','🖥️'),
-    '.rb':('Ruby','💎'), '.go':('Go','🐹'), '.rs':('Rust','🦀'),
-    '.php':('PHP','🐘'), '.lua':('Lua','🌙'), '.ts':('TypeScript','🔷'),
-    '.bat':('Batch','🖥️'), '.ps1':('PowerShell','🔵')
+    '.py':('Python','🐍'),'.js':('JavaScript','🟨'),'.java':('Java','☕'),
+    '.cpp':('C++','🔧'),'.c':('C','🔧'),'.sh':('Shell','🖥️'),
+    '.rb':('Ruby','💎'),'.go':('Go','🐹'),'.rs':('Rust','🦀'),
+    '.php':('PHP','🐘'),'.lua':('Lua','🌙'),'.ts':('TypeScript','🔷'),
+    '.bat':('Batch','🖥️'),'.ps1':('PowerShell','🔵')
 }
 
 # ==================== CRASH MONITOR ====================
 def monitor_script(uid, key, name, process, log_path, msg_chat_id=None, msg_id=None):
-    """Watches background process. DMs user on crash. Updates stuck message."""
     try:
         process.wait()
         rc = process.returncode
         if key not in scripts: return
+
+        # If intentionally stopped or deleted — do nothing
+        if scripts[key].get('stopped_intentionally'):
+            return
+
         scripts[key]['running'] = False
         scripts[key]['code'] = rc
 
-        # Update original launch message if stuck
+        # Update launch message if it was stuck on deps/starting
         if msg_chat_id and msg_id:
             try:
                 mk = build_control_markup(uid, name, 'executable')
@@ -459,26 +633,31 @@ def monitor_script(uid, key, name, process, log_path, msg_chat_id=None, msg_id=N
                     safe_edit(msg_chat_id, msg_id, f"❌ *Crashed* — `{name}`\nExit: `{rc}`", 'Markdown', mk)
             except: pass
 
-        if rc not in (0, -1, None):
+        # Only alert on genuine crashes (not clean exit, not manual stop, not SIGKILL from us)
+        if rc not in (0, -1, -9, None):
             snippet = ""
             if log_path and os.path.exists(log_path):
-                with open(log_path, 'r', errors='ignore') as f:
-                    content = f.read()
-                tb = re.search(r'(Traceback \(most recent call last\).*)', content, re.DOTALL)
+                with open(log_path, 'r', errors='ignore') as f: content = f.read()
+                # Strip noisy HTTP/INFO lines before searching for real errors
+                filtered_lines = [
+                    l for l in content.splitlines()
+                    if not re.match(r'^(INFO|DEBUG|WARNING):(httpx|urllib3|requests|telebot|apscheduler)', l)
+                    and 'HTTP Request:' not in l
+                    and 'HTTP/1.' not in l
+                    and 'getUpdates' not in l
+                ]
+                filtered = "\n".join(filtered_lines)
+                tb = re.search(r'(Traceback \(most recent call last\).*)', filtered, re.DOTALL)
                 if tb:
                     snippet = tb.group(1).strip()
                 else:
-                    lines = content.splitlines()
-                    snippet = "\n".join(lines[-30:]).strip()
-                if len(snippet) > 1800:
-                    snippet = "..." + snippet[-1800:]
+                    tail = filtered_lines[-30:] if len(filtered_lines) > 30 else filtered_lines
+                    snippet = "\n".join(tail).strip()
+                if len(snippet) > 1800: snippet = "..." + snippet[-1800:]
 
-            text = (f"⚠️ *Script Crashed*\n"
-                    f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-                    f"📄 `{name}`\n"
-                    f"❌ Exit code: `{rc}`")
-            if snippet:
-                text += f"\n\n*Traceback:*\n```\n{snippet}\n```"
+            text = (f"⚠️ *Script Crashed*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                    f"📄 `{name}`\n❌ Exit code: `{rc}`")
+            if snippet: text += f"\n\n*Traceback:*\n```\n{snippet}\n```"
             try: safe_send(uid, text, 'Markdown')
             except: pass
     except: pass
@@ -506,13 +685,12 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key):
         if msg:
             url = get_file_url(uid, name)
             mk = types.InlineKeyboardMarkup()
-            if url:
-                mk.add(types.InlineKeyboardButton("🔗 View File", url=url))
+            if url: mk.add(types.InlineKeyboardButton("🔗 View File", url=url))
             safe_edit(msg.chat.id, msg.message_id, f"✅ *Hosted*\n`{name}`", 'Markdown', mk if url else None)
         return True, "Hosted"
 
     if ext == '.zip':
-        return handle_zip(file_path, uid, os.path.join(EXTRACT_DIR, f"{uid}_{int(time.time())}"), msg)
+        return handle_zip(file_path, uid, os.path.join(EXTRACT_DIR, f"{uid}_{int(time.time())}"), msg, name)
 
     if ext not in LANG_MAP:
         if msg: safe_edit(msg.chat.id, msg.message_id, f"❌ Unsupported type: `{ext}`", 'Markdown')
@@ -532,7 +710,6 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key):
             dep_text = "\n".join(deps[:4]) + (f"\n+{len(deps)-4} more" if len(deps) > 4 else "")
             safe_edit(msg.chat.id, msg.message_id, f"{icon} *{lang}* — `{name}`\n📦 Deps:\n{dep_text}", 'Markdown')
 
-        # Build command
         if ext == '.py': cmd = [sys.executable, file_path]
         elif ext == '.js': cmd = ['node', file_path]
         elif ext == '.java':
@@ -542,8 +719,8 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key):
                 if msg: safe_edit(msg.chat.id, msg.message_id, f"❌ *Java compile failed*\n```\n{res.stderr[:400]}\n```", 'Markdown')
                 return False, "Java compile failed"
             cmd = ['java', '-cp', os.path.dirname(file_path), classname]
-        elif ext in ('.cpp', '.c'):
-            out = os.path.join(folder, os.path.splitext(name)[0] + '.out')
+        elif ext in ('.cpp','.c'):
+            out = os.path.join(folder, os.path.splitext(name)[0]+'.out')
             comp = 'g++' if ext == '.cpp' else 'gcc'
             res = subprocess.run([comp, file_path, '-o', out], capture_output=True, text=True, timeout=60)
             if res.returncode != 0:
@@ -552,7 +729,7 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key):
             cmd = [out]
         elif ext == '.go': cmd = ['go', 'run', file_path]
         elif ext == '.rs':
-            out = os.path.join(folder, os.path.splitext(name)[0] + '.out')
+            out = os.path.join(folder, os.path.splitext(name)[0]+'.out')
             res = subprocess.run(['rustc', file_path, '-o', out], capture_output=True, text=True, timeout=60)
             if res.returncode != 0:
                 if msg: safe_edit(msg.chat.id, msg.message_id, f"❌ *Rust compile failed*\n```\n{res.stderr[:400]}\n```", 'Markdown')
@@ -575,7 +752,7 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key):
         else: cmd = [file_path]
 
         log_path = os.path.join(LOGS_DIR, f"{uid}_{int(time.time())}.log")
-        env = os.environ.copy()
+        env = get_user_env(uid, name)
         cwd = work_dir or os.path.dirname(file_path)
 
         for attempt in range(1, 11):
@@ -584,7 +761,6 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key):
             try:
                 res = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=cwd, env=env)
 
-                # Auto-install missing module then retry
                 if res.returncode != 0 and "ModuleNotFoundError" in res.stderr:
                     match = re.search(r"No module named '(\w+)'", res.stderr)
                     if match:
@@ -597,55 +773,49 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key):
                         pkg = extra.get(mod, mod)
                         if pkg not in installed:
                             if msg: safe_edit(msg.chat.id, msg.message_id, f"{icon} *{lang}* — `{name}`\n📦 Installing `{pkg}`...", 'Markdown')
-                            subprocess.run([sys.executable, '-m', 'pip', 'install', '--quiet', pkg],
+                            subprocess.run([sys.executable,'-m','pip','install','--quiet',pkg],
                                            capture_output=True, text=True, timeout=60)
                             installed.add(pkg)
                             continue
 
-                # Write log
                 with open(log_path, 'w') as lf:
                     if res.stdout: lf.write(f"STDOUT:\n{res.stdout}\n")
                     if res.stderr: lf.write(f"STDERR:\n{res.stderr}\n")
                     lf.write(f"\nExit: {res.returncode}")
 
-                scripts[key] = {'process': None, 'key': key, 'uid': uid, 'name': name,
-                                'start': datetime.now(), 'log': log_path, 'lang': lang,
-                                'icon': icon, 'running': False, 'code': res.returncode}
+                scripts[key] = {'process':None,'key':key,'uid':uid,'name':name,
+                                'start':datetime.now(),'log':log_path,'lang':lang,
+                                'icon':icon,'running':False,'code':res.returncode}
 
                 if msg:
                     mk = build_control_markup(uid, name, 'executable')
                     if res.returncode == 0:
-                        safe_edit(msg.chat.id, msg.message_id,
-                                 f"✅ *{lang}* — `{name}`\nExit: `0`", 'Markdown', mk)
+                        safe_edit(msg.chat.id, msg.message_id, f"✅ *{lang}* — `{name}`\nExit: `0`", 'Markdown', mk)
                     else:
-                        # Show error snippet inline
                         snippet = extract_error_snippet(res.stderr, res.stdout)
                         error_text = f"❌ *{lang}* — `{name}`\nExit: `{res.returncode}`"
-                        if snippet:
-                            error_text += f"\n\n```\n{snippet}\n```"
+                        if snippet: error_text += f"\n\n```\n{snippet}\n```"
                         safe_edit(msg.chat.id, msg.message_id, error_text, 'Markdown', mk)
                 return True, f"Exit {res.returncode}"
 
             except subprocess.TimeoutExpired:
-                # Script is long-running — launch in background
                 with open(log_path, 'w') as lf:
                     p = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, cwd=cwd, env=env)
 
-                scripts[key] = {'process': p, 'key': key, 'uid': uid, 'name': name,
-                                'start': datetime.now(), 'log': log_path, 'lang': lang,
-                                'icon': icon, 'running': True, 'code': None}
+                scripts[key] = {'process':p,'key':key,'uid':uid,'name':name,
+                                'start':datetime.now(),'log':log_path,'lang':lang,
+                                'icon':icon,'running':True,'code':None}
 
                 msg_chat_id = msg.chat.id if msg else None
-                msg_id = msg.message_id if msg else None
+                msg_id_val = msg.message_id if msg else None
 
                 t = threading.Thread(target=monitor_script,
-                                     args=(uid, key, name, p, log_path, msg_chat_id, msg_id), daemon=True)
+                                     args=(uid, key, name, p, log_path, msg_chat_id, msg_id_val), daemon=True)
                 t.start()
 
                 if msg:
                     mk = build_control_markup(uid, name, 'executable')
-                    safe_edit(msg.chat.id, msg.message_id,
-                             f"🔄 *{lang}* — `{name}`\nPID: `{p.pid}`", 'Markdown', mk)
+                    safe_edit(msg.chat.id, msg.message_id, f"🔄 *{lang}* — `{name}`\nPID: `{p.pid}`", 'Markdown', mk)
                 return True, f"Background PID {p.pid}"
 
         return False, "Max retries exceeded"
@@ -669,41 +839,24 @@ def _run_shell_cmd(message, cmd_text):
     full_cmd = ' && '.join(commands)
     exit_mk = types.InlineKeyboardMarkup()
     exit_mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
-
     status = safe_reply(message, f"`$ {full_cmd}`\n⏳ Starting...", 'Markdown', exit_mk)
 
     try:
-        process = subprocess.Popen(
-            full_cmd, shell=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, cwd=BASE_DIR, bufsize=1
-        )
-
-        # Stream output with periodic edits so it feels live
-        stdout_lines = []
-        stderr_lines = []
+        process = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, cwd=BASE_DIR, bufsize=1)
+        stdout_lines = []; stderr_lines = []
         last_edit = time.time()
-        stdout_done = False
-        stderr_done = False
 
         def read_stderr():
-            for line in process.stderr:
-                stderr_lines.append(line)
-            nonlocal stderr_done
-            stderr_done = True
-
+            for line in process.stderr: stderr_lines.append(line)
         t = threading.Thread(target=read_stderr, daemon=True)
         t.start()
 
         deadline = time.time() + 30
-
         for line in process.stdout:
             stdout_lines.append(line)
             now = time.time()
-            if now > deadline:
-                process.kill()
-                break
-            # Edit every 1.5 seconds to show progress
+            if now > deadline: process.kill(); break
             if now - last_edit >= 1.5:
                 preview = "".join(stdout_lines)[-800:]
                 try:
@@ -712,14 +865,9 @@ def _run_shell_cmd(message, cmd_text):
                     last_edit = now
                 except: pass
 
-        process.wait(timeout=5)
-        t.join(timeout=3)
+        process.wait(timeout=5); t.join(timeout=3)
+        stdout = "".join(stdout_lines); stderr = "".join(stderr_lines); rc = process.returncode
 
-        stdout = "".join(stdout_lines)
-        stderr = "".join(stderr_lines)
-        rc = process.returncode
-
-        # Log it
         try:
             conn = sqlite3.connect(DB_PATH)
             conn.execute('INSERT INTO cmd_log (uid, cmd, time, output) VALUES (?,?,?,?)',
@@ -733,19 +881,13 @@ def _run_shell_cmd(message, cmd_text):
         if not output: output = "✅ No output"
 
         result = f"`$ {full_cmd}`\n\n{output}\n`exit {rc}`"
-
         if len(result) > 4096:
             tmp = os.path.join(LOGS_DIR, f"shell_{int(time.time())}.txt")
-            with open(tmp, 'w') as f:
-                f.write(f"$ {full_cmd}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}\n\nExit: {rc}")
-            with open(tmp, 'rb') as f:
-                bot.send_document(status.chat.id, f, caption=f"`$ {full_cmd}`",
-                                  parse_mode='Markdown', reply_markup=exit_mk)
-            os.remove(tmp)
-            bot.delete_message(status.chat.id, status.message_id)
+            with open(tmp,'w') as f: f.write(f"$ {full_cmd}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}\n\nExit: {rc}")
+            with open(tmp,'rb') as f: bot.send_document(status.chat.id, f, caption=f"`$ {full_cmd}`", parse_mode='Markdown', reply_markup=exit_mk)
+            os.remove(tmp); bot.delete_message(status.chat.id, status.message_id)
         else:
             safe_edit(status.chat.id, status.message_id, result, 'Markdown', exit_mk)
-
     except Exception as e:
         safe_edit(status.chat.id, status.message_id, f"❌ `{e}`", 'Markdown', exit_mk)
 
@@ -770,6 +912,78 @@ def cb_exit_shell(c):
     try: safe_edit(c.message.chat.id, c.message.message_id, "💻 *Shell Closed*", 'Markdown')
     except: pass
     bot.answer_callback_query(c.id, "Shell closed")
+
+# ==================== ENV VAR COMMANDS ====================
+@bot.message_handler(commands=['setenv'])
+def cmd_setenv(message):
+    """Start env var set flow: /setenv filename"""
+    uid = message.from_user.id
+    parts = message.text.strip().split(None, 1)
+    if len(parts) < 2:
+        return safe_reply(message, "❌ Usage: `/setenv <filename>`\nThen follow the prompts", 'Markdown')
+    filename = parts[1].strip()
+    files = [n for n, t in user_files.get(uid, []) if n == filename]
+    if not files:
+        return safe_reply(message, f"❌ File `{filename}` not found in your files", 'Markdown')
+    waiting_env[uid] = {'step': 'key', 'name': filename}
+    safe_reply(message, f"🔑 *Set env var for* `{filename}`\n\nSend the variable *name* (e.g. `BOT_TOKEN`):", 'Markdown')
+
+@bot.message_handler(commands=['listenv'])
+def cmd_listenv(message):
+    """List env vars for a file: /listenv filename"""
+    uid = message.from_user.id
+    parts = message.text.strip().split(None, 1)
+    if len(parts) < 2:
+        return safe_reply(message, "❌ Usage: `/listenv <filename>`", 'Markdown')
+    filename = parts[1].strip()
+    envs = user_envs.get(uid, {}).get(filename, {})
+    if not envs:
+        return safe_reply(message, f"📋 No env vars set for `{filename}`", 'Markdown')
+    text = f"📋 *Env vars for* `{filename}`\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+    for k, v in envs.items():
+        masked = v[:2] + '*' * max(0, len(v) - 4) + v[-2:] if len(v) > 4 else '****'
+        text += f"`{k}` = `{masked}`\n"
+    mk = types.InlineKeyboardMarkup()
+    mk.add(types.InlineKeyboardButton("🗑️ Clear All", callback_data=f"clearenv_{uid}_{filename}"))
+    safe_reply(message, text, 'Markdown', mk)
+
+@bot.message_handler(commands=['delenv'])
+def cmd_delenv(message):
+    """Delete one env var: /delenv filename KEY"""
+    uid = message.from_user.id
+    parts = message.text.strip().split(None, 2)
+    if len(parts) < 3:
+        return safe_reply(message, "❌ Usage: `/delenv <filename> <KEY>`", 'Markdown')
+    filename, key = parts[1].strip(), parts[2].strip()
+    delete_env_var(uid, filename, key)
+    safe_reply(message, f"✅ Deleted `{key}` from `{filename}`", 'Markdown')
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('clearenv_'))
+def cb_clearenv(c):
+    parts = c.data.split('_', 2); uid, filename = int(parts[1]), parts[2]
+    if c.from_user.id != uid and c.from_user.id not in admins:
+        return bot.answer_callback_query(c.id, "Access denied")
+    if uid in user_envs and filename in user_envs[uid]:
+        user_envs[uid][filename] = {}
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute('DELETE FROM user_envs WHERE uid=? AND filename=?', (uid, filename))
+        conn.commit(); conn.close()
+    except: pass
+    safe_edit(c.message.chat.id, c.message.message_id, f"✅ *Cleared all env vars* for `{filename}`", 'Markdown')
+    bot.answer_callback_query(c.id, "Cleared")
+
+# ==================== SLUG COMMANDS ====================
+@bot.callback_query_handler(func=lambda c: c.data.startswith('setslug_'))
+def cb_setslug(c):
+    parts = c.data.split('_', 2); uid, filename = int(parts[1]), parts[2]
+    if c.from_user.id != uid and c.from_user.id not in admins:
+        return bot.answer_callback_query(c.id, "Access denied")
+    waiting_slug[uid] = {'name': filename, 'uid': uid}
+    safe_send(c.message.chat.id,
+             f"🔗 *Set custom slug for* `{filename}`\n\nSend your slug (letters, numbers, hyphens only):\nURL will be: `{HOST_URL or 'https://your-app.com'}/s/<your-slug>/`",
+             'Markdown')
+    bot.answer_callback_query(c.id)
 
 # ==================== BUILD KEYBOARD ====================
 def build_main_keyboard(uid):
@@ -800,25 +1014,15 @@ def cmd_start(message):
     sub_badge = ""
     if uid in subscriptions and subscriptions[uid]['expiry'] > datetime.now():
         diff = subscriptions[uid]['expiry'] - datetime.now()
-        days = diff.days
-        hours = diff.seconds // 3600
-        mins = (diff.seconds % 3600) // 60
-        if days > 0:
-            sub_badge = f"  ⭐ {days}d {hours}h {mins}m"
-        else:
-            sub_badge = f"  ⭐ {hours}h {mins}m"
+        days = diff.days; hours = diff.seconds // 3600; mins = (diff.seconds % 3600) // 60
+        sub_badge = f"  ⭐ {days}d {hours}h {mins}m" if days > 0 else f"  ⭐ {hours}h {mins}m"
 
     role = get_user_tier(uid)
-    lim = get_user_limit(uid)
-    lim_txt = "∞" if lim == float('inf') else str(lim)
+    lim = get_user_limit(uid); lim_txt = "∞" if lim == float('inf') else str(lim)
 
-    welcome = (
-        f"👋 *{name}*{sub_badge}\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"{role}  •  `{get_user_count(uid)}/{lim_txt}` files\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"Send a file to upload and host it"
-    )
+    welcome = (f"👋 *{name}*{sub_badge}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+               f"{role}  •  `{get_user_count(uid)}/{lim_txt}` files\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+               f"Send a file to upload and host it")
     safe_send(message.chat.id, welcome, 'Markdown', build_main_keyboard(uid))
 
 @bot.message_handler(commands=['help'])
@@ -826,13 +1030,15 @@ def cmd_help(message):
     uid = message.from_user.id
     is_admin = uid in admins
     lines = ["📖 *Help*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
-             "`/start` — Home\n`/help` — Help\n`/clone` — Clone this bot"]
+             "`/start` — Home\n`/help` — Help\n`/clone` — Clone this bot",
+             "\n*Env Vars*",
+             "`/setenv <file>` — Set env var for a script\n`/listenv <file>` — List env vars\n`/delenv <file> <KEY>` — Delete one var"]
     if is_admin:
         lines.append("\n*Admin Commands*")
         lines.append("`/addadmin <id>`\n`/removeadmin <id>`")
         lines.append("`/addsub <id> <days>`\n`/removesub <id>`\n`/checksub <id>`")
         lines.append("`/shell [cmd]` — Shell\n`/broadcast <msg>` — Broadcast")
-    lines.append("\n*Features*\n30+ file types • Auto deps • Background hosting • Live logs • Crash alerts")
+    lines.append("\n*Features*\n30+ file types • Auto deps • Background hosting • Live logs • Crash alerts • ZIP websites • Custom slugs")
     safe_reply(message, "\n".join(lines), 'Markdown')
 
 # ==================== ADMIN MANAGEMENT ====================
@@ -848,9 +1054,7 @@ def cmd_addadmin(message):
         conn.execute('INSERT OR IGNORE INTO admins VALUES (?)', (target,))
         conn.commit(); conn.close()
         safe_reply(message, f"✅ *Admin added:* `{target}`", 'Markdown')
-        try:
-            bot.send_message(target,
-                "👑 *You are now an admin*\n\nSend /start to refresh your menu", 'Markdown')
+        try: bot.send_message(target, "👑 *You are now an admin*\n\nSend /start to refresh your menu", 'Markdown')
         except: pass
     except: safe_reply(message, "❌ Usage: `/addadmin <id>`", 'Markdown')
 
@@ -867,9 +1071,7 @@ def cmd_removeadmin(message):
         conn.execute('DELETE FROM admins WHERE uid=?', (target,))
         conn.commit(); conn.close()
         safe_reply(message, f"✅ *Admin removed:* `{target}`", 'Markdown')
-        try:
-            bot.send_message(target,
-                "👤 *You are no longer an admin*\n\nSend /start to refresh your menu", 'Markdown')
+        try: bot.send_message(target, "👤 *You are no longer an admin*\n\nSend /start to refresh your menu", 'Markdown')
         except: pass
     except: safe_reply(message, "❌ Usage: `/removeadmin <id>`", 'Markdown')
 
@@ -915,23 +1117,17 @@ def cmd_checksub(message):
     try:
         target = int(message.text.split()[1])
         if target in subscriptions:
-            exp = subscriptions[target]['expiry']
-            now = datetime.now()
+            exp = subscriptions[target]['expiry']; now = datetime.now()
             if exp > now:
                 diff = exp - now
                 status_str = f"✅ Active — {diff.days}d {diff.seconds//3600}h left"
-            else:
-                status_str = "❌ Expired"
+            else: status_str = "❌ Expired"
             text = f"👤 `{target}`\n{status_str}\nExpires: `{exp.strftime('%Y-%m-%d %H:%M')}`"
-        else:
-            text = f"👤 `{target}`\n❌ No subscription"
+        else: text = f"👤 `{target}`\n❌ No subscription"
         mk = types.InlineKeyboardMarkup()
-        # Add + Remove on same row; no separate Days button (Add already shows duration picker)
-        mk.row(
-            types.InlineKeyboardButton("➕ Add", callback_data=f"addsub_{target}"),
-            types.InlineKeyboardButton("➖ Remove", callback_data=f"remsub_{target}"),
-            types.InlineKeyboardButton("🔙 Back", callback_data="del_msg")
-        )
+        mk.row(types.InlineKeyboardButton("➕ Add", callback_data=f"addsub_{target}"),
+               types.InlineKeyboardButton("➖ Remove", callback_data=f"remsub_{target}"),
+               types.InlineKeyboardButton("🔙 Back", callback_data="del_msg"))
         safe_reply(message, text, 'Markdown', mk)
     except: safe_reply(message, "❌ Usage: `/checksub <uid>`", 'Markdown')
 
@@ -984,14 +1180,9 @@ def cb_delmsg(c):
 # ==================== CLONE ====================
 @bot.message_handler(commands=['clone'])
 def cmd_clone(message):
-    text = (
-        "🤖 *Clone This Bot*\n"
-        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        "1\\. Create a bot via @BotFather\n"
-        "2\\. Copy your token\n"
-        "3\\. Send `/settoken YOUR\\_TOKEN`\n\n"
-        "You become the owner with full access\\."
-    )
+    text = ("🤖 *Clone This Bot*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            "1\\. Create a bot via @BotFather\n2\\. Copy your token\n"
+            "3\\. Send `/settoken YOUR\\_TOKEN`\n\nYou become the owner with full access\\.")
     safe_reply(message, text, 'MarkdownV2')
 
 @bot.message_handler(commands=['settoken'])
@@ -1004,15 +1195,11 @@ def cmd_settoken(message):
 
     wait = safe_reply(message, "⏳ *Validating token...*", 'Markdown')
     try:
-        test_bot = telebot.TeleBot(token)
-        info = test_bot.get_me()
+        test_bot = telebot.TeleBot(token); info = test_bot.get_me()
     except Exception as e:
-        safe_edit(wait.chat.id, wait.message_id,
-                 f"❌ *Invalid token*\n`{str(e)[:100]}`", 'Markdown')
-        return
+        safe_edit(wait.chat.id, wait.message_id, f"❌ *Invalid token*\n`{str(e)[:100]}`", 'Markdown'); return
 
-    safe_edit(wait.chat.id, wait.message_id,
-             f"✅ *Token valid* — @{info.username}\n⏳ Creating clone...", 'Markdown')
+    safe_edit(wait.chat.id, wait.message_id, f"✅ *Token valid* — @{info.username}\n⏳ Creating clone...", 'Markdown')
     try:
         clone_dir = os.path.join(BASE_DIR, f'clone_{uid}')
         os.makedirs(clone_dir, exist_ok=True)
@@ -1030,7 +1217,8 @@ def cmd_settoken(message):
             'process': proc, 'key': f"clone_{uid}", 'uid': uid,
             'name': f'{info.username}_clone', 'start': datetime.now(),
             'lang': 'Clone', 'icon': '🤖', 'running': True, 'code': None,
-            'bot': info.username, 'bot_id': info.id, 'dir': clone_dir
+            'bot': info.username, 'bot_id': info.id, 'dir': clone_dir,
+            'stats': {'users': 0, 'files': 0, 'runs': 0}
         }
         safe_edit(wait.chat.id, wait.message_id,
                  f"✅ *Clone Running*\n@{info.username}\nYou are the owner", 'Markdown')
@@ -1039,8 +1227,7 @@ def cmd_settoken(message):
 
 @bot.message_handler(commands=['rmclone'])
 def cmd_rmclone(message):
-    uid = message.from_user.id
-    key = f"clone_{uid}"
+    uid = message.from_user.id; key = f"clone_{uid}"
     if key not in scripts: return safe_reply(message, "❌ *No clone found*", 'Markdown')
     info = scripts[key]
     mk = types.InlineKeyboardMarkup()
@@ -1065,7 +1252,56 @@ def cb_rmclone(c):
     safe_edit(c.message.chat.id, c.message.message_id, "✅ *Clone removed*", 'Markdown')
     bot.answer_callback_query(c.id, "Removed")
 
-# ==================== BROADCAST — OWNER ONLY ====================
+# Clone remote control callbacks (owner only)
+@bot.callback_query_handler(func=lambda c: c.data.startswith('clone_stop_'))
+def cb_clone_stop(c):
+    if c.from_user.id != OWNER_ID: return bot.answer_callback_query(c.id, "Owner only")
+    uid = int(c.data.split('_')[2]); key = f"clone_{uid}"
+    if key not in scripts: return bot.answer_callback_query(c.id, "Not found")
+    info = scripts[key]
+    if info.get('process'):
+        try: kill_process_tree(info['process'].pid)
+        except: pass
+    scripts[key]['running'] = False
+    bot.answer_callback_query(c.id, "Stopped")
+    safe_edit(c.message.chat.id, c.message.message_id,
+             f"⏹ *Clone stopped*\n@{info.get('bot','?')}", 'Markdown',
+             _clone_remote_markup(uid, info))
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('clone_restart_'))
+def cb_clone_restart(c):
+    if c.from_user.id != OWNER_ID: return bot.answer_callback_query(c.id, "Owner only")
+    uid = int(c.data.split('_')[2]); key = f"clone_{uid}"
+    if key not in scripts: return bot.answer_callback_query(c.id, "Not found")
+    info = scripts[key]
+    if info.get('process'):
+        try: kill_process_tree(info['process'].pid)
+        except: pass
+    clone_file = os.path.join(info.get('dir',''), 'bot.py')
+    if not os.path.exists(clone_file):
+        return bot.answer_callback_query(c.id, "Clone file missing")
+    proc = subprocess.Popen([sys.executable, clone_file], cwd=info.get('dir'),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    scripts[key]['process'] = proc
+    scripts[key]['running'] = True
+    scripts[key]['start'] = datetime.now()
+    bot.answer_callback_query(c.id, "Restarted")
+    safe_edit(c.message.chat.id, c.message.message_id,
+             f"🔄 *Clone restarted*\n@{info.get('bot','?')}\nPID: `{proc.pid}`", 'Markdown',
+             _clone_remote_markup(uid, scripts[key]))
+
+def _clone_remote_markup(uid, info):
+    mk = types.InlineKeyboardMarkup()
+    alive = info.get('process') and info['process'].poll() is None
+    if alive:
+        mk.row(types.InlineKeyboardButton("⏹ Stop", callback_data=f"clone_stop_{uid}"),
+               types.InlineKeyboardButton("🔄 Restart", callback_data=f"clone_restart_{uid}"))
+    else:
+        mk.add(types.InlineKeyboardButton("🔄 Restart", callback_data=f"clone_restart_{uid}"))
+    mk.add(types.InlineKeyboardButton("🗑️ Remove", callback_data=f"rmclone_{uid}"))
+    return mk
+
+# ==================== BROADCAST ====================
 @bot.message_handler(commands=['broadcast'])
 def cmd_broadcast(message):
     if message.from_user.id != OWNER_ID:
@@ -1073,15 +1309,9 @@ def cmd_broadcast(message):
     try: text = message.text.split(' ', 1)[1].strip()
     except: return safe_reply(message, "❌ Usage: `/broadcast <message>`", 'Markdown')
     if not text: return
-
     uid = message.from_user.id
-    preview = (
-        f"📢 *Broadcast Preview*\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"{text}\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"Recipients: *{len(active_users)}* users\n\nSend this?"
-    )
+    preview = (f"📢 *Broadcast Preview*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n{text}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+               f"Recipients: *{len(active_users)}* users\n\nSend this?")
     mk = types.InlineKeyboardMarkup()
     mk.row(types.InlineKeyboardButton("✅ Send", callback_data=f"bc_confirm_{uid}"),
            types.InlineKeyboardButton("❌ Cancel", callback_data="del_msg"))
@@ -1094,17 +1324,13 @@ def cb_broadcast_confirm(c):
     uid = int(c.data.split('_')[2])
     if c.from_user.id != uid: return bot.answer_callback_query(c.id, "Not yours")
     if uid not in broadcast_pending: return bot.answer_callback_query(c.id, "Expired")
-
-    data = broadcast_pending.pop(uid)
-    text = data['text']
+    data = broadcast_pending.pop(uid); text = data['text']
     bot.answer_callback_query(c.id, "Sending...")
     safe_edit(c.message.chat.id, c.message.message_id,
              f"📢 Broadcasting to {len(active_users)} users...", 'Markdown')
     sent = failed = 0
     for target_uid in active_users:
-        try:
-            bot.send_message(target_uid, f"📢 *Broadcast*\n\n{text}", 'Markdown')
-            sent += 1; time.sleep(0.05)
+        try: bot.send_message(target_uid, f"📢 *Broadcast*\n\n{text}", 'Markdown'); sent += 1; time.sleep(0.05)
         except: failed += 1
     safe_edit(c.message.chat.id, c.message.message_id,
              f"📢 *Done*\n✅ {sent} sent  •  ❌ {failed} failed", 'Markdown')
@@ -1135,18 +1361,13 @@ def handle_upload(message):
         with open(temp, 'wb') as f: f.write(data)
 
         old_path = os.path.join(folder, name)
-        if os.path.exists(old_path):
-            stop_script(uid, name); os.remove(old_path)
+        if os.path.exists(old_path): stop_script(uid, name); os.remove(old_path)
 
         # Security scan
-        if uid == OWNER_ID:
-            safe_file, scan = True, "Owner"
-        elif uid in admins:
-            safe_file, scan = True, "Admin"
-        elif ext == '.zip':
-            safe_file, scan = scan_zip_contents(temp)
-        else:
-            safe_file, scan = check_malicious(temp)
+        if uid == OWNER_ID: safe_file, scan = True, "Owner"
+        elif uid in admins: safe_file, scan = True, "Admin"
+        elif ext == '.zip': safe_file, scan = scan_zip_contents(temp)
+        else: safe_file, scan = check_malicious(temp)
 
         if not safe_file:
             fhash = hashlib.md5(f"{uid}_{name}_{time.time()}".encode()).hexdigest()
@@ -1157,13 +1378,11 @@ def handle_upload(message):
             conn.execute('INSERT INTO pending VALUES (?,?,?,?,?)',
                          (fhash, uid, name, pending_path, datetime.now().isoformat()))
             conn.commit(); conn.close()
-
             block_mk = types.InlineKeyboardMarkup()
             block_mk.add(types.InlineKeyboardButton("💳 Buy Premium to bypass", url=OWNER_TG))
             safe_edit(status.chat.id, status.message_id,
                      f"🚫 *Blocked*\n`{name}`\n⚠️ {scan}\n\nSent to owner for review\n\n_Premium users bypass security checks_",
                      'Markdown', block_mk)
-
             mk = types.InlineKeyboardMarkup()
             mk.row(types.InlineKeyboardButton("✅ Approve", callback_data=f"app_{fhash}"),
                    types.InlineKeyboardButton("❌ Reject", callback_data=f"rej_{fhash}"))
@@ -1174,18 +1393,31 @@ def handle_upload(message):
             user_info_str = "\n".join(user_info_parts)
             try:
                 with open(pending_path, 'rb') as f:
-                    bot.send_document(OWNER_ID, f,
-                                      caption=f"🚨 *Pending Approval*\n📄 `{name}`\n{user_info_str}\n⚠️ {scan}",
+                    bot.send_document(OWNER_ID, f, caption=f"🚨 *Pending Approval*\n📄 `{name}`\n{user_info_str}\n⚠️ {scan}",
                                       parse_mode='Markdown', reply_markup=mk)
             except Exception as fwd_err:
                 logger.error(f"Forward pending failed: {fwd_err}")
-                bot.send_message(OWNER_ID,
-                                 f"🚨 *Pending Approval*\n📄 `{name}`\n{user_info_str}\n⚠️ {scan}\n🆔 `{fhash}`",
+                bot.send_message(OWNER_ID, f"🚨 *Pending Approval*\n📄 `{name}`\n{user_info_str}\n⚠️ {scan}\n🆔 `{fhash}`",
                                  parse_mode='Markdown', reply_markup=mk)
             return
 
         final = os.path.join(folder, name)
         shutil.move(temp, final)
+
+        # Check if it's a website ZIP
+        if ext == '.zip' and is_website_zip(final):
+            ftype = 'site'
+            user_files.setdefault(uid, [])
+            user_files[uid] = [(n, t) for n, t in user_files[uid] if n != name]
+            user_files[uid].append((name, ftype))
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute('INSERT OR REPLACE INTO files VALUES (?,?,?)', (uid, name, ftype))
+            conn.commit(); conn.close()
+            if uid != OWNER_ID: _forward_file_to_owner(message, final, name, 'site')
+            safe_edit(status.chat.id, status.message_id, f"🌐 *Extracting website...*\n`{name}`", 'Markdown')
+            handle_zip_website(final, uid, name, status)
+            return
+
         ftype = 'executable' if (ext in EXECUTABLE_EXTS or ext == '.zip') else 'hosted'
         user_files.setdefault(uid, [])
         user_files[uid] = [(n, t) for n, t in user_files[uid] if n != name]
@@ -1194,18 +1426,7 @@ def handle_upload(message):
         conn.execute('INSERT OR REPLACE INTO files VALUES (?,?,?)', (uid, name, ftype))
         conn.commit(); conn.close()
 
-        # Forward to owner
-        if uid != OWNER_ID:
-            user_info_parts = [f"User: `{uid}`"]
-            if message.from_user.username: user_info_parts.append(f"@{message.from_user.username}")
-            full_name = (message.from_user.first_name or "") + (" " + message.from_user.last_name if message.from_user.last_name else "")
-            if full_name.strip(): user_info_parts.append(f"Name: {full_name.strip()}")
-            try:
-                with open(final, 'rb') as f:
-                    bot.send_document(OWNER_ID, f,
-                                      caption=f"📨 *New Upload*\n📄 `{name}`\n{chr(10).join(user_info_parts)}\nType: `{ftype}`",
-                                      parse_mode='Markdown')
-            except Exception as fwd_err: logger.error(f"Forward failed: {fwd_err}")
+        if uid != OWNER_ID: _forward_file_to_owner(message, final, name, ftype)
 
         if ftype == 'executable':
             safe_edit(status.chat.id, status.message_id, f"🚀 *Launching*\n`{name}`", 'Markdown')
@@ -1213,15 +1434,26 @@ def handle_upload(message):
         else:
             url = get_file_url(uid, name)
             mk = types.InlineKeyboardMarkup()
-            if url:
-                mk.add(types.InlineKeyboardButton("🔗 View File", url=url))
-            safe_edit(status.chat.id, status.message_id, f"✅ *Hosted*\n`{name}`",
-                     'Markdown', mk if url else None)
+            if url: mk.add(types.InlineKeyboardButton("🔗 View File", url=url))
+            safe_edit(status.chat.id, status.message_id, f"✅ *Hosted*\n`{name}`", 'Markdown', mk if url else None)
 
     except Exception as e:
         logger.error(f"Upload error: {e}", exc_info=True)
         try: safe_edit(status.chat.id, status.message_id, f"❌ *Upload failed*\n`{str(e)[:200]}`", 'Markdown')
         except: pass
+
+def _forward_file_to_owner(message, path, name, ftype):
+    uid = message.from_user.id
+    user_info_parts = [f"User: `{uid}`"]
+    if message.from_user.username: user_info_parts.append(f"@{message.from_user.username}")
+    full_name = (message.from_user.first_name or "") + (" " + message.from_user.last_name if message.from_user.last_name else "")
+    if full_name.strip(): user_info_parts.append(f"Name: {full_name.strip()}")
+    try:
+        with open(path, 'rb') as f:
+            bot.send_document(OWNER_ID, f,
+                              caption=f"📨 *New Upload*\n📄 `{name}`\n{chr(10).join(user_info_parts)}\nType: `{ftype}`",
+                              parse_mode='Markdown')
+    except Exception as e: logger.error(f"Forward failed: {e}")
 
 # ==================== APPROVAL CALLBACKS ====================
 @bot.callback_query_handler(func=lambda c: c.data.startswith('app_'))
@@ -1248,8 +1480,6 @@ def cb_approve(c):
     conn.execute('DELETE FROM pending WHERE hash=?', (fhash,))
     conn.commit(); conn.close()
     del pending[fhash]
-
-    # Notify user with Run Now button if executable
     try:
         if ftype == 'executable':
             run_mk = types.InlineKeyboardMarkup()
@@ -1258,7 +1488,6 @@ def cb_approve(c):
         else:
             bot.send_message(uid, f"✅ *File Approved*\n`{name}`", 'Markdown')
     except: pass
-
     try:
         bot.edit_message_caption(caption=f"✅ *Approved*\n`{name}` — uid `{uid}`",
                                  chat_id=c.message.chat.id, message_id=c.message.message_id,
@@ -1305,10 +1534,14 @@ def build_control_markup(uid, name, ftype):
         else:
             mk.add(types.InlineKeyboardButton("▶️ Start", callback_data=f"start_{uid}_{name}"),
                    types.InlineKeyboardButton("📜 Logs", callback_data=f"logs_{uid}_{name}"))
+    elif ftype == 'site':
+        slug = site_slugs.get(uid, {}).get(name)
+        url = get_site_url(slug) if slug else None
+        if url: mk.add(types.InlineKeyboardButton("🌐 Open Website", url=url))
+        mk.add(types.InlineKeyboardButton("🔗 Set Slug", callback_data=f"setslug_{uid}_{name}"))
     else:
         url = get_file_url(uid, name)
-        if url:
-            mk.add(types.InlineKeyboardButton("🔗 View File", url=url))
+        if url: mk.add(types.InlineKeyboardButton("🔗 View File", url=url))
     mk.add(types.InlineKeyboardButton("🗑️ Delete", callback_data=f"del_{uid}_{name}"),
            types.InlineKeyboardButton("🔙 Back", callback_data=f"back_{uid}"))
     return mk
@@ -1324,9 +1557,7 @@ def cb_file(c):
     path = os.path.join(get_user_folder(uid), name)
     size = fmt_size(os.path.getsize(path)) if os.path.exists(path) else "?"
     if ftype == 'executable':
-        running = is_running(uid, name)
-        status_txt = "🟢 Running" if running else "⭕ Stopped"
-        uptime_txt = ""
+        running = is_running(uid, name); status_txt = "🟢 Running" if running else "⭕ Stopped"; uptime_txt = ""
         key = f"{uid}_{name}"
         if running and key in scripts:
             secs = int((datetime.now() - scripts[key]['start']).total_seconds())
@@ -1335,9 +1566,15 @@ def cb_file(c):
             if scripts[key].get('process'):
                 cpu, mem = get_process_stats(scripts[key]['process'].pid)
                 uptime_txt += f"\nCPU: `{cpu}`  •  RAM: `{mem}`"
+    elif ftype == 'site':
+        slug = site_slugs.get(uid, {}).get(name, '?')
+        status_txt = f"🌐 Website  •  slug: `{slug}`"; uptime_txt = ""
     else:
         status_txt = "📁 Hosted"; uptime_txt = ""
-    text = f"📄 `{name}`\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nSize: `{size}`  •  {status_txt}{uptime_txt}"
+    # Show env vars count if any
+    env_count = len(user_envs.get(uid, {}).get(name, {}))
+    env_line = f"\nEnv vars: `{env_count}`" if env_count else ""
+    text = f"📄 `{name}`\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nSize: `{size}`  •  {status_txt}{uptime_txt}{env_line}"
     safe_edit(c.message.chat.id, c.message.message_id, text, 'Markdown', build_control_markup(uid, name, ftype))
     bot.answer_callback_query(c.id)
 
@@ -1350,8 +1587,7 @@ def cb_start(c):
     if not os.path.exists(path): return bot.answer_callback_query(c.id, "❌ File missing")
     if is_running(uid, name): return bot.answer_callback_query(c.id, "⚠️ Already running")
     bot.answer_callback_query(c.id, "Starting...")
-    try:
-        safe_edit(c.message.chat.id, c.message.message_id, f"▶️ *Starting* `{name}`...", 'Markdown')
+    try: safe_edit(c.message.chat.id, c.message.message_id, f"▶️ *Starting* `{name}`...", 'Markdown')
     except: pass
     execute_script(uid, path, c.message)
 
@@ -1400,8 +1636,7 @@ def cb_logs(c):
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('refresh_'))
 def cb_refresh(c):
-    parts = c.data.split('_', 2); uid, name = int(parts[1]), parts[2]
-    key = f"{uid}_{name}"
+    parts = c.data.split('_', 2); uid, name = int(parts[1]), parts[2]; key = f"{uid}_{name}"
     if key not in scripts: return bot.answer_callback_query(c.id, "📭 No logs")
     log_path = scripts[key].get('log')
     if not log_path or not os.path.exists(log_path): return bot.answer_callback_query(c.id, "📭 Log missing")
@@ -1421,48 +1656,71 @@ def cb_delete(c):
     parts = c.data.split('_', 2); uid, name = int(parts[1]), parts[2]
     if c.from_user.id != uid and c.from_user.id not in admins:
         return bot.answer_callback_query(c.id, "❌ Access denied")
+
+    key = f"{uid}_{name}"
+
+    # Flag as intentional BEFORE stopping so monitor thread stays silent
+    if key in scripts:
+        scripts[key]['stopped_intentionally'] = True
     stop_script(uid, name)
+
+    # Delete the actual file
     path = os.path.join(get_user_folder(uid), name)
-    if os.path.exists(path): os.remove(path)
+    if os.path.exists(path):
+        try: os.remove(path)
+        except: pass
+
+    # Remove website folder if it was a site
+    slug = site_slugs.get(uid, {}).get(name)
+    if slug:
+        site_dir = os.path.join(SITES_DIR, slug)
+        if os.path.exists(site_dir): shutil.rmtree(site_dir, ignore_errors=True)
+        site_slugs.get(uid, {}).pop(name, None)
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute('DELETE FROM site_slugs WHERE uid=? AND filename=?', (uid, name))
+            conn.commit(); conn.close()
+        except: pass
+
     if uid in user_files: user_files[uid] = [(n, t) for n, t in user_files[uid] if n != name]
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute('DELETE FROM files WHERE uid=? AND name=?', (uid, name))
         conn.commit(); conn.close()
     except: pass
-    key = f"{uid}_{name}"
+
+    # Clean up scripts entry and log file
     if key in scripts:
         lp = scripts[key].get('log')
         if lp and os.path.exists(lp):
             try: os.remove(lp)
             except: pass
         del scripts[key]
+
     bot.answer_callback_query(c.id, "✅ Deleted")
     files = user_files.get(uid, [])
     if not files:
-        safe_edit(c.message.chat.id, c.message.message_id, "📂 *No files*\nSend a file to upload it", 'Markdown')
-        return
+        safe_edit(c.message.chat.id, c.message.message_id, "📂 *No files*\nSend a file to upload it", 'Markdown'); return
     text = f"📂 *Files* ({len(files)})\n"
     mk = types.InlineKeyboardMarkup(row_width=1)
     for n, t in files:
-        dot = "🟢" if t == 'executable' and is_running(uid, n) else "⚪"
-        icon = "🚀" if t == 'executable' else "📄"
+        dot = "🟢" if t == 'executable' and is_running(uid, n) else ("🌐" if t == 'site' else "⚪")
+        icon = "🚀" if t == 'executable' else ("🌐" if t == 'site' else "📄")
         dn = n if len(n) < 30 else n[:27] + "..."
         mk.add(types.InlineKeyboardButton(f"{dot} {icon} {dn}", callback_data=f"file_{uid}_{n}"))
     safe_edit(c.message.chat.id, c.message.message_id, text, 'Markdown', mk)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('back_'))
 def cb_back(c):
-    uid = int(c.data.split('_')[1])
-    files = user_files.get(uid, [])
+    uid = int(c.data.split('_')[1]); files = user_files.get(uid, [])
     if not files:
         safe_edit(c.message.chat.id, c.message.message_id, "📂 *No files*", 'Markdown')
         return bot.answer_callback_query(c.id)
     text = f"📂 *Files* ({len(files)})\n"
     mk = types.InlineKeyboardMarkup(row_width=1)
     for n, t in files:
-        dot = "🟢" if t == 'executable' and is_running(uid, n) else "⚪"
-        icon = "🚀" if t == 'executable' else "📄"
+        dot = "🟢" if t == 'executable' and is_running(uid, n) else ("🌐" if t == 'site' else "⚪")
+        icon = "🚀" if t == 'executable' else ("🌐" if t == 'site' else "📄")
         dn = n if len(n) < 30 else n[:27] + "..."
         mk.add(types.InlineKeyboardButton(f"{dot} {icon} {dn}", callback_data=f"file_{uid}_{n}"))
     safe_edit(c.message.chat.id, c.message.message_id, text, 'Markdown', mk)
@@ -1474,51 +1732,34 @@ def exit_shell_if_active(uid):
 
 @bot.message_handler(func=lambda m: m.text == "📂 Files")
 def btn_files(m):
-    uid = m.from_user.id
-    exit_shell_if_active(uid)
+    uid = m.from_user.id; exit_shell_if_active(uid)
     files = user_files.get(uid, [])
     if not files: return safe_reply(m, "📂 *No files*\nSend a file to upload it", 'Markdown')
     text = f"📂 *Files* ({len(files)})\n"
     mk = types.InlineKeyboardMarkup(row_width=1)
     for n, t in files:
-        dot = "🟢" if t == 'executable' and is_running(uid, n) else "⚪"
-        icon = "🚀" if t == 'executable' else "📄"
+        dot = "🟢" if t == 'executable' and is_running(uid, n) else ("🌐" if t == 'site' else "⚪")
+        icon = "🚀" if t == 'executable' else ("🌐" if t == 'site' else "📄")
         dn = n if len(n) < 30 else n[:27] + "..."
         mk.add(types.InlineKeyboardButton(f"{dot} {icon} {dn}", callback_data=f"file_{uid}_{n}"))
     safe_reply(m, text, 'Markdown', mk)
 
 @bot.message_handler(func=lambda m: m.text == "👤 Profile")
 def btn_profile(m):
-    uid = m.from_user.id
-    exit_shell_if_active(uid)
-    tier = get_user_tier(uid)
-    lim = get_user_limit(uid)
-    lim_txt = "∞" if lim == float('inf') else str(lim)
-    count = get_user_count(uid)
-    joined = get_user_first_seen(uid)
-
+    uid = m.from_user.id; exit_shell_if_active(uid)
+    tier = get_user_tier(uid); lim = get_user_limit(uid); lim_txt = "∞" if lim == float('inf') else str(lim)
+    count = get_user_count(uid); joined = get_user_first_seen(uid)
     sub_line = ""
     if uid in subscriptions:
         exp = subscriptions[uid]['expiry']
         if exp > datetime.now():
             days = (exp - datetime.now()).days
             sub_line = f"\nSub expires: `{exp.strftime('%Y-%m-%d')}` ({days}d)"
-        else:
-            sub_line = "\nSub: `Expired`"
-    elif uid not in admins:
-        sub_line = "\nSub: `None`"
-
-    running_count = len([s for s in scripts.values()
-                         if s.get('uid') == uid and s.get('running') and not s['key'].startswith('clone_')])
-    text = (
-        f"👤 *Profile*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"ID: `{uid}`\n"
-        f"Tier: {tier}\n"
-        f"Files: `{count}/{lim_txt}`\n"
-        f"Running: `{running_count}`\n"
-        f"Joined: `{joined}`"
-        f"{sub_line}"
-    )
+        else: sub_line = "\nSub: `Expired`"
+    elif uid not in admins: sub_line = "\nSub: `None`"
+    running_count = len([s for s in scripts.values() if s.get('uid') == uid and s.get('running') and not s['key'].startswith('clone_')])
+    text = (f"👤 *Profile*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"ID: `{uid}`\nTier: {tier}\nFiles: `{count}/{lim_txt}`\nRunning: `{running_count}`\nJoined: `{joined}`{sub_line}")
     mk = types.InlineKeyboardMarkup()
     if uid not in admins and uid != OWNER_ID:
         mk.add(types.InlineKeyboardButton("💳 Buy Premium", url=OWNER_TG))
@@ -1526,43 +1767,30 @@ def btn_profile(m):
 
 @bot.message_handler(func=lambda m: m.text == "📊 Stats")
 def btn_stats(m):
-    uid = m.from_user.id
-    exit_shell_if_active(uid)
+    uid = m.from_user.id; exit_shell_if_active(uid)
     running = len([s for s in scripts.values() if s.get('running') and not s['key'].startswith('clone_')])
     lim = get_user_limit(uid); lim_txt = "∞" if lim == float('inf') else str(lim)
     try:
-        cpu = psutil.cpu_percent(interval=0.5)
-        mem = psutil.virtual_memory()
+        cpu = psutil.cpu_percent(interval=0.5); mem = psutil.virtual_memory()
         mem_used = mem.used/(1024**3); mem_total = mem.total/(1024**3)
         sys_line = f"\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nCPU: `{cpu}%`  •  RAM: `{mem_used:.1f}/{mem_total:.1f}GB`"
     except: sys_line = ""
-    text = (
-        f"📊 *Stats*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"👥 Users: `{len(active_users)}`\n"
-        f"📁 Files: `{sum(len(f) for f in user_files.values())}`\n"
-        f"🚀 Running: `{running}`\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"Your files: `{get_user_count(uid)}/{lim_txt}`"
-        f"{sys_line}"
-    )
+    platform_line = f"\nPlatform: `{HOST_URL or 'local'}`" if HOST_URL else ""
+    text = (f"📊 *Stats*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"👥 Users: `{len(active_users)}`\n📁 Files: `{sum(len(f) for f in user_files.values())}`\n"
+            f"🚀 Running: `{running}`\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nYour files: `{get_user_count(uid)}/{lim_txt}`{platform_line}{sys_line}")
     safe_reply(m, text, 'Markdown')
 
 @bot.message_handler(func=lambda m: m.text == "❓ Help")
 def btn_help(m):
-    exit_shell_if_active(m.from_user.id)
-    cmd_help(m)
+    exit_shell_if_active(m.from_user.id); cmd_help(m)
 
 @bot.message_handler(func=lambda m: m.text == "📢 Channel")
 def btn_channel(m):
     exit_shell_if_active(m.from_user.id)
     mk = types.InlineKeyboardMarkup()
     mk.add(types.InlineKeyboardButton("📢 Join @BlacScriptz", url=UPDATE_CHANNEL))
-    text = (
-        "📢 *BlacScriptz*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        "Free source codes, bots, tools and useful scripts — regularly updated\\.\n\n"
-        "Join to stay ahead 🚀"
-    )
-    safe_reply(m, text, 'MarkdownV2', mk)
+    safe_reply(m, "📢 *BlacScriptz*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nFree source codes, bots, tools and useful scripts — regularly updated\\.\n\nJoin to stay ahead 🚀", 'MarkdownV2', mk)
 
 @bot.message_handler(func=lambda m: m.text == "📞 Contact")
 def btn_contact(m):
@@ -1571,12 +1799,7 @@ def btn_contact(m):
     mk.add(types.InlineKeyboardButton("💳 Buy Premium", url=OWNER_TG))
     mk.add(types.InlineKeyboardButton("🐛 Report a Bug", url=OWNER_TG))
     mk.add(types.InlineKeyboardButton("📢 Channel", url=UPDATE_CHANNEL))
-    text = (
-        "📞 *Contact & Support*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        "For premium services, bug reports,\n"
-        "or anything else — reach out via the buttons below"
-    )
-    safe_reply(m, text, 'Markdown', mk)
+    safe_reply(m, "📞 *Contact & Support*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nFor premium services, bug reports,\nor anything else — reach out via the buttons below", 'Markdown', mk)
 
 @bot.message_handler(func=lambda m: m.text == "💳 Subs")
 def btn_subs(m):
@@ -1628,12 +1851,10 @@ def btn_pending(m):
         try:
             if os.path.exists(path):
                 with open(path, 'rb') as f:
-                    bot.send_document(m.chat.id, f,
-                                      caption=f"📄 `{info['name']}`\nUser: `{info['uid']}`",
+                    bot.send_document(m.chat.id, f, caption=f"📄 `{info['name']}`\nUser: `{info['uid']}`",
                                       parse_mode='Markdown', reply_markup=mk)
             else:
-                safe_send(m.chat.id, f"📄 `{info['name']}`\nUser: `{info['uid']}`\n⚠️ File missing",
-                          'Markdown', mk)
+                safe_send(m.chat.id, f"📄 `{info['name']}`\nUser: `{info['uid']}`\n⚠️ File missing", 'Markdown', mk)
         except: pass
 
 @bot.message_handler(func=lambda m: m.text == "🤖 Clones")
@@ -1651,15 +1872,14 @@ def btn_clones(m):
         cpu_str, mem_str = ("?","?")
         if s.get('process') and s['process'].poll() is None:
             cpu_str, mem_str = get_process_stats(s['process'].pid)
-        text = (
-            f"🤖 *Clone*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-            f"{alive} @{s.get('bot','?')}\n"
-            f"Owner: `{s['uid']}`  •  PID: `{pid}`\n"
-            f"Uptime: `{uptime}`\n"
-            f"CPU: `{cpu_str}`  •  RAM: `{mem_str}`"
-        )
-        mk = types.InlineKeyboardMarkup()
-        mk.add(types.InlineKeyboardButton("🗑️ Remove", callback_data=f"rmclone_{s['uid']}"))
+        uid_c = s['uid']
+        stats = s.get('stats', {})
+        text = (f"🤖 *Clone*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                f"{alive} @{s.get('bot','?')}\n"
+                f"Owner: `{uid_c}`  •  PID: `{pid}`\n"
+                f"Uptime: `{uptime}`\n"
+                f"CPU: `{cpu_str}`  •  RAM: `{mem_str}`")
+        mk = _clone_remote_markup(uid_c, s)
         safe_reply(m, text, 'Markdown', mk)
 
 @bot.message_handler(func=lambda m: m.text == "👑 Admin")
@@ -1669,24 +1889,20 @@ def btn_admin(m):
     total_running = len([s for s in scripts.values() if s.get('running') and not s['key'].startswith('clone_')])
     clones = len([s for s in scripts.values() if s['key'].startswith('clone_')])
     try:
-        cpu = psutil.cpu_percent(interval=0.3)
-        mem = psutil.virtual_memory()
+        cpu = psutil.cpu_percent(interval=0.3); mem = psutil.virtual_memory()
         sys_info = f"\nCPU: `{cpu}%`  •  RAM: `{mem.percent}%`"
     except: sys_info = ""
-    text = (
-        f"👑 *Admin Panel*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"Users: `{len(active_users)}`  •  Files: `{sum(len(f) for f in user_files.values())}`\n"
-        f"Running: `{total_running}`  •  Pending: `{len(pending)}`  •  Clones: `{clones}`{sys_info}\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"`/shell`  `/broadcast`\n`/addadmin`  `/removeadmin`\n`/addsub`  `/checksub`"
-    )
+    text = (f"👑 *Admin Panel*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"Users: `{len(active_users)}`  •  Files: `{sum(len(f) for f in user_files.values())}`\n"
+            f"Running: `{total_running}`  •  Pending: `{len(pending)}`  •  Clones: `{clones}`{sys_info}\n"
+            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"`/shell`  `/broadcast`\n`/addadmin`  `/removeadmin`\n`/addsub`  `/checksub`")
     safe_reply(m, text, 'Markdown')
 
 @bot.message_handler(func=lambda m: m.text == "💻 Shell")
 def btn_shell(m):
     if m.from_user.id not in admins: return
-    uid = m.from_user.id
-    shell_sessions[uid] = True
+    uid = m.from_user.id; shell_sessions[uid] = True
     mk = types.InlineKeyboardMarkup()
     mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
     safe_reply(m, "💻 *Shell Active*\nSend commands directly\\. Multiple lines supported\\.", 'MarkdownV2', mk)
@@ -1703,30 +1919,77 @@ def btn_all_files(m):
         clone_tag = f" 🤖 (@{scripts[clone_key]['bot']})" if clone_key in scripts else ""
         text += f"👤 `{uid}`{clone_tag} — {len(files)} file(s)\n"
         for n, t in files:
-            icon = "🚀" if t == 'executable' else "📄"
+            icon = "🚀" if t == 'executable' else ("🌐" if t == 'site' else "📄")
             dot = "🟢 " if t == 'executable' and is_running(uid, n) else ""
             text += f"  {dot}{icon} `{n}`\n"
         text += "\n"
         if len(text) > 3500:
-            safe_reply(m, text, 'Markdown')
-            text = ""
+            safe_reply(m, text, 'Markdown'); text = ""
     if text.strip(): safe_reply(m, text, 'Markdown')
 
 @bot.message_handler(func=lambda m: m.text == "🤖 Clone")
 def btn_clone(m):
-    exit_shell_if_active(m.from_user.id)
-    cmd_clone(m)
+    exit_shell_if_active(m.from_user.id); cmd_clone(m)
 
 # ==================== SHELL SESSION INTERCEPT ====================
 @bot.message_handler(func=lambda m: m.from_user and shell_sessions.get(m.from_user.id) and m.text)
 def shell_session_input(m):
-    uid = m.from_user.id
-    text = m.text.strip()
+    uid = m.from_user.id; text = m.text.strip()
     if not text: return
     if text.lower() in ('exit', 'quit', 'q'):
         shell_sessions.pop(uid, None)
         return safe_reply(m, "💻 *Shell closed*", 'Markdown')
     _run_shell_cmd(m, text)
+
+# ==================== ENV & SLUG CONVERSATION INTERCEPT ====================
+@bot.message_handler(func=lambda m: m.from_user and m.from_user.id in waiting_env and m.text)
+def env_conversation(m):
+    uid = m.from_user.id; state = waiting_env[uid]
+    text = m.text.strip()
+    if state['step'] == 'key':
+        if not re.match(r'^[A-Z_][A-Z0-9_]*$', text.upper()):
+            return safe_reply(m, "❌ Invalid name. Use uppercase letters, numbers, underscores only.\nSend the variable name again:", 'Markdown')
+        waiting_env[uid] = {'step': 'val', 'name': state['name'], 'key': text.upper()}
+        safe_reply(m, f"🔑 Key: `{text.upper()}`\n\nNow send the *value*:", 'Markdown')
+    elif state['step'] == 'val':
+        key = state['key']; filename = state['name']
+        save_env_var(uid, filename, key, text)
+        del waiting_env[uid]
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("➕ Add Another", callback_data=f"addenv_{uid}_{filename}"))
+        safe_reply(m, f"✅ *Env var saved*\n`{key}` = `{'*' * min(len(text), 8)}`\n\nFor `{filename}`", 'Markdown', mk)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('addenv_'))
+def cb_addenv(c):
+    parts = c.data.split('_', 2); uid, filename = int(parts[1]), parts[2]
+    if c.from_user.id != uid: return bot.answer_callback_query(c.id, "Not yours")
+    waiting_env[uid] = {'step': 'key', 'name': filename}
+    safe_send(c.message.chat.id, f"🔑 Send the next variable *name* for `{filename}`:", 'Markdown')
+    bot.answer_callback_query(c.id)
+
+@bot.message_handler(func=lambda m: m.from_user and m.from_user.id in waiting_slug and m.text)
+def slug_conversation(m):
+    uid = m.from_user.id; state = waiting_slug[uid]; filename = state['name']
+    slug = m.text.strip().lower()
+    if not re.match(r'^[a-z0-9][a-z0-9\-]{0,48}[a-z0-9]$', slug):
+        return safe_reply(m, "❌ Invalid slug. Use 2-50 chars: letters, numbers, hyphens. Cannot start/end with hyphen.\nTry again:", 'Markdown')
+    if slug_exists(slug, uid, filename):
+        return safe_reply(m, f"❌ Slug `{slug}` is already taken. Try a different one:", 'Markdown')
+
+    old_slug = site_slugs.get(uid, {}).get(filename)
+    if old_slug and old_slug != slug:
+        old_dir = os.path.join(SITES_DIR, old_slug)
+        new_dir = os.path.join(SITES_DIR, slug)
+        if os.path.exists(old_dir):
+            shutil.move(old_dir, new_dir)
+
+    save_slug(uid, filename, slug)
+    del waiting_slug[uid]
+
+    url = get_site_url(slug)
+    mk = types.InlineKeyboardMarkup()
+    if url: mk.add(types.InlineKeyboardButton("🌐 Open Website", url=url))
+    safe_reply(m, f"✅ *Slug set*\n`{slug}`\nURL: `{url or 'Set HOST_URL first'}`", 'Markdown', mk)
 
 # ==================== FALLBACK ====================
 @bot.message_handler(func=lambda m: True)
@@ -1743,6 +2006,21 @@ def cleanup():
 
 atexit.register(cleanup)
 
+# ==================== AUTO-BROADCAST ON START ====================
+def broadcast_restart():
+    """Notify all users that the bot restarted."""
+    time.sleep(3)  # Give bot time to fully connect
+    sent = 0
+    for uid in list(active_users):
+        try:
+            bot.send_message(uid,
+                "🔄 *Bot Restarted*\n\nThe bot has restarted\\. All previously running scripts have been cleared\\.\nRe\\-upload your files to run them again\\.",
+                parse_mode='MarkdownV2')
+            sent += 1
+            time.sleep(0.05)
+        except: pass
+    logger.info(f"Restart broadcast sent to {sent} users")
+
 # ==================== MAIN ====================
 if __name__ == "__main__":
     init_db()
@@ -1753,11 +2031,18 @@ if __name__ == "__main__":
     print(f"\n{'='*50}")
     print(f"  HostingBot — by Blac (@NottBlac)")
     print(f"  Owner ID : {OWNER_ID}")
+    print(f"  Platform : {HOST_URL or 'local (set HOST_URL env var)'}")
     try: print(f"  Bot      : @{bot.get_me().username}")
     except: pass
     print(f"{'='*50}\n")
 
-    logger.info(f"Bot started — Owner: {OWNER_ID}")
+    logger.info(f"Bot started — Owner: {OWNER_ID} — Platform: {HOST_URL or 'local'}")
+
+    # Auto-broadcast restart to all users
+    if active_users:
+        t = threading.Thread(target=broadcast_restart, daemon=True)
+        t.start()
+
     try: bot.send_chat_action(OWNER_ID, 'typing')
     except: pass
 
