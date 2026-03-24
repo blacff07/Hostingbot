@@ -311,26 +311,48 @@ def kill_process_tree(pid):
 
 def stop_script(uid, name):
     key = f"{uid}_{name}"
-    if key in scripts and scripts[key].get('process'):
-        try:
-            # Flag as intentional BEFORE killing so monitor thread ignores it
-            scripts[key]['stopped_intentionally'] = True
-            scripts[key]['running'] = False
-            kill_process_tree(scripts[key]['process'].pid)
-            return True
-        except: pass
-    return False
+    # For ZIP files, the process may be stored under both the zip key and the entry point key
+    keys_to_stop = [key]
+    # Find any entry that has this as its zip_name
+    for k, info in list(scripts.items()):
+        if info.get('zip_name') == name and info.get('uid') == uid and k != key:
+            keys_to_stop.append(k)
+
+    stopped = False
+    for k in keys_to_stop:
+        if k in scripts and scripts[k].get('process'):
+            try:
+                scripts[k]['stopped_intentionally'] = True
+                scripts[k]['running'] = False
+                kill_process_tree(scripts[k]['process'].pid)
+                try: scripts[k]['process'].wait(timeout=2)
+                except: pass
+                stopped = True
+            except: pass
+    return stopped
 
 def is_running(uid, name):
     key = f"{uid}_{name}"
-    if key not in scripts or not scripts[key].get('process'): return False
-    try:
-        p = psutil.Process(scripts[key]['process'].pid)
-        if p.is_running() and p.status() != psutil.STATUS_ZOMBIE:
-            scripts[key]['running'] = True
-            return True
-    except psutil.NoSuchProcess: pass
-    scripts[key]['running'] = False
+    # Check direct key first
+    def _check_key(k):
+        if k not in scripts or not scripts[k].get('process'): return False
+        if scripts[k].get('stopped_intentionally'): return False
+        try:
+            p = psutil.Process(scripts[k]['process'].pid)
+            if p.is_running() and p.status() != psutil.STATUS_ZOMBIE:
+                scripts[k]['running'] = True
+                return True
+        except psutil.NoSuchProcess: pass
+        scripts[k]['running'] = False
+        return False
+
+    if _check_key(key):
+        return True
+    # For ZIPs: also check any entry whose zip_name matches
+    for k, info in scripts.items():
+        if info.get('zip_name') == name and info.get('uid') == uid:
+            if _check_key(k):
+                return True
     return False
 
 def get_process_stats(pid):
@@ -591,7 +613,18 @@ def handle_zip(zip_path, uid, extract_to, msg=None, zip_name=None):
                     if f.endswith(('.py','.js','.sh')): main_file = os.path.join(root, f); break
                 if main_file: break
         if not main_file: return False, "No executable file found in ZIP"
-        return execute_script(uid, main_file, msg, extract_to)
+        ok, result = execute_script(uid, main_file, msg, extract_to)
+        # After execute_script, tag the scripts entry with zip metadata for tracking
+        if ok and zip_name:
+            entry_name = os.path.basename(main_file)
+            entry_key = f"{uid}_{entry_name}"
+            zip_key = f"{uid}_{zip_name}"
+            if entry_key in scripts:
+                scripts[entry_key]['zip_name'] = zip_name
+                scripts[entry_key]['extract_dir'] = extract_to
+                # Also register under the zip key so is_running(uid, zip_name) works
+                scripts[zip_key] = scripts[entry_key]
+        return ok, result
     except zipfile.BadZipFile: return False, "Invalid ZIP file"
     except Exception as e: return False, f"ZIP error: {e}"
 
@@ -1361,7 +1394,24 @@ def handle_upload(message):
         with open(temp, 'wb') as f: f.write(data)
 
         old_path = os.path.join(folder, name)
-        if os.path.exists(old_path): stop_script(uid, name); os.remove(old_path)
+        if os.path.exists(old_path):
+            # Mark intentional stop so monitor doesn't fire
+            old_key = f"{uid}_{name}"
+            if old_key in scripts:
+                scripts[old_key]['stopped_intentionally'] = True
+            stop_script(uid, name)
+            # Remove old extract dir for ZIPs so new code runs, not cached old files
+            old_zip_extract = scripts.get(old_key, {}).get('extract_dir')
+            if old_zip_extract and os.path.exists(old_zip_extract):
+                shutil.rmtree(old_zip_extract, ignore_errors=True)
+            # Also clear any extract dirs matching this uid+name pattern
+            for d in os.listdir(EXTRACT_DIR):
+                if d.startswith(f"{uid}_"):
+                    shutil.rmtree(os.path.join(EXTRACT_DIR, d), ignore_errors=True)
+            # Remove the old script entry entirely so execute_script starts fresh
+            if old_key in scripts:
+                del scripts[old_key]
+            os.remove(old_path)
 
         # Security scan
         if uid == OWNER_ID: safe_file, scan = True, "Owner"
