@@ -756,9 +756,12 @@ def monitor_script(uid, key, name, process, log_path, msg_chat_id=None, msg_id=N
         # Only alert on genuine crashes (not clean exit, not manual stop, not SIGKILL from us)
         if rc not in (0, -1, -9, None):
             snippet = ""
-            if log_path and os.path.exists(log_path):
-                with open(log_path, 'r', errors='ignore') as f: content = f.read()
-                # Strip noisy HTTP/INFO lines before searching for real errors
+            # Prefer stderr_log (clean stderr only) over merged log
+            stderr_path = scripts[key].get('stderr_log')
+            read_path = stderr_path if stderr_path and os.path.exists(stderr_path) and os.path.getsize(stderr_path) > 0 else log_path
+            if read_path and os.path.exists(read_path):
+                with open(read_path, 'r', errors='ignore') as f: content = f.read()
+                # Strip noisy HTTP/INFO lines
                 filtered_lines = [
                     l for l in content.splitlines()
                     if not re.match(r'^(INFO|DEBUG|WARNING):(httpx|urllib3|requests|telebot|apscheduler)', l)
@@ -962,11 +965,12 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key):
                 return True, f"Exit {res.returncode}"
 
             except subprocess.TimeoutExpired:
-                with open(log_path, 'w') as lf:
-                    p = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, cwd=cwd, env=env)
+                stderr_path = log_path.replace('.log', '.err')
+                with open(log_path, 'w') as lf, open(stderr_path, 'w') as ef:
+                    p = subprocess.Popen(cmd, stdout=lf, stderr=ef, cwd=cwd, env=env)
 
                 scripts[key] = {'process':p,'key':key,'uid':uid,'name':name,
-                                'start':datetime.now(),'log':log_path,'lang':lang,
+                                'start':datetime.now(),'log':log_path,'stderr_log':stderr_path,'lang':lang,
                                 'icon':icon,'running':True,'code':None}
 
                 msg_chat_id = msg.chat.id if msg else None
@@ -1884,11 +1888,15 @@ def cb_delete(c):
         conn.commit(); conn.close()
     except: pass
 
-    # Clean up scripts entry and log file
+    # Clean up scripts entry and log files
     if key in scripts:
         lp = scripts[key].get('log')
+        ep = scripts[key].get('stderr_log')
         if lp and os.path.exists(lp):
             try: os.remove(lp)
+            except: pass
+        if ep and os.path.exists(ep):
+            try: os.remove(ep)
             except: pass
         del scripts[key]
 
