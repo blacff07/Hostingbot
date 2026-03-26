@@ -2,7 +2,7 @@
 """
 HostingBot — by Blac (@NottBlac)
 """
-
+⁰
 import telebot
 from telebot import types
 import subprocess
