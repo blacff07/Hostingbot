@@ -629,17 +629,104 @@ def handle_zip(zip_path, uid, extract_to, msg=None, zip_name=None):
     except Exception as e: return False, f"ZIP error: {e}"
 
 # ==================== FILE TYPE SETS ====================
-EXECUTABLE_EXTS = {'.py','.js','.java','.cpp','.c','.sh','.rb',
-                   '.go','.rs','.php','.lua','.ts','.bat','.ps1'}
-STATIC_EXTS = {'.html','.css','.txt','.json','.md','.jpg','.jpeg',
-               '.png','.gif','.pdf','.sql','.csv','.xml','.yaml','.yml',
-               '.toml','.env','.log','.mp3','.mp4'}
+EXECUTABLE_EXTS = {
+    # Python
+    '.py', '.pyw',
+    # JavaScript / Node
+    '.js', '.mjs', '.cjs',
+    # TypeScript
+    '.ts', '.tsx',
+    # Shell
+    '.sh', '.bash', '.zsh', '.fish',
+    # Java
+    '.java',
+    # C / C++
+    '.c', '.cpp', '.cc', '.cxx',
+    # Go
+    '.go',
+    # Rust
+    '.rs',
+    # Ruby
+    '.rb',
+    # PHP
+    '.php',
+    # Lua
+    '.lua',
+    # Perl
+    '.pl', '.pm',
+    # R
+    '.r', '.R',
+    # Swift
+    '.swift',
+    # Kotlin
+    '.kt',
+    # Scala
+    '.scala',
+    # Elixir
+    '.ex', '.exs',
+    # Haskell
+    '.hs',
+    # Windows
+    '.bat', '.cmd', '.ps1',
+}
+
+STATIC_EXTS = {
+    # Web
+    '.html', '.htm', '.css', '.js', '.mjs',
+    # Text / Docs
+    '.txt', '.md', '.rst', '.rtf',
+    # Data
+    '.json', '.jsonl', '.xml', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf',
+    '.csv', '.tsv', '.sql',
+    # Images
+    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.ico', '.bmp', '.tiff',
+    # Video / Audio
+    '.mp4', '.webm', '.mkv', '.avi', '.mov', '.mp3', '.wav', '.ogg', '.flac', '.aac',
+    # Docs
+    '.pdf',
+    # Archives (static, not executable)
+    '.tar', '.gz', '.bz2',
+    # Code as static (viewed not run)
+    '.env', '.log', '.sh', '.bat',
+    # Font
+    '.ttf', '.woff', '.woff2',
+}
+
 LANG_MAP = {
-    '.py':('Python','🐍'),'.js':('JavaScript','🟨'),'.java':('Java','☕'),
-    '.cpp':('C++','🔧'),'.c':('C','🔧'),'.sh':('Shell','🖥️'),
-    '.rb':('Ruby','💎'),'.go':('Go','🐹'),'.rs':('Rust','🦀'),
-    '.php':('PHP','🐘'),'.lua':('Lua','🌙'),'.ts':('TypeScript','🔷'),
-    '.bat':('Batch','🖥️'),'.ps1':('PowerShell','🔵')
+    '.py':   ('Python',     '🐍'),
+    '.pyw':  ('Python',     '🐍'),
+    '.js':   ('JavaScript', '🟨'),
+    '.mjs':  ('JavaScript', '🟨'),
+    '.cjs':  ('JavaScript', '🟨'),
+    '.ts':   ('TypeScript', '🔷'),
+    '.tsx':  ('TypeScript', '🔷'),
+    '.java': ('Java',       '☕'),
+    '.cpp':  ('C++',        '🔧'),
+    '.cc':   ('C++',        '🔧'),
+    '.cxx':  ('C++',        '🔧'),
+    '.c':    ('C',          '🔧'),
+    '.sh':   ('Shell',      '🖥️'),
+    '.bash': ('Shell',      '🖥️'),
+    '.zsh':  ('Shell',      '🖥️'),
+    '.fish': ('Shell',      '🖥️'),
+    '.rb':   ('Ruby',       '💎'),
+    '.go':   ('Go',         '🐹'),
+    '.rs':   ('Rust',       '🦀'),
+    '.php':  ('PHP',        '🐘'),
+    '.lua':  ('Lua',        '🌙'),
+    '.pl':   ('Perl',       '🐪'),
+    '.pm':   ('Perl',       '🐪'),
+    '.r':    ('R',          '📊'),
+    '.R':    ('R',          '📊'),
+    '.swift':('Swift',      '🍎'),
+    '.kt':   ('Kotlin',     '🟣'),
+    '.scala':('Scala',      '🔴'),
+    '.ex':   ('Elixir',     '💜'),
+    '.exs':  ('Elixir',     '💜'),
+    '.hs':   ('Haskell',    '🔵'),
+    '.bat':  ('Batch',      '🖥️'),
+    '.cmd':  ('Batch',      '🖥️'),
+    '.ps1':  ('PowerShell', '🔵'),
 }
 
 # ==================== CRASH MONITOR ====================
@@ -743,8 +830,10 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key):
             dep_text = "\n".join(deps[:4]) + (f"\n+{len(deps)-4} more" if len(deps) > 4 else "")
             safe_edit(msg.chat.id, msg.message_id, f"{icon} *{lang}* — `{name}`\n📦 Deps:\n{dep_text}", 'Markdown')
 
-        if ext == '.py': cmd = [sys.executable, file_path]
-        elif ext == '.js': cmd = ['node', file_path]
+        if ext in ('.py', '.pyw'):
+            cmd = [sys.executable, file_path]
+        elif ext in ('.js', '.mjs', '.cjs'):
+            cmd = ['node', file_path]
         elif ext == '.java':
             classname = os.path.splitext(name)[0]
             res = subprocess.run(['javac', file_path], capture_output=True, text=True, timeout=60)
@@ -752,15 +841,16 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key):
                 if msg: safe_edit(msg.chat.id, msg.message_id, f"❌ *Java compile failed*\n```\n{res.stderr[:400]}\n```", 'Markdown')
                 return False, "Java compile failed"
             cmd = ['java', '-cp', os.path.dirname(file_path), classname]
-        elif ext in ('.cpp','.c'):
+        elif ext in ('.cpp', '.cc', '.cxx', '.c'):
             out = os.path.join(folder, os.path.splitext(name)[0]+'.out')
-            comp = 'g++' if ext == '.cpp' else 'gcc'
+            comp = 'g++' if ext in ('.cpp','.cc','.cxx') else 'gcc'
             res = subprocess.run([comp, file_path, '-o', out], capture_output=True, text=True, timeout=60)
             if res.returncode != 0:
                 if msg: safe_edit(msg.chat.id, msg.message_id, f"❌ *Compile failed*\n```\n{res.stderr[:400]}\n```", 'Markdown')
                 return False, "Compile failed"
             cmd = [out]
-        elif ext == '.go': cmd = ['go', 'run', file_path]
+        elif ext == '.go':
+            cmd = ['go', 'run', file_path]
         elif ext == '.rs':
             out = os.path.join(folder, os.path.splitext(name)[0]+'.out')
             res = subprocess.run(['rustc', file_path, '-o', out], capture_output=True, text=True, timeout=60)
@@ -768,21 +858,61 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key):
                 if msg: safe_edit(msg.chat.id, msg.message_id, f"❌ *Rust compile failed*\n```\n{res.stderr[:400]}\n```", 'Markdown')
                 return False, "Rust compile failed"
             cmd = [out]
-        elif ext == '.php': cmd = ['php', file_path]
-        elif ext == '.rb': cmd = ['ruby', file_path]
-        elif ext == '.lua': cmd = ['lua', file_path]
-        elif ext == '.sh': os.chmod(file_path, 0o755); cmd = ['bash', file_path]
-        elif ext == '.ts':
-            js = file_path.replace('.ts', '.js')
+        elif ext == '.php':
+            cmd = ['php', file_path]
+        elif ext == '.rb':
+            cmd = ['ruby', file_path]
+        elif ext == '.lua':
+            cmd = ['lua', file_path]
+        elif ext in ('.sh', '.bash', '.zsh', '.fish'):
+            os.chmod(file_path, 0o755)
+            shell = ext.lstrip('.') if ext != '.sh' else 'bash'
+            cmd = [shell, file_path]
+        elif ext in ('.ts', '.tsx'):
+            js = file_path.rsplit('.', 1)[0] + '.js'
             res = subprocess.run(['tsc', file_path, '--outDir', os.path.dirname(file_path)],
                                  capture_output=True, text=True, timeout=60)
             if res.returncode != 0:
                 if msg: safe_edit(msg.chat.id, msg.message_id, f"❌ *TS compile failed*\n```\n{res.stderr[:400]}\n```", 'Markdown')
                 return False, "TS compile failed"
             cmd = ['node', js]
-        elif ext == '.ps1': cmd = ['powershell', '-File', file_path]
-        elif ext == '.bat': cmd = [file_path]
-        else: cmd = [file_path]
+        elif ext == '.ps1':
+            cmd = ['powershell', '-File', file_path]
+        elif ext in ('.bat', '.cmd'):
+            cmd = [file_path]
+        elif ext in ('.pl', '.pm'):
+            cmd = ['perl', file_path]
+        elif ext in ('.r', '.R'):
+            cmd = ['Rscript', file_path]
+        elif ext == '.swift':
+            cmd = ['swift', file_path]
+        elif ext == '.kt':
+            jar = os.path.join(folder, os.path.splitext(name)[0]+'.jar')
+            res = subprocess.run(['kotlinc', file_path, '-include-runtime', '-d', jar],
+                                 capture_output=True, text=True, timeout=120)
+            if res.returncode != 0:
+                if msg: safe_edit(msg.chat.id, msg.message_id, f"❌ *Kotlin compile failed*\n```\n{res.stderr[:400]}\n```", 'Markdown')
+                return False, "Kotlin compile failed"
+            cmd = ['java', '-jar', jar]
+        elif ext == '.scala':
+            res = subprocess.run(['scalac', file_path, '-d', folder],
+                                 capture_output=True, text=True, timeout=120)
+            if res.returncode != 0:
+                if msg: safe_edit(msg.chat.id, msg.message_id, f"❌ *Scala compile failed*\n```\n{res.stderr[:400]}\n```", 'Markdown')
+                return False, "Scala compile failed"
+            cmd = ['scala', '-cp', folder, os.path.splitext(name)[0]]
+        elif ext in ('.ex', '.exs'):
+            cmd = ['elixir', file_path]
+        elif ext == '.hs':
+            out = os.path.join(folder, os.path.splitext(name)[0])
+            res = subprocess.run(['ghc', file_path, '-o', out],
+                                 capture_output=True, text=True, timeout=120)
+            if res.returncode != 0:
+                if msg: safe_edit(msg.chat.id, msg.message_id, f"❌ *Haskell compile failed*\n```\n{res.stderr[:400]}\n```", 'Markdown')
+                return False, "Haskell compile failed"
+            cmd = [out]
+        else:
+            cmd = [file_path]
 
         log_path = os.path.join(LOGS_DIR, f"{uid}_{int(time.time())}.log")
         env = get_user_env(uid, name)
@@ -1388,10 +1518,25 @@ def handle_upload(message):
     status = safe_reply(message, f"📥 *Uploading*\n`{name}`", 'Markdown')
 
     try:
+        # Use file_unique_id in temp name to bust Telegram's server-side file cache
+        unique_id = message.document.file_unique_id
         data = bot.download_file(file_info.file_path)
         folder = get_user_folder(uid)
-        temp = os.path.join(folder, f"temp_{name}")
+        temp = os.path.join(folder, f"temp_{unique_id}_{name}")
         with open(temp, 'wb') as f: f.write(data)
+
+        # Check if this is actually different content from what's already stored
+        old_path = os.path.join(folder, name)
+        if os.path.exists(old_path):
+            old_hash = hashlib.md5(open(old_path, 'rb').read()).hexdigest()
+            new_hash = hashlib.md5(data).hexdigest()
+            if old_hash == new_hash:
+                # Exact same bytes — Telegram served cached file, warn user
+                os.remove(temp)
+                safe_edit(status.chat.id, status.message_id,
+                         f"⚠️ *Same file detected*\n`{name}`\n\nTelegram served a cached copy — no changes found\\.\nIf you updated the file, try renaming it slightly \\(e\\.g\\. `bot2\\.py`\\) and re\\-uploading\\.",
+                         'MarkdownV2')
+                return
 
         old_path = os.path.join(folder, name)
         if os.path.exists(old_path):
