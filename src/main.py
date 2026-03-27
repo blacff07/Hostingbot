@@ -2,7 +2,7 @@
 """
 HostingBot — by Blac (@NottBlac)
 """
-⁰
+
 import telebot
 from telebot import types
 import subprocess
@@ -1813,6 +1813,36 @@ def cb_restart(c):
     safe_edit(c.message.chat.id, c.message.message_id, f"🔄 *Restarting* `{name}`...", 'Markdown')
     execute_script(uid, path, c.message)
 
+def get_script_logs(key, max_chars=3500):
+    """Read and merge stdout log + stderr log for display."""
+    if key not in scripts:
+        return ""
+    info = scripts[key]
+    stdout_path = info.get('log')
+    stderr_path = info.get('stderr_log')
+
+    parts = []
+    if stdout_path and os.path.exists(stdout_path):
+        try:
+            with open(stdout_path, 'r', errors='ignore') as f:
+                out = f.read().strip()
+            if out:
+                parts.append(out)
+        except: pass
+
+    if stderr_path and os.path.exists(stderr_path):
+        try:
+            with open(stderr_path, 'r', errors='ignore') as f:
+                err = f.read().strip()
+            if err:
+                parts.append(err)
+        except: pass
+
+    content = "\n".join(parts).strip() if parts else ""
+    if len(content) > max_chars:
+        content = "…" + content[-max_chars:]
+    return content
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith('logs_'))
 def cb_logs(c):
     parts = c.data.split('_', 2); uid, name = int(parts[1]), parts[2]
@@ -1820,16 +1850,14 @@ def cb_logs(c):
         return bot.answer_callback_query(c.id, "❌ Access denied")
     key = f"{uid}_{name}"
     if key not in scripts: return bot.answer_callback_query(c.id, "📭 No logs")
-    log_path = scripts[key].get('log')
-    if not log_path or not os.path.exists(log_path): return bot.answer_callback_query(c.id, "📭 Log missing")
-    with open(log_path, 'r') as f: content = f.read()
+    content = get_script_logs(key)
     running = scripts[key].get('running', False); code = scripts[key].get('code')
     status_txt = "🟢 Running" if running else (f"⭕ Stopped (exit {code})" if code is not None else "⭕ Stopped")
-    if len(content) > 3500: content = "…" + content[-3500:]
+    display = content if content else "(no output yet)"
     mk = types.InlineKeyboardMarkup()
     mk.add(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{uid}_{name}"))
     bot.send_message(c.message.chat.id,
-                     f"📜 *Logs:* `{name}`\n{status_txt}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n{content}\n```",
+                     f"📜 *Logs:* `{name}`\n{status_txt}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n{display}\n```",
                      parse_mode='Markdown', reply_markup=mk)
     bot.answer_callback_query(c.id)
 
@@ -1837,16 +1865,14 @@ def cb_logs(c):
 def cb_refresh(c):
     parts = c.data.split('_', 2); uid, name = int(parts[1]), parts[2]; key = f"{uid}_{name}"
     if key not in scripts: return bot.answer_callback_query(c.id, "📭 No logs")
-    log_path = scripts[key].get('log')
-    if not log_path or not os.path.exists(log_path): return bot.answer_callback_query(c.id, "📭 Log missing")
-    with open(log_path, 'r') as f: content = f.read()
+    content = get_script_logs(key)
     running = scripts[key].get('running', False); code = scripts[key].get('code')
     status_txt = "🟢 Running" if running else (f"⭕ Stopped (exit {code})" if code is not None else "⭕ Stopped")
-    if len(content) > 3500: content = "…" + content[-3500:]
+    display = content if content else "(no output yet)"
     mk = types.InlineKeyboardMarkup()
     mk.add(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{uid}_{name}"))
     safe_edit(c.message.chat.id, c.message.message_id,
-             f"📜 *Logs:* `{name}`\n{status_txt}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n{content}\n```",
+             f"📜 *Logs:* `{name}`\n{status_txt}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n{display}\n```",
              'Markdown', mk)
     bot.answer_callback_query(c.id, "Refreshed")
 
