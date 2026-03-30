@@ -713,7 +713,7 @@ def monitor_script(uid, key, name, process, log_path, msg_chat_id=None, msg_id=N
         scripts[key]['running'] = False
         scripts[key]['code'] = rc
 
-        # Update launch message if it was stuck on deps/starting
+        # Update launch message
         if msg_chat_id and msg_id:
             try:
                 mk = build_control_markup(uid, name, 'executable')
@@ -723,37 +723,52 @@ def monitor_script(uid, key, name, process, log_path, msg_chat_id=None, msg_id=N
                     safe_edit(msg_chat_id, msg_id, f"❌ *Crashed* — `{name}`\nExit: `{rc}`", 'Markdown', mk)
             except: pass
 
-        # Only alert on genuine crashes (not clean exit, not manual stop, not SIGKILL from us)
-        if rc not in (0, -1, -9, None):
-            snippet = ""
-            # Prefer stderr_log (clean stderr only) over merged log
-            stderr_path = scripts[key].get('stderr_log')
-            read_path = stderr_path if stderr_path and os.path.exists(stderr_path) and os.path.getsize(stderr_path) > 0 else log_path
-            if read_path and os.path.exists(read_path):
-                with open(read_path, 'r', errors='ignore') as f: content = f.read()
-                # Strip noisy HTTP/INFO lines
-                filtered_lines = [
-                    l for l in content.splitlines()
-                    if not re.match(r'^(INFO|DEBUG|WARNING):(httpx|urllib3|requests|telebot|apscheduler)', l)
-                    and 'HTTP Request:' not in l
-                    and 'HTTP/1.' not in l
-                    and 'getUpdates' not in l
-                ]
-                filtered = "\n".join(filtered_lines)
-                tb = re.search(r'(Traceback \(most recent call last\).*)', filtered, re.DOTALL)
-                if tb:
-                    snippet = tb.group(1).strip()
-                else:
-                    tail = filtered_lines[-30:] if len(filtered_lines) > 30 else filtered_lines
-                    snippet = "\n".join(tail).strip()
-                if len(snippet) > 1800: snippet = "..." + snippet[-1800:]
-
-            text = (f"⚠️ *Script Crashed*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-                    f"📄 `{name}`\n❌ Exit code: `{rc}`")
-            if snippet: text += f"\n\n*Traceback:*\n```\n{snippet}\n```"
-            try: safe_send(uid, text, 'Markdown')
+        # Alert on any non-zero exit that wasn't intentional (-1 = our stop, -9 = our SIGKILL)
+        if rc is not None and rc not in (0, -1, -9):
+            snippet = _read_crash_snippet(key, log_path)
+            # Send as plain text to avoid Markdown parse errors from traceback content
+            text = (
+                f"⚠️ Script Crashed\n"
+                f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                f"📄 {name}\n"
+                f"❌ Exit code: {rc}"
+            )
+            if snippet:
+                # Truncate snippet to stay under message limit
+                if len(snippet) > 1500:
+                    snippet = "..." + snippet[-1500:]
+                text += f"\n\nTraceback:\n{snippet}"
+            try: safe_send(uid, text)
             except: pass
     except: pass
+
+def _read_crash_snippet(key, log_path):
+    """Extract the most useful error lines from stderr or stdout log."""
+    try:
+        info = scripts.get(key, {})
+        stderr_path = info.get('stderr_log')
+        # Prefer clean stderr
+        read_path = stderr_path if stderr_path and os.path.exists(stderr_path) and os.path.getsize(stderr_path) > 0 else log_path
+        if not read_path or not os.path.exists(read_path):
+            return ""
+        with open(read_path, 'r', errors='ignore') as f:
+            content = f.read()
+        # Strip noisy polling lines
+        filtered = "\n".join([
+            l for l in content.splitlines()
+            if not re.match(r'^(INFO|DEBUG|WARNING):(httpx|urllib3|requests|telebot|apscheduler)', l)
+            and 'HTTP Request:' not in l
+            and 'HTTP/1.' not in l
+            and 'getUpdates' not in l
+        ])
+        tb = re.search(r'(Traceback \(most recent call last\).*)', filtered, re.DOTALL)
+        if tb:
+            return tb.group(1).strip()
+        lines = filtered.splitlines()
+        tail = lines[-30:] if len(lines) > 30 else lines
+        return "\n".join(tail).strip()
+    except:
+        return ""
 
 # ==================== SCRIPT EXECUTOR ====================
 def execute_script(uid, file_path, msg=None, work_dir=None, zip_name=None):
@@ -929,26 +944,38 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
                     if res.stderr: lf.write(f"STDERR:\n{res.stderr}\n")
                     lf.write(f"\nExit: {res.returncode}")
 
-                scripts[key] = {'process':None,'key':key,'uid':uid,'name':name,
-                                'start':datetime.now(),'log':log_path,'lang':lang,
+                scripts[key] = {'process':None,'key':key,'uid':uid,'name':display_name,
+                                'start':datetime.now(),'log':log_path,'stderr_log':stderr_path,'lang':lang,
                                 'icon':icon,'running':False,'code':res.returncode}
 
                 if msg:
-                    mk = build_control_markup(uid, name, 'executable')
+                    mk = build_control_markup(uid, display_name, 'executable')
                     if res.returncode == 0:
-                        safe_edit(msg.chat.id, msg.message_id, f"✅ *{lang}* — `{name}`\nExit: `0`", 'Markdown', mk)
+                        safe_edit(msg.chat.id, msg.message_id, f"✅ *{lang}* — `{display_name}`\nExit: `0`", 'Markdown', mk)
                     else:
                         snippet = extract_error_snippet(res.stderr, res.stdout)
-                        error_text = f"❌ *{lang}* — `{name}`\nExit: `{res.returncode}`"
+                        error_text = f"❌ *{lang}* — `{display_name}`\nExit: `{res.returncode}`"
                         if snippet: error_text += f"\n\n```\n{snippet}\n```"
                         safe_edit(msg.chat.id, msg.message_id, error_text, 'Markdown', mk)
+
+                # DM crash report if non-zero (plain text — tracebacks break Markdown)
+                if res.returncode not in (0, None):
+                    snippet = extract_error_snippet(res.stderr, res.stdout)
+                    dm = (f"⚠️ Script Error\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                          f"📄 {display_name}\n❌ Exit code: {res.returncode}")
+                    if snippet:
+                        if len(snippet) > 1500: snippet = "..." + snippet[-1500:]
+                        dm += f"\n\nTraceback:\n{snippet}"
+                    try: safe_send(uid, dm)
+                    except: pass
+
                 return True, f"Exit {res.returncode}"
 
             except subprocess.TimeoutExpired:
                 with open(log_path, 'w') as lf, open(stderr_path, 'w') as ef:
                     p = subprocess.Popen(cmd, stdout=lf, stderr=ef, cwd=cwd, env=env)
 
-                scripts[key] = {'process':p,'key':key,'uid':uid,'name':name,
+                scripts[key] = {'process':p,'key':key,'uid':uid,'name':display_name,
                                 'start':datetime.now(),'log':log_path,'stderr_log':stderr_path,'lang':lang,
                                 'icon':icon,'running':True,'code':None}
 
@@ -956,12 +983,12 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
                 msg_id_val = msg.message_id if msg else None
 
                 t = threading.Thread(target=monitor_script,
-                                     args=(uid, key, name, p, log_path, msg_chat_id, msg_id_val), daemon=True)
+                                     args=(uid, key, display_name, p, log_path, msg_chat_id, msg_id_val), daemon=True)
                 t.start()
 
                 if msg:
-                    mk = build_control_markup(uid, name, 'executable')
-                    safe_edit(msg.chat.id, msg.message_id, f"🔄 *{lang}* — `{name}`\nPID: `{p.pid}`", 'Markdown', mk)
+                    mk = build_control_markup(uid, display_name, 'executable')
+                    safe_edit(msg.chat.id, msg.message_id, f"🔄 *{lang}* — `{display_name}`\nPID: `{p.pid}`", 'Markdown', mk)
                 return True, f"Background PID {p.pid}"
 
         return False, "Max retries exceeded"
@@ -1447,7 +1474,47 @@ def _clone_remote_markup(uid, info):
     mk.add(types.InlineKeyboardButton("🗑️ Remove", callback_data=f"rmclone_{uid}"))
     return mk
 
-# ==================== BROADCAST ====================
+# ==================== RESTART COMMAND ====================
+@bot.message_handler(commands=['restart'])
+def cmd_restart(message):
+    if message.from_user.id != OWNER_ID:
+        return safe_reply(message, "🚫 *Owner Only*", 'Markdown')
+    mk = types.InlineKeyboardMarkup()
+    mk.row(
+        types.InlineKeyboardButton("✅ Yes, restart", callback_data="confirm_restart"),
+        types.InlineKeyboardButton("❌ Cancel", callback_data="del_msg")
+    )
+    safe_reply(message,
+               "⚠️ *Restart Bot*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+               "This will:\n• Kill all running scripts\n• Delete all uploaded files\n• Clear all data\n\n"
+               "Subscriptions and admins are preserved\\.",
+               'MarkdownV2', mk)
+
+@bot.callback_query_handler(func=lambda c: c.data == "confirm_restart")
+def cb_confirm_restart(c):
+    if c.from_user.id != OWNER_ID:
+        return bot.answer_callback_query(c.id, "Owner only")
+    bot.answer_callback_query(c.id, "Restarting...")
+    safe_edit(c.message.chat.id, c.message.message_id,
+             "🔄 *Restarting...*\nKilling processes and clearing data", 'Markdown')
+
+    # Notify all users
+    def _do_restart():
+        for uid in list(active_users):
+            try:
+                bot.send_message(uid,
+                    "🔄 Bot is restarting — all files have been cleared.\nPlease re-upload your files.",
+                    parse_mode=None)
+            except: pass
+            time.sleep(0.05)
+        time.sleep(1)
+        # Kill everything and wipe data
+        clear_old_data()
+        # Restart the process
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    t = threading.Thread(target=_do_restart, daemon=False)
+    t.start()
 @bot.message_handler(commands=['broadcast'])
 def cmd_broadcast(message):
     if message.from_user.id != OWNER_ID:
