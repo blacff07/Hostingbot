@@ -311,48 +311,28 @@ def kill_process_tree(pid):
 
 def stop_script(uid, name):
     key = f"{uid}_{name}"
-    # For ZIP files, the process may be stored under both the zip key and the entry point key
-    keys_to_stop = [key]
-    # Find any entry that has this as its zip_name
-    for k, info in list(scripts.items()):
-        if info.get('zip_name') == name and info.get('uid') == uid and k != key:
-            keys_to_stop.append(k)
-
-    stopped = False
-    for k in keys_to_stop:
-        if k in scripts and scripts[k].get('process'):
-            try:
-                scripts[k]['stopped_intentionally'] = True
-                scripts[k]['running'] = False
-                kill_process_tree(scripts[k]['process'].pid)
-                try: scripts[k]['process'].wait(timeout=2)
-                except: pass
-                stopped = True
+    if key in scripts and scripts[key].get('process'):
+        try:
+            scripts[key]['stopped_intentionally'] = True
+            scripts[key]['running'] = False
+            kill_process_tree(scripts[key]['process'].pid)
+            try: scripts[key]['process'].wait(timeout=2)
             except: pass
-    return stopped
+            return True
+        except: pass
+    return False
 
 def is_running(uid, name):
     key = f"{uid}_{name}"
-    # Check direct key first
-    def _check_key(k):
-        if k not in scripts or not scripts[k].get('process'): return False
-        if scripts[k].get('stopped_intentionally'): return False
-        try:
-            p = psutil.Process(scripts[k]['process'].pid)
-            if p.is_running() and p.status() != psutil.STATUS_ZOMBIE:
-                scripts[k]['running'] = True
-                return True
-        except psutil.NoSuchProcess: pass
-        scripts[k]['running'] = False
-        return False
-
-    if _check_key(key):
-        return True
-    # For ZIPs: also check any entry whose zip_name matches
-    for k, info in scripts.items():
-        if info.get('zip_name') == name and info.get('uid') == uid:
-            if _check_key(k):
-                return True
+    if key not in scripts or not scripts[key].get('process'): return False
+    if scripts[key].get('stopped_intentionally'): return False
+    try:
+        p = psutil.Process(scripts[key]['process'].pid)
+        if p.is_running() and p.status() != psutil.STATUS_ZOMBIE:
+            scripts[key]['running'] = True
+            return True
+    except psutil.NoSuchProcess: pass
+    scripts[key]['running'] = False
     return False
 
 def get_process_stats(pid):
@@ -613,17 +593,7 @@ def handle_zip(zip_path, uid, extract_to, msg=None, zip_name=None):
                     if f.endswith(('.py','.js','.sh')): main_file = os.path.join(root, f); break
                 if main_file: break
         if not main_file: return False, "No executable file found in ZIP"
-        ok, result = execute_script(uid, main_file, msg, extract_to)
-        # After execute_script, tag the scripts entry with zip metadata for tracking
-        if ok and zip_name:
-            entry_name = os.path.basename(main_file)
-            entry_key = f"{uid}_{entry_name}"
-            zip_key = f"{uid}_{zip_name}"
-            if entry_key in scripts:
-                scripts[entry_key]['zip_name'] = zip_name
-                scripts[entry_key]['extract_dir'] = extract_to
-                # Also register under the zip key so is_running(uid, zip_name) works
-                scripts[zip_key] = scripts[entry_key]
+        ok, result = execute_script(uid, main_file, msg, extract_to, zip_name=zip_name)
         return ok, result
     except zipfile.BadZipFile: return False, "Invalid ZIP file"
     except Exception as e: return False, f"ZIP error: {e}"
@@ -786,24 +756,31 @@ def monitor_script(uid, key, name, process, log_path, msg_chat_id=None, msg_id=N
     except: pass
 
 # ==================== SCRIPT EXECUTOR ====================
-def execute_script(uid, file_path, msg=None, work_dir=None):
+def execute_script(uid, file_path, msg=None, work_dir=None, zip_name=None):
+    """
+    zip_name: if this file is being run on behalf of a ZIP, pass the ZIP filename.
+              This ensures the script is tracked under the ZIP's key, not the entry point's key.
+    """
     name = os.path.basename(file_path)
     ext = os.path.splitext(file_path)[1].lower()
-    key = f"{uid}_{name}"
+    # Track under zip_name if provided, so ZIP files each get their own slot
+    key = f"{uid}_{zip_name}" if zip_name else f"{uid}_{name}"
     with exec_locks_mutex:
         if exec_locks.get(key):
             if msg:
-                try: safe_edit(msg.chat.id, msg.message_id, f"⚠️ `{name}` is already being started", 'Markdown')
+                try: safe_edit(msg.chat.id, msg.message_id, f"⚠️ `{zip_name or name}` is already being started", 'Markdown')
                 except: pass
             return False, "Already starting"
         exec_locks[key] = True
     try:
-        return _do_execute(uid, file_path, msg, work_dir, name, ext, key)
+        return _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=zip_name)
     finally:
         with exec_locks_mutex:
             exec_locks.pop(key, None)
 
-def _do_execute(uid, file_path, msg, work_dir, name, ext, key):
+def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
+    # Display name shown to user — use zip filename if this is from a ZIP
+    display_name = zip_name if zip_name else name
     if ext in STATIC_EXTS:
         if msg:
             url = get_file_url(uid, name)
@@ -917,7 +894,10 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key):
         else:
             cmd = [file_path]
 
-        log_path = os.path.join(LOGS_DIR, f"{uid}_{int(time.time())}.log")
+        # Use display_name (zip name or script name) so each file gets its own stable log
+        safe_name = re.sub(r'[^\w]', '_', display_name)
+        log_path = os.path.join(LOGS_DIR, f"{uid}_{safe_name}.log")
+        stderr_path = os.path.join(LOGS_DIR, f"{uid}_{safe_name}.err")
         env = get_user_env(uid, name)
         cwd = work_dir or os.path.dirname(file_path)
 
@@ -965,7 +945,6 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key):
                 return True, f"Exit {res.returncode}"
 
             except subprocess.TimeoutExpired:
-                stderr_path = log_path.replace('.log', '.err')
                 with open(log_path, 'w') as lf, open(stderr_path, 'w') as ef:
                     p = subprocess.Popen(cmd, stdout=lf, stderr=ef, cwd=cwd, env=env)
 
@@ -1814,31 +1793,21 @@ def cb_restart(c):
     execute_script(uid, path, c.message)
 
 def get_script_logs(key, max_chars=3500):
-    """Read and merge stdout log + stderr log for display."""
+    """Read and merge stdout + stderr logs for display."""
     if key not in scripts:
         return ""
     info = scripts[key]
-    stdout_path = info.get('log')
-    stderr_path = info.get('stderr_log')
-
     parts = []
-    if stdout_path and os.path.exists(stdout_path):
-        try:
-            with open(stdout_path, 'r', errors='ignore') as f:
-                out = f.read().strip()
-            if out:
-                parts.append(out)
-        except: pass
-
-    if stderr_path and os.path.exists(stderr_path):
-        try:
-            with open(stderr_path, 'r', errors='ignore') as f:
-                err = f.read().strip()
-            if err:
-                parts.append(err)
-        except: pass
-
-    content = "\n".join(parts).strip() if parts else ""
+    for path_key in ('log', 'stderr_log'):
+        p = info.get(path_key)
+        if p and os.path.exists(p):
+            try:
+                with open(p, 'r', errors='ignore') as f:
+                    txt = f.read().strip()
+                if txt:
+                    parts.append(txt)
+            except: pass
+    content = "\n".join(parts).strip()
     if len(content) > max_chars:
         content = "…" + content[-max_chars:]
     return content
