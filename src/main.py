@@ -401,19 +401,67 @@ def extract_error_snippet(stderr, stdout=""):
 
 # ==================== SECURITY ====================
 _DANGEROUS = [
-    'sudo ', 'rm -rf', 'fdisk', 'mkfs', 'dd if=', 'shutdown', 'reboot', 'halt',
+    # System destruction
+    'rm -rf', 'fdisk', 'mkfs', 'dd if=', 'shutdown', 'reboot', 'halt',
     'poweroff', 'init 0', 'init 6', 'systemctl',
-    'os.system("rm', 'os.system("sudo', 'shutil.rmtree("/"',
-    'setuid', 'setgid', 'chmod 777', 'chown root'
+    'shutil.rmtree("/"', 'setuid', 'setgid', 'chmod 777', 'chown root',
+    # Privilege escalation
+    'sudo ', 'os.system("sudo',
+    # File system snooping — reading outside own sandbox
+    'os.listdir', 'os.walk', 'os.scandir',
+    # Path traversal attempts
+    '../uploads', '../data', '../logs', '../pending', '../extracted', '../sites',
+    '/etc/passwd', '/etc/shadow', '/etc/hosts', '/proc/',
+    # Reading and exfiltrating arbitrary files
+    "open('/'", 'open("/',
+    "open('/etc", "open('/proc", "open('/var",
+    "open('../", 'open("../',
+    # Sending files out via bot/requests
+    'send_document', 'send_file',
+    'requests.post', 'requests.get', 'httpx.post', 'httpx.get',
+    'aiohttp.clientsession',
+    # Zip-and-exfiltrate
+    'zipfile.zipfile', 'shutil.make_archive',
+    # Executing shell commands
+    'os.system(', 'subprocess.call(', 'subprocess.run(', 'subprocess.popen(',
+    'os.popen(', 'commands.getoutput',
+    # Env variable harvesting (tokens live here)
+    'os.environ', 'os.getenv(',
+]
+
+# Patterns checked with word-boundary awareness (avoid false positives)
+_DANGEROUS_REGEX = [
+    re.compile(r'os\.listdir\s*\('),
+    re.compile(r'os\.walk\s*\('),
+    re.compile(r'os\.scandir\s*\('),
+    re.compile(r'os\.environ(?!\[.TELEGRAM|.BOT_TOKEN|.PORT)'),  # allow reading own token
+    re.compile(r'os\.getenv\s*\(\s*[\'"](?!TELEGRAM|BOT_TOKEN|PORT)[^\'"]+[\'"]'),
+    re.compile(r'open\s*\(\s*[\'"]\.\.'),       # open('../
+    re.compile(r'open\s*\(\s*[\'"]\/'),          # open('/...
+    re.compile(r'subprocess\.(run|call|Popen|check_output)\s*\('),
+    re.compile(r'os\.(system|popen)\s*\('),
+    re.compile(r'send_document\s*\('),
+    re.compile(r'zipfile\.ZipFile\s*\('),
+    re.compile(r'shutil\.make_archive\s*\('),
+    re.compile(r'requests\.(get|post|put)\s*\('),
+    re.compile(r'httpx\.(get|post|put)\s*\('),
 ]
 
 def check_malicious(file_path):
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read().lower()
+            content = f.read()
+        content_lower = content.lower()
+        # String pattern check
         for p in _DANGEROUS:
-            if p.lower() in content: return False, f"Blocked pattern: `{p}`"
-        if os.path.getsize(file_path) > 20*1024*1024: return False, "File >20MB"
+            if p.lower() in content_lower:
+                return False, f"Blocked pattern: `{p}`"
+        # Regex pattern check
+        for pattern in _DANGEROUS_REGEX:
+            if pattern.search(content):
+                return False, f"Blocked pattern: `{pattern.pattern}`"
+        if os.path.getsize(file_path) > 20*1024*1024:
+            return False, "File >20MB"
         return True, "Safe"
     except: return True, "Safe"
 
@@ -423,10 +471,14 @@ def scan_zip_contents(zip_path):
             for name in zf.namelist():
                 if os.path.splitext(name)[1].lower() in ('.py','.js','.sh','.rb','.php','.lua','.ts','.bat','.ps1'):
                     try:
-                        content = zf.open(name).read(512*1024).decode('utf-8', errors='ignore').lower()
+                        content = zf.open(name).read(512*1024).decode('utf-8', errors='ignore')
+                        content_lower = content.lower()
                         for p in _DANGEROUS:
-                            if p.lower() in content:
+                            if p.lower() in content_lower:
                                 return False, f"Blocked in `{os.path.basename(name)}`: `{p}`"
+                        for pattern in _DANGEROUS_REGEX:
+                            if pattern.search(content):
+                                return False, f"Blocked in `{os.path.basename(name)}`: `{pattern.pattern}`"
                     except: pass
         return True, "Safe"
     except zipfile.BadZipFile: return False, "Invalid ZIP file"
@@ -578,7 +630,14 @@ def handle_zip(zip_path, uid, extract_to, msg=None, zip_name=None):
                     if f.endswith(('.py','.js','.sh')): main_file = os.path.join(root, f); break
                 if main_file: break
         if not main_file: return False, "No executable file found in ZIP"
-        return execute_script(uid, main_file, msg, extract_to, zip_name=zip_name)
+
+        # Call _do_execute directly — exec_lock for this zip_name key is already held
+        # by the outer execute_script call, so we must NOT go through execute_script again
+        inner_name = os.path.basename(main_file)
+        inner_ext  = os.path.splitext(main_file)[1].lower()
+        key        = f"{uid}_{zip_name}" if zip_name else f"{uid}_{inner_name}"
+        return _do_execute(uid, main_file, msg, extract_to, inner_name, inner_ext, key, zip_name)
+
     except zipfile.BadZipFile: return False, "Invalid ZIP file"
     except Exception as e: return False, f"ZIP error: {e}"
 
@@ -602,14 +661,17 @@ def monitor_script(uid, key, name, process, log_path, msg_chat_id=None, msg_id=N
                     safe_edit(msg_chat_id, msg_id, f"❌ *Crashed* — `{name}`\nExit: `{rc}`", 'Markdown', mk)
             except: pass
 
-        # DM on any genuine crash — plain text, no parse_mode, tracebacks break Markdown
+        # DM on any genuine crash — HTML so code block works, Markdown breaks on tracebacks
         if rc is not None and rc not in (0, -1, -9):
             snippet = _read_crash_snippet(key, log_path)
-            text = f"⚠️ Script Crashed\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n📄 {name}\n❌ Exit code: {rc}"
+            text = (f"⚠️ <b>Script Crashed</b>\n"
+                    f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                    f"📄 <code>{name}</code>\n"
+                    f"❌ Exit code: <code>{rc}</code>")
             if snippet:
                 if len(snippet) > 1500: snippet = "..." + snippet[-1500:]
-                text += f"\n\nTraceback:\n{snippet}"
-            try: safe_send(uid, text)
+                text += f"\n\n<pre>{snippet}</pre>"
+            try: safe_send(uid, text, parse='HTML')
             except: pass
     except: pass
 
@@ -688,9 +750,10 @@ def tail_stderr_for_tracebacks(uid, key, name, stderr_path, process):
                             if now - sent_hashes.get(h, 0) >= COOLDOWN:
                                 sent_hashes[h] = now
                                 snippet = tb_clean if len(tb_clean) <= 1500 else "..." + tb_clean[-1500:]
-                                text = (f"⚠️ Runtime Error in {name}\n"
-                                        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n{snippet}")
-                                try: safe_send(uid, text)
+                                text = (f"⚠️ <b>Runtime Error in {name}</b>\n"
+                                        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                                        f"<pre>{snippet}</pre>")
+                                try: safe_send(uid, text, parse='HTML')
                                 except: pass
 
                         buffer = buffer[start + len('\n'.join(lines[:end_idx])):]
