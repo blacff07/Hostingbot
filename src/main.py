@@ -158,6 +158,7 @@ user_envs       = {}   # uid -> {filename -> {KEY: VALUE}}
 site_slugs      = {}   # uid -> {filename -> slug}
 waiting_slug    = {}   # uid -> {name, uid}
 waiting_env     = {}   # uid -> {step, name, key}
+banned_users    = set()  # uid -> banned from using bot
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -183,6 +184,7 @@ def init_db():
         c.execute('CREATE TABLE IF NOT EXISTS cmd_log (id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, cmd TEXT, time TEXT, output TEXT)')
         c.execute('CREATE TABLE IF NOT EXISTS user_envs (uid INTEGER, filename TEXT, key TEXT, value TEXT, PRIMARY KEY (uid, filename, key))')
         c.execute('CREATE TABLE IF NOT EXISTS site_slugs (uid INTEGER, filename TEXT, slug TEXT, PRIMARY KEY (uid, filename))')
+        c.execute('CREATE TABLE IF NOT EXISTS banned (uid INTEGER PRIMARY KEY)')
         c.execute('INSERT OR IGNORE INTO admins VALUES (?)', (OWNER_ID,))
         if ADMIN_ID != OWNER_ID:
             c.execute('INSERT OR IGNORE INTO admins VALUES (?)', (ADMIN_ID,))
@@ -236,6 +238,8 @@ def load_data():
         c.execute('SELECT uid, filename, slug FROM site_slugs')
         for uid, filename, slug in c.fetchall():
             site_slugs.setdefault(uid, {})[filename] = slug
+        c.execute('SELECT uid FROM banned')
+        banned_users.update(uid for uid, in c.fetchall())
         conn.close()
         logger.info(f"Data loaded: {len(active_users)} users")
     except Exception as e:
@@ -356,9 +360,23 @@ def get_user_first_seen(uid):
     return "Unknown"
 
 def get_user_env(uid, name):
-    env = os.environ.copy()
-    env.update(user_envs.get(uid, {}).get(name, {}))
-    return env
+    """Build a clean env for user scripts — strips all host secrets."""
+    # Start from a minimal safe base, NOT os.environ (which has BOT_TOKEN etc.)
+    safe_env = {
+        'PATH': os.environ.get('PATH', '/usr/bin:/bin:/usr/local/bin'),
+        'HOME': get_user_folder(uid),   # confine ~ to user's own folder
+        'USER': str(uid),
+        'LANG': 'en_US.UTF-8',
+        'PYTHONPATH': '',
+        'NODE_PATH': os.environ.get('NODE_PATH', ''),
+    }
+    # Copy only non-sensitive platform vars needed for runtime
+    for k in ('VIRTUAL_ENV', 'npm_config_prefix'):
+        if k in os.environ:
+            safe_env[k] = os.environ[k]
+    # Apply user-defined env vars for this specific file
+    safe_env.update(user_envs.get(uid, {}).get(name, {}))
+    return safe_env
 
 def save_env_var(uid, filename, key, value):
     user_envs.setdefault(uid, {}).setdefault(filename, {})[key] = value
@@ -400,68 +418,81 @@ def extract_error_snippet(stderr, stdout=""):
     return ("..." + snippet[-1800:]) if len(snippet) > 1800 else snippet
 
 # ==================== SECURITY ====================
-_DANGEROUS = [
-    # System destruction
+_DANGEROUS_STRINGS = [
     'rm -rf', 'fdisk', 'mkfs', 'dd if=', 'shutdown', 'reboot', 'halt',
     'poweroff', 'init 0', 'init 6', 'systemctl',
     'shutil.rmtree("/"', 'setuid', 'setgid', 'chmod 777', 'chown root',
-    # Privilege escalation
-    'sudo ', 'os.system("sudo',
-    # File system snooping — reading outside own sandbox
-    'os.listdir', 'os.walk', 'os.scandir',
-    # Path traversal attempts
-    '../uploads', '../data', '../logs', '../pending', '../extracted', '../sites',
-    '/etc/passwd', '/etc/shadow', '/etc/hosts', '/proc/',
-    # Reading and exfiltrating arbitrary files
-    "open('/'", 'open("/',
-    "open('/etc", "open('/proc", "open('/var",
-    "open('../", 'open("../',
-    # Sending files out via bot/requests
-    'send_document', 'send_file',
-    'requests.post', 'requests.get', 'httpx.post', 'httpx.get',
-    'aiohttp.clientsession',
-    # Zip-and-exfiltrate
-    'zipfile.zipfile', 'shutil.make_archive',
-    # Executing shell commands
-    'os.system(', 'subprocess.call(', 'subprocess.run(', 'subprocess.popen(',
-    'os.popen(', 'commands.getoutput',
-    # Env variable harvesting (tokens live here)
-    'os.environ', 'os.getenv(',
+    'sudo ', '/etc/passwd', '/etc/shadow', '/etc/hosts', '/proc/self',
+    '.ssh/', 'id_rsa',
 ]
 
-# Patterns checked with word-boundary awareness (avoid false positives)
+# Each tuple: (compiled regex, human label)
 _DANGEROUS_REGEX = [
-    re.compile(r'os\.listdir\s*\('),
-    re.compile(r'os\.walk\s*\('),
-    re.compile(r'os\.scandir\s*\('),
-    re.compile(r'os\.environ(?!\[.TELEGRAM|.BOT_TOKEN|.PORT)'),  # allow reading own token
-    re.compile(r'os\.getenv\s*\(\s*[\'"](?!TELEGRAM|BOT_TOKEN|PORT)[^\'"]+[\'"]'),
-    re.compile(r'open\s*\(\s*[\'"]\.\.'),       # open('../
-    re.compile(r'open\s*\(\s*[\'"]\/'),          # open('/...
-    re.compile(r'subprocess\.(run|call|Popen|check_output)\s*\('),
-    re.compile(r'os\.(system|popen)\s*\('),
-    re.compile(r'send_document\s*\('),
-    re.compile(r'zipfile\.ZipFile\s*\('),
-    re.compile(r'shutil\.make_archive\s*\('),
-    re.compile(r'requests\.(get|post|put)\s*\('),
-    re.compile(r'httpx\.(get|post|put)\s*\('),
+    (re.compile(r'\bos\.listdir\s*\('),          'os.listdir'),
+    (re.compile(r'\bos\.walk\s*\('),             'os.walk'),
+    (re.compile(r'\bos\.scandir\s*\('),          'os.scandir'),
+    (re.compile(r'\bos\.getcwd\s*\('),           'os.getcwd'),
+    (re.compile(r'\bos\.chdir\s*\('),            'os.chdir'),
+    (re.compile(r'\bos\.environ\b'),             'os.environ'),
+    (re.compile(r'\bos\.getenv\s*\('),           'os.getenv'),
+    (re.compile(r'\bos\.path\.abspath\s*\('),    'os.path.abspath'),
+    (re.compile(r'\bos\.system\s*\('),           'os.system'),
+    (re.compile(r'\bos\.popen\s*\('),            'os.popen'),
+    (re.compile(r'\bos\.remove\s*\('),           'os.remove'),
+    # open() with any argument — file I/O not permitted
+    (re.compile(r'\bopen\s*\('),                 'open()'),
+    # subprocess — any form
+    (re.compile(r'\bsubprocess\s*\.'),           'subprocess'),
+    (re.compile(r'\bimport\s+subprocess\b'),     'import subprocess'),
+    (re.compile(r'\bfrom\s+subprocess\b'),       'from subprocess'),
+    # Network
+    (re.compile(r'\bimport\s+socket\b'),         'import socket'),
+    (re.compile(r'\bfrom\s+socket\b'),           'from socket'),
+    (re.compile(r'\brequests\s*\.'),             'requests'),
+    (re.compile(r'\bhttpx\s*\.'),                'httpx'),
+    (re.compile(r'\baiohttp\s*\.'),              'aiohttp'),
+    (re.compile(r'\burllib\s*\.'),               'urllib'),
+    (re.compile(r'\bhttp\.client\b'),            'http.client'),
+    # Sending files — covers any bot API method that sends data
+    (re.compile(r'\bsend_document\s*\('),        'send_document'),
+    (re.compile(r'\bsend_photo\s*\('),           'send_photo'),
+    (re.compile(r'\bsend_video\s*\('),           'send_video'),
+    (re.compile(r'\bsend_audio\s*\('),           'send_audio'),
+    (re.compile(r'\bsend_file\s*\('),            'send_file'),
+    (re.compile(r'\bsend_media_group\s*\('),     'send_media_group'),
+    # Archive / copy
+    (re.compile(r'\bzipfile\s*\.'),              'zipfile'),
+    (re.compile(r'\bimport\s+zipfile\b'),        'import zipfile'),
+    (re.compile(r'\btarfile\s*\.'),              'tarfile'),
+    (re.compile(r'\bshutil\.copy\b'),            'shutil.copy'),
+    (re.compile(r'\bshutil\.move\b'),            'shutil.move'),
+    (re.compile(r'\bshutil\.make_archive\b'),    'shutil.make_archive'),
+    # Code execution
+    (re.compile(r'\beval\s*\('),                 'eval()'),
+    (re.compile(r'\bexec\s*\('),                 'exec()'),
+    (re.compile(r'\b__import__\s*\('),           '__import__'),
+    (re.compile(r'\bimportlib\b'),               'importlib'),
+    (re.compile(r'\bcompile\s*\('),              'compile()'),
 ]
+
+def _scan_content(content):
+    """Returns (safe: bool, reason: str)."""
+    cl = content.lower()
+    for p in _DANGEROUS_STRINGS:
+        if p.lower() in cl:
+            return False, f"Blocked: `{p}`"
+    for pattern, label in _DANGEROUS_REGEX:
+        if pattern.search(content):
+            return False, f"Blocked: `{label}`"
+    return True, "Safe"
 
 def check_malicious(file_path):
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
-        content_lower = content.lower()
-        # String pattern check
-        for p in _DANGEROUS:
-            if p.lower() in content_lower:
-                return False, f"Blocked pattern: `{p}`"
-        # Regex pattern check
-        for pattern in _DANGEROUS_REGEX:
-            if pattern.search(content):
-                return False, f"Blocked pattern: `{pattern.pattern}`"
-        if os.path.getsize(file_path) > 20*1024*1024:
-            return False, "File >20MB"
+        ok, reason = _scan_content(content)
+        if not ok: return False, reason
+        if os.path.getsize(file_path) > 20*1024*1024: return False, "File >20MB"
         return True, "Safe"
     except: return True, "Safe"
 
@@ -469,16 +500,15 @@ def scan_zip_contents(zip_path):
     try:
         with zipfile.ZipFile(zip_path, 'r') as zf:
             for name in zf.namelist():
-                if os.path.splitext(name)[1].lower() in ('.py','.js','.sh','.rb','.php','.lua','.ts','.bat','.ps1'):
+                if os.path.splitext(name)[1].lower() in (
+                    '.py','.pyw','.js','.mjs','.cjs','.ts','.tsx',
+                    '.sh','.bash','.rb','.php','.lua','.pl','.bat','.cmd','.ps1'
+                ):
                     try:
                         content = zf.open(name).read(512*1024).decode('utf-8', errors='ignore')
-                        content_lower = content.lower()
-                        for p in _DANGEROUS:
-                            if p.lower() in content_lower:
-                                return False, f"Blocked in `{os.path.basename(name)}`: `{p}`"
-                        for pattern in _DANGEROUS_REGEX:
-                            if pattern.search(content):
-                                return False, f"Blocked in `{os.path.basename(name)}`: `{pattern.pattern}`"
+                        ok, reason = _scan_content(content)
+                        if not ok:
+                            return False, f"In `{os.path.basename(name)}`: {reason}"
                     except: pass
         return True, "Safe"
     except zipfile.BadZipFile: return False, "Invalid ZIP file"
@@ -1190,6 +1220,8 @@ def build_main_keyboard(uid):
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
     uid = message.from_user.id
+    if uid in banned_users:
+        return safe_reply(message, "🚫 *You are banned from using this bot*", 'Markdown')
     active_users.add(uid)
     update_user_info(message)
     name = message.from_user.first_name or "User"
@@ -1223,6 +1255,8 @@ def cmd_help(message):
         lines.append("\n*Admin Commands*")
         lines.append("`/addadmin <id>`\n`/removeadmin <id>`")
         lines.append("`/addsub <id> <days>`\n`/removesub <id>`\n`/checksub <id>`")
+        lines.append("`/ban <uid>` — Ban user\n`/unban <uid>` — Unban user")
+        lines.append("`/delete <uid> <file>` — Delete any user's file\n`/get <uid> <file>` — Retrieve any user's file")
         lines.append("`/broadcast <msg>` — Broadcast to all users")
     if is_owner:
         lines.append("`/restart` — Wipe all data & restart bot")
@@ -1488,6 +1522,105 @@ def _clone_remote_markup(uid, info):
     mk.add(types.InlineKeyboardButton("🗑️ Remove", callback_data=f"rmclone_{uid}"))
     return mk
 
+# ==================== MODERATION ====================
+@bot.message_handler(commands=['ban'])
+def cmd_ban(message):
+    if message.from_user.id not in admins:
+        return safe_reply(message, "🚫 *Admin Only*", 'Markdown')
+    try:
+        target = int(message.text.split()[1])
+        if target == OWNER_ID:
+            return safe_reply(message, "❌ Cannot ban owner", 'Markdown')
+        banned_users.add(target)
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute('INSERT OR IGNORE INTO banned VALUES (?)', (target,))
+            conn.commit(); conn.close()
+        except: pass
+        safe_reply(message, f"🚫 *Banned:* `{target}`", 'Markdown')
+        try: bot.send_message(target, "🚫 *You have been banned from this bot*", 'Markdown')
+        except: pass
+    except:
+        safe_reply(message, "❌ Usage: `/ban <uid>`", 'Markdown')
+
+@bot.message_handler(commands=['unban'])
+def cmd_unban(message):
+    if message.from_user.id not in admins:
+        return safe_reply(message, "🚫 *Admin Only*", 'Markdown')
+    try:
+        target = int(message.text.split()[1])
+        banned_users.discard(target)
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute('DELETE FROM banned WHERE uid=?', (target,))
+            conn.commit(); conn.close()
+        except: pass
+        safe_reply(message, f"✅ *Unbanned:* `{target}`", 'Markdown')
+        try: bot.send_message(target, "✅ *Your ban has been lifted*", 'Markdown')
+        except: pass
+    except:
+        safe_reply(message, "❌ Usage: `/unban <uid>`", 'Markdown')
+
+@bot.message_handler(commands=['delete'])
+def cmd_delete_file(message):
+    """Owner/admin: /delete <uid> <filename> — force-delete any user's file."""
+    if message.from_user.id not in admins:
+        return safe_reply(message, "🚫 *Admin Only*", 'Markdown')
+    try:
+        parts = message.text.strip().split(None, 2)
+        if len(parts) < 3:
+            return safe_reply(message, "❌ Usage: `/delete <uid> <filename>`", 'Markdown')
+        target_uid = int(parts[1]); fname = parts[2].strip()
+        key = f"{target_uid}_{fname}"
+        if key in scripts: scripts[key]['stopped_intentionally'] = True
+        stop_script(target_uid, fname)
+        path = os.path.join(get_user_folder(target_uid), fname)
+        if os.path.exists(path): os.remove(path)
+        # Remove site folder if applicable
+        slug = site_slugs.get(target_uid, {}).get(fname)
+        if slug:
+            sd = os.path.join(SITES_DIR, slug)
+            if os.path.exists(sd): shutil.rmtree(sd, ignore_errors=True)
+            site_slugs.get(target_uid, {}).pop(fname, None)
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                conn.execute('DELETE FROM site_slugs WHERE uid=? AND filename=?', (target_uid, fname))
+                conn.commit(); conn.close()
+            except: pass
+        if target_uid in user_files:
+            user_files[target_uid] = [(n, t) for n, t in user_files[target_uid] if n != fname]
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute('DELETE FROM files WHERE uid=? AND name=?', (target_uid, fname))
+            conn.commit(); conn.close()
+        except: pass
+        if key in scripts: del scripts[key]
+        safe_reply(message, f"✅ *Deleted* `{fname}` from uid `{target_uid}`", 'Markdown')
+        try: bot.send_message(target_uid, f"🗑️ *File removed by admin:* `{fname}`", 'Markdown')
+        except: pass
+    except Exception as e:
+        safe_reply(message, f"❌ Error: `{e}`\nUsage: `/delete <uid> <filename>`", 'Markdown')
+
+@bot.message_handler(commands=['get'])
+def cmd_get_file(message):
+    """Owner/admin: /get <uid> <filename> — retrieve any user's hosted file."""
+    if message.from_user.id not in admins:
+        return safe_reply(message, "🚫 *Admin Only*", 'Markdown')
+    try:
+        parts = message.text.strip().split(None, 2)
+        if len(parts) < 3:
+            return safe_reply(message, "❌ Usage: `/get <uid> <filename>`", 'Markdown')
+        target_uid = int(parts[1]); fname = parts[2].strip()
+        path = os.path.join(get_user_folder(target_uid), fname)
+        if not os.path.exists(path):
+            return safe_reply(message, f"❌ File not found: `{fname}` for uid `{target_uid}`", 'Markdown')
+        with open(path, 'rb') as f:
+            bot.send_document(message.chat.id, f,
+                              caption=f"📄 `{fname}`\nFrom uid: `{target_uid}`",
+                              parse_mode='Markdown')
+    except Exception as e:
+        safe_reply(message, f"❌ Error: `{e}`\nUsage: `/get <uid> <filename>`", 'Markdown')
+
 # ==================== RESTART ====================
 @bot.message_handler(commands=['restart'])
 def cmd_restart(message):
@@ -1557,6 +1690,8 @@ def cb_broadcast_confirm(c):
 def handle_upload(message):
     uid = message.from_user.id
     update_user_info(message)
+    if uid in banned_users:
+        return safe_reply(message, "🚫 *You are banned from using this bot*", 'Markdown')
     if bot_locked and uid not in admins:
         return safe_reply(message, "🔒 *Bot Locked*\nUploads disabled temporarily", 'Markdown')
     if get_user_count(uid) >= get_user_limit(uid) and uid != OWNER_ID:
