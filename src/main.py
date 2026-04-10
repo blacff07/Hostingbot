@@ -1049,71 +1049,134 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
         return False, str(e)
 
 # ==================== SHELL ====================
+# Persistent shell processes: uid -> {process, output_lines, lock, waiting_input}
+shell_procs = {}
+
+def _get_or_create_shell(uid):
+    info = shell_procs.get(uid)
+    if info and info['process'].poll() is None:
+        return info
+    p = subprocess.Popen(
+        ['bash', '--norc', '--noprofile'],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, cwd=BASE_DIR,
+        env={**os.environ, 'PS1': '', 'TERM': 'dumb', 'DEBIAN_FRONTEND': 'noninteractive'}
+    )
+    info = {'process': p, 'output_lines': [], 'lock': threading.Lock(), 'waiting_input': False}
+    shell_procs[uid] = info
+    def _reader():
+        try:
+            for line in p.stdout:
+                with info['lock']:
+                    info['output_lines'].append(line)
+        except: pass
+    threading.Thread(target=_reader, daemon=True).start()
+    return info
+
+def _kill_shell(uid):
+    info = shell_procs.pop(uid, None)
+    if info:
+        try: info['process'].stdin.close()
+        except: pass
+        try: info['process'].kill()
+        except: pass
+
 def _run_shell_cmd(message, cmd_text):
     uid = message.from_user.id
-    commands = [c.strip() for c in re.split(r'\n|&&', cmd_text) if c.strip()]
-    for cmd in commands:
-        for d in ['rm -rf /*', 'dd if=', 'mkfs', ':(){', '> /dev/sda']:
-            if d in cmd: return safe_reply(message, f"🚫 *Blocked:* `{d}`", 'Markdown')
+    for d in ['rm -rf /*', 'dd if=', 'mkfs', ':(){', '> /dev/sda']:
+        if d in cmd_text:
+            return safe_reply(message, f"🚫 *Blocked:* `{d}`", 'Markdown')
 
-    full_cmd = ' && '.join(commands)
-    exit_mk  = types.InlineKeyboardMarkup()
+    exit_mk = types.InlineKeyboardMarkup()
     exit_mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
-    status = safe_reply(message, f"`$ {full_cmd}`\n⏳ Starting...", 'Markdown', exit_mk)
 
     try:
-        process = subprocess.Popen(
-            full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, cwd=BASE_DIR, bufsize=1
-        )
-        stdout_lines = []; stderr_lines = []
+        info = _get_or_create_shell(uid)
+
+        # If previous command timed out and is still waiting for input,
+        # pipe this text directly to its stdin instead of starting a new command
+        if info.get('waiting_input') and info['process'].poll() is None:
+            info['waiting_input'] = False
+            with info['lock']:
+                info['output_lines'].clear()
+            status = safe_reply(message, f"📥 `{cmd_text}` → stdin\n⏳ Running...", 'Markdown', exit_mk)
+            try:
+                info['process'].stdin.write(cmd_text + '\n')
+                info['process'].stdin.flush()
+            except BrokenPipeError:
+                _kill_shell(uid)
+                return safe_edit(status.chat.id, status.message_id,
+                                 "❌ Shell died. Send a command to reopen.", 'Markdown', exit_mk)
+            # Wait for output with sentinel
+            sentinel = f"__DONE_{int(time.time())}__"
+            info['process'].stdin.write(f"echo {sentinel}\n")
+            info['process'].stdin.flush()
+        else:
+            with info['lock']:
+                info['output_lines'].clear()
+            status = safe_reply(message, f"`$ {cmd_text}`\n⏳ Running...", 'Markdown', exit_mk)
+            sentinel = f"__DONE_{int(time.time())}__"
+            info['process'].stdin.write(cmd_text + '\n')
+            info['process'].stdin.write(f"echo {sentinel}\n")
+            info['process'].stdin.flush()
+
+        collected = []
+        deadline  = time.time() + 30
         last_edit = time.time()
+        prefix    = f"`$ {cmd_text}`" if not info.get('_was_stdin') else f"📥 `{cmd_text}` → stdin"
 
-        def read_stderr():
-            for line in process.stderr: stderr_lines.append(line)
-        threading.Thread(target=read_stderr, daemon=True).start()
+        while time.time() < deadline:
+            time.sleep(0.3)
+            with info['lock']:
+                new_lines = info['output_lines'].copy()
+                info['output_lines'].clear()
+            collected.extend(new_lines)
 
-        deadline = time.time() + 30
-        for line in process.stdout:
-            stdout_lines.append(line)
+            done    = any(sentinel in l for l in collected)
+            visible = [l for l in collected if sentinel not in l]
+
             now = time.time()
-            if now > deadline: process.kill(); break
-            if now - last_edit >= 1.5:
-                preview = "".join(stdout_lines)[-800:]
+            if now - last_edit >= 1.5 or done:
+                preview = "".join(visible)[-2500:].strip()
+                display = f"```\n{preview}\n```" if preview else "✅ No output"
                 try:
                     safe_edit(status.chat.id, status.message_id,
-                              f"`$ {full_cmd}`\n⏳ Running...\n```\n{preview}\n```", 'Markdown', exit_mk)
+                              f"`$ {cmd_text}`\n\n{display}", 'Markdown', exit_mk)
                     last_edit = now
                 except: pass
+                if done: break
 
-        process.wait(timeout=5)
-        stdout = "".join(stdout_lines); stderr = "".join(stderr_lines); rc = process.returncode
+        if time.time() >= deadline:
+            # Command is still running / waiting for input
+            info['waiting_input'] = True
+            visible = [l for l in collected if sentinel not in l]
+            preview = "".join(visible)[-2500:].strip()
+            display = f"```\n{preview}\n```" if preview else ""
+            msg = (f"`$ {cmd_text}`\n\n{display}\n\n"
+                   f"⏱️ *Waiting for input or still running*\n"
+                   f"Send your response \\(e\\.g\\. `Y` or `n`\\) or wait\\.")
+            try:
+                safe_edit(status.chat.id, status.message_id, msg, 'MarkdownV2', exit_mk)
+            except:
+                try: safe_edit(status.chat.id, status.message_id,
+                               f"`$ {cmd_text}`\n\n{display}\n\n⏱️ Waiting for input — send your response.",
+                               'Markdown', exit_mk)
+                except: pass
 
+        # Log command
         try:
+            visible_out = "".join([l for l in collected if sentinel not in l])[:500]
             conn = sqlite3.connect(DB_PATH)
             conn.execute('INSERT INTO cmd_log (uid,cmd,time,output) VALUES (?,?,?,?)',
-                         (uid, full_cmd, datetime.now().isoformat(), (stdout+stderr)[:500]))
+                         (uid, cmd_text, datetime.now().isoformat(), visible_out))
             conn.commit(); conn.close()
         except: pass
 
-        output = ""
-        if stdout: output += f"```\n{stdout[:2500]}\n```" + ("\n_…truncated_" if len(stdout) > 2500 else "")
-        if stderr: output += ("\n" if output else "") + f"⚠️ stderr:\n```\n{stderr[:800]}\n```"
-        if not output: output = "✅ No output"
-
-        result = f"`$ {full_cmd}`\n\n{output}\n`exit {rc}`"
-        if len(result) > 4096:
-            tmp = os.path.join(LOGS_DIR, f"shell_{int(time.time())}.txt")
-            with open(tmp, 'w') as f:
-                f.write(f"$ {full_cmd}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}\n\nExit: {rc}")
-            with open(tmp, 'rb') as f:
-                bot.send_document(status.chat.id, f, caption=f"`$ {full_cmd}`",
-                                  parse_mode='Markdown', reply_markup=exit_mk)
-            os.remove(tmp); bot.delete_message(status.chat.id, status.message_id)
-        else:
-            safe_edit(status.chat.id, status.message_id, result, 'Markdown', exit_mk)
+    except BrokenPipeError:
+        _kill_shell(uid)
+        safe_reply(message, "❌ Shell died. Send a command to reopen.", 'Markdown', exit_mk)
     except Exception as e:
-        safe_edit(status.chat.id, status.message_id, f"❌ `{e}`", 'Markdown', exit_mk)
+        safe_reply(message, f"❌ `{e}`", 'Markdown', exit_mk)
 
 @bot.message_handler(commands=['shell'])
 def cmd_shell(message):
@@ -1123,53 +1186,107 @@ def cmd_shell(message):
         _run_shell_cmd(message, parts[1].strip())
     else:
         shell_sessions[uid] = True
+        _get_or_create_shell(uid)   # pre-spawn shell process
         mk = types.InlineKeyboardMarkup()
         mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
-        safe_reply(message, "💻 *Shell Active*\nSend commands directly. Multiple lines supported.", 'Markdown', mk)
+        safe_reply(message, "💻 *Shell Active*\nSend commands directly. Multiple lines supported.\nShell is persistent — `Y/n` prompts work.", 'Markdown', mk)
 
 @bot.callback_query_handler(func=lambda c: c.data == "exit_shell")
 def cb_exit_shell(c):
-    shell_sessions.pop(c.from_user.id, None)
+    uid = c.from_user.id
+    shell_sessions.pop(uid, None)
+    _kill_shell(uid)
     try: safe_edit(c.message.chat.id, c.message.message_id, "💻 *Shell Closed*", 'Markdown')
     except: pass
     bot.answer_callback_query(c.id, "Shell closed")
 
 # ==================== ENV VAR COMMANDS ====================
+def _env_file_picker(uid, chat_id, action):
+    files = [(n, t) for n, t in user_files.get(uid, []) if t == 'executable']
+    if not files:
+        safe_send(chat_id, "❌ No executable files. Upload a script first.", 'Markdown')
+        return
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    for n, _ in files:
+        mk.add(types.InlineKeyboardButton(f"📄 {n}", callback_data=f"envpick_{action}_{uid}_{n}"))
+    safe_send(chat_id, "📂 *Pick a file:*", 'Markdown', mk)
+
 @bot.message_handler(commands=['setenv'])
 def cmd_setenv(message):
-    uid = message.from_user.id
-    parts = message.text.strip().split(None, 1)
-    if len(parts) < 2:
-        return safe_reply(message, "❌ Usage: `/setenv <filename>`", 'Markdown')
-    filename = parts[1].strip()
-    if not any(n == filename for n, _ in user_files.get(uid, [])):
-        return safe_reply(message, f"❌ File `{filename}` not found", 'Markdown')
-    waiting_env[uid] = {'step': 'key', 'name': filename}
-    safe_reply(message, f"🔑 *Set env var for* `{filename}`\n\nSend the variable *name* (e.g. `BOT_TOKEN`):", 'Markdown')
+    _env_file_picker(message.from_user.id, message.chat.id, 'set')
 
 @bot.message_handler(commands=['listenv'])
 def cmd_listenv(message):
-    uid = message.from_user.id
-    parts = message.text.strip().split(None, 1)
-    if len(parts) < 2: return safe_reply(message, "❌ Usage: `/listenv <filename>`", 'Markdown')
-    filename = parts[1].strip()
-    envs = user_envs.get(uid, {}).get(filename, {})
-    if not envs: return safe_reply(message, f"📋 No env vars set for `{filename}`", 'Markdown')
-    text = f"📋 *Env vars for* `{filename}`\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-    for k, v in envs.items():
-        masked = (v[:2] + '*' * max(0, len(v)-4) + v[-2:]) if len(v) > 4 else '****'
-        text += f"`{k}` = `{masked}`\n"
-    mk = types.InlineKeyboardMarkup()
-    mk.add(types.InlineKeyboardButton("🗑️ Clear All", callback_data=f"clearenv_{uid}_{filename}"))
-    safe_reply(message, text, 'Markdown', mk)
+    _env_file_picker(message.from_user.id, message.chat.id, 'list')
 
 @bot.message_handler(commands=['delenv'])
 def cmd_delenv(message):
-    uid = message.from_user.id
-    parts = message.text.strip().split(None, 2)
-    if len(parts) < 3: return safe_reply(message, "❌ Usage: `/delenv <filename> <KEY>`", 'Markdown')
-    delete_env_var(uid, parts[1].strip(), parts[2].strip())
-    safe_reply(message, f"✅ Deleted `{parts[2].strip()}` from `{parts[1].strip()}`", 'Markdown')
+    _env_file_picker(message.from_user.id, message.chat.id, 'del')
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('envpick_'))
+def cb_envpick(c):
+    # envpick_<action>_<uid>_<filename>
+    parts  = c.data.split('_', 3)
+    action = parts[1]; uid = int(parts[2]); filename = parts[3]
+    if c.from_user.id != uid and c.from_user.id not in admins:
+        return bot.answer_callback_query(c.id, "Access denied")
+
+    if action == 'set':
+        waiting_env[uid] = {'step': 'key', 'name': filename,
+                            'chat_id': c.message.chat.id, 'msg_id': c.message.message_id}
+        safe_edit(c.message.chat.id, c.message.message_id,
+                  f"🔑 *Set env var for* `{filename}`\n\nSend the variable name (e.g. `BOT_TOKEN`):",
+                  'Markdown')
+
+    elif action == 'list':
+        envs = user_envs.get(uid, {}).get(filename, {})
+        if not envs:
+            safe_edit(c.message.chat.id, c.message.message_id,
+                      f"📋 No env vars set for `{filename}`", 'Markdown')
+        else:
+            text = f"📋 *Env vars for* `{filename}`\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            for k, v in envs.items():
+                masked = (v[:2] + '*' * max(0, len(v)-4) + v[-2:]) if len(v) > 4 else '****'
+                text += f"`{k}` = `{masked}`\n"
+            mk = types.InlineKeyboardMarkup()
+            mk.add(types.InlineKeyboardButton("➕ Add Var", callback_data=f"envpick_set_{uid}_{filename}"))
+            mk.add(types.InlineKeyboardButton("🗑️ Clear All", callback_data=f"clearenv_{uid}_{filename}"))
+            safe_edit(c.message.chat.id, c.message.message_id, text, 'Markdown', mk)
+
+    elif action == 'del':
+        envs = user_envs.get(uid, {}).get(filename, {})
+        if not envs:
+            safe_edit(c.message.chat.id, c.message.message_id,
+                      f"📋 No env vars set for `{filename}`", 'Markdown')
+        else:
+            mk = types.InlineKeyboardMarkup(row_width=1)
+            for k in envs:
+                mk.add(types.InlineKeyboardButton(f"🗑️ {k}", callback_data=f"deloneenv_{uid}_{filename}_{k}"))
+            mk.add(types.InlineKeyboardButton("🗑️ Clear All", callback_data=f"clearenv_{uid}_{filename}"))
+            safe_edit(c.message.chat.id, c.message.message_id,
+                      f"🗑️ *Delete env var from* `{filename}`\n\nPick a key:", 'Markdown', mk)
+
+    bot.answer_callback_query(c.id)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('deloneenv_'))
+def cb_deloneenv(c):
+    # deloneenv_<uid>_<filename>_<key>
+    parts = c.data.split('_', 3); uid = int(parts[1]); filename = parts[2]; key = parts[3]
+    if c.from_user.id != uid and c.from_user.id not in admins:
+        return bot.answer_callback_query(c.id, "Access denied")
+    delete_env_var(uid, filename, key)
+    envs = user_envs.get(uid, {}).get(filename, {})
+    if not envs:
+        safe_edit(c.message.chat.id, c.message.message_id,
+                  f"✅ Deleted `{key}` — no more env vars for `{filename}`", 'Markdown')
+    else:
+        mk = types.InlineKeyboardMarkup(row_width=1)
+        for k in envs:
+            mk.add(types.InlineKeyboardButton(f"🗑️ {k}", callback_data=f"deloneenv_{uid}_{filename}_{k}"))
+        mk.add(types.InlineKeyboardButton("🗑️ Clear All", callback_data=f"clearenv_{uid}_{filename}"))
+        safe_edit(c.message.chat.id, c.message.message_id,
+                  f"✅ Deleted `{key}`\n\n🗑️ *Delete another from* `{filename}`:", 'Markdown', mk)
+    bot.answer_callback_query(c.id, f"Deleted {key}")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('clearenv_'))
 def cb_clearenv(c):
@@ -1639,8 +1756,9 @@ def cmd_restart(message):
 def cb_confirm_restart(c):
     if c.from_user.id != OWNER_ID: return bot.answer_callback_query(c.id, "Owner only")
     bot.answer_callback_query(c.id, "Restarting...")
-    safe_edit(c.message.chat.id, c.message.message_id,
-              "🔄 *Restarting...*", 'Markdown')
+    safe_edit(c.message.chat.id, c.message.message_id, "🔄 *Restarting...*\nClearing data and restarting.", 'Markdown')
+    chat_id = c.message.chat.id
+    msg_id  = c.message.message_id
     def _do():
         for uid in list(active_users):
             try: bot.send_message(uid, "🔄 Bot restarting — all files cleared. Please re-upload.")
@@ -1648,6 +1766,12 @@ def cb_confirm_restart(c):
             time.sleep(0.05)
         time.sleep(1)
         clear_old_data()
+        # Write restart marker so next boot can edit this message to show "Done"
+        try:
+            marker = os.path.join(DB_DIR, 'restart_marker.json')
+            with open(marker, 'w') as f:
+                json.dump({'chat_id': chat_id, 'msg_id': msg_id}, f)
+        except: pass
         os._exit(0)
     threading.Thread(target=_do, daemon=False).start()
 
@@ -2395,6 +2519,18 @@ atexit.register(cleanup)
 # ==================== AUTO-BROADCAST ON START ====================
 def broadcast_restart():
     time.sleep(3)
+    # If a /restart was triggered, edit the "Restarting..." message to show Done
+    try:
+        marker = os.path.join(DB_DIR, 'restart_marker.json')
+        if os.path.exists(marker):
+            with open(marker, 'r') as f:
+                data = json.load(f)
+            os.remove(marker)
+            try:
+                safe_edit(data['chat_id'], data['msg_id'],
+                          "✅ *Bot restarted successfully*\nAll data has been cleared.", 'Markdown')
+            except: pass
+    except: pass
     sent = 0
     for uid in list(active_users):
         try:
@@ -2422,8 +2558,8 @@ if __name__ == "__main__":
 
     logger.info(f"Started — Owner: {OWNER_ID} — Platform: {HOST_URL or 'local'}")
 
-    if active_users:
-        threading.Thread(target=broadcast_restart, daemon=True).start()
+    # Always run broadcast_restart — handles /restart marker + notifies users
+    threading.Thread(target=broadcast_restart, daemon=True).start()
 
     try: bot.send_chat_action(OWNER_ID, 'typing')
     except: pass
