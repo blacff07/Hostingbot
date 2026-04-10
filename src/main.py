@@ -157,7 +157,7 @@ broadcast_pending = {}
 user_envs       = {}   # uid -> {filename -> {KEY: VALUE}}
 site_slugs      = {}   # uid -> {filename -> slug}
 waiting_slug    = {}   # uid -> {name, uid}
-waiting_env     = {}   # uid -> {step, name, key}
+waiting_env     = {}   # uid -> {step, name, key, chat_id, msg_id}
 banned_users    = set()  # uid -> banned from using bot
 
 # ==================== LOGGING ====================
@@ -361,20 +361,17 @@ def get_user_first_seen(uid):
 
 def get_user_env(uid, name):
     """Build a clean env for user scripts — strips all host secrets."""
-    # Start from a minimal safe base, NOT os.environ (which has BOT_TOKEN etc.)
     safe_env = {
         'PATH': os.environ.get('PATH', '/usr/bin:/bin:/usr/local/bin'),
-        'HOME': get_user_folder(uid),   # confine ~ to user's own folder
+        'HOME': get_user_folder(uid),
         'USER': str(uid),
         'LANG': 'en_US.UTF-8',
         'PYTHONPATH': '',
         'NODE_PATH': os.environ.get('NODE_PATH', ''),
     }
-    # Copy only non-sensitive platform vars needed for runtime
     for k in ('VIRTUAL_ENV', 'npm_config_prefix'):
         if k in os.environ:
             safe_env[k] = os.environ[k]
-    # Apply user-defined env vars for this specific file
     safe_env.update(user_envs.get(uid, {}).get(name, {}))
     return safe_env
 
@@ -426,7 +423,6 @@ _DANGEROUS_STRINGS = [
     '.ssh/', 'id_rsa',
 ]
 
-# Each tuple: (compiled regex, human label)
 _DANGEROUS_REGEX = [
     (re.compile(r'\bos\.listdir\s*\('),          'os.listdir'),
     (re.compile(r'\bos\.walk\s*\('),             'os.walk'),
@@ -439,13 +435,10 @@ _DANGEROUS_REGEX = [
     (re.compile(r'\bos\.system\s*\('),           'os.system'),
     (re.compile(r'\bos\.popen\s*\('),            'os.popen'),
     (re.compile(r'\bos\.remove\s*\('),           'os.remove'),
-    # open() with any argument — file I/O not permitted
     (re.compile(r'\bopen\s*\('),                 'open()'),
-    # subprocess — any form
     (re.compile(r'\bsubprocess\s*\.'),           'subprocess'),
     (re.compile(r'\bimport\s+subprocess\b'),     'import subprocess'),
     (re.compile(r'\bfrom\s+subprocess\b'),       'from subprocess'),
-    # Network
     (re.compile(r'\bimport\s+socket\b'),         'import socket'),
     (re.compile(r'\bfrom\s+socket\b'),           'from socket'),
     (re.compile(r'\brequests\s*\.'),             'requests'),
@@ -453,21 +446,18 @@ _DANGEROUS_REGEX = [
     (re.compile(r'\baiohttp\s*\.'),              'aiohttp'),
     (re.compile(r'\burllib\s*\.'),               'urllib'),
     (re.compile(r'\bhttp\.client\b'),            'http.client'),
-    # Sending files — covers any bot API method that sends data
     (re.compile(r'\bsend_document\s*\('),        'send_document'),
     (re.compile(r'\bsend_photo\s*\('),           'send_photo'),
     (re.compile(r'\bsend_video\s*\('),           'send_video'),
     (re.compile(r'\bsend_audio\s*\('),           'send_audio'),
     (re.compile(r'\bsend_file\s*\('),            'send_file'),
     (re.compile(r'\bsend_media_group\s*\('),     'send_media_group'),
-    # Archive / copy
     (re.compile(r'\bzipfile\s*\.'),              'zipfile'),
     (re.compile(r'\bimport\s+zipfile\b'),        'import zipfile'),
     (re.compile(r'\btarfile\s*\.'),              'tarfile'),
     (re.compile(r'\bshutil\.copy\b'),            'shutil.copy'),
     (re.compile(r'\bshutil\.move\b'),            'shutil.move'),
     (re.compile(r'\bshutil\.make_archive\b'),    'shutil.make_archive'),
-    # Code execution
     (re.compile(r'\beval\s*\('),                 'eval()'),
     (re.compile(r'\bexec\s*\('),                 'exec()'),
     (re.compile(r'\b__import__\s*\('),           '__import__'),
@@ -476,7 +466,6 @@ _DANGEROUS_REGEX = [
 ]
 
 def _scan_content(content):
-    """Returns (safe: bool, reason: str)."""
     cl = content.lower()
     for p in _DANGEROUS_STRINGS:
         if p.lower() in cl:
@@ -624,7 +613,6 @@ def handle_zip_website(zip_path, uid, zip_name, msg=None):
     os.makedirs(site_dir)
     with zipfile.ZipFile(zip_path, 'r') as zf:
         zf.extractall(site_dir)
-    # Flatten single nested directory
     entries = os.listdir(site_dir)
     if len(entries) == 1 and os.path.isdir(os.path.join(site_dir, entries[0])):
         sub = os.path.join(site_dir, entries[0])
@@ -661,8 +649,6 @@ def handle_zip(zip_path, uid, extract_to, msg=None, zip_name=None):
                 if main_file: break
         if not main_file: return False, "No executable file found in ZIP"
 
-        # Call _do_execute directly — exec_lock for this zip_name key is already held
-        # by the outer execute_script call, so we must NOT go through execute_script again
         inner_name = os.path.basename(main_file)
         inner_ext  = os.path.splitext(main_file)[1].lower()
         key        = f"{uid}_{zip_name}" if zip_name else f"{uid}_{inner_name}"
@@ -691,7 +677,6 @@ def monitor_script(uid, key, name, process, log_path, msg_chat_id=None, msg_id=N
                     safe_edit(msg_chat_id, msg_id, f"❌ *Crashed* — `{name}`\nExit: `{rc}`", 'Markdown', mk)
             except: pass
 
-        # DM on any genuine crash — HTML so code block works, Markdown breaks on tracebacks
         if rc is not None and rc not in (0, -1, -9):
             snippet = _read_crash_snippet(key, log_path)
             text = (f"⚠️ <b>Script Crashed</b>\n"
@@ -726,23 +711,17 @@ def _read_crash_snippet(key, log_path):
 
 # ==================== MID-RUN TRACEBACK WATCHER ====================
 def tail_stderr_for_tracebacks(uid, key, name, stderr_path, process):
-    """
-    Tails the stderr file while the script runs.
-    Sends a plain-text DM when a new Traceback appears.
-    Deduplicates: same error only sent once per 60 s cooldown.
-    """
     NOISE = re.compile(
         r'^(INFO|DEBUG|WARNING):(httpx|urllib3|requests|telebot|apscheduler)|'
         r'HTTP Request:|HTTP/1\.|getUpdates'
     )
-    sent_hashes = {}  # hash -> last sent timestamp
-    COOLDOWN    = 60  # seconds
+    sent_hashes = {}
+    COOLDOWN    = 60
 
     def _hash(tb_text):
         lines = [l for l in tb_text.splitlines() if l.strip()]
         return hashlib.md5('\n'.join(lines[:4]).encode()).hexdigest()
 
-    # Wait for file to appear
     for _ in range(30):
         if os.path.exists(stderr_path): break
         time.sleep(0.2)
@@ -758,7 +737,6 @@ def tail_stderr_for_tracebacks(uid, key, name, stderr_path, process):
                 chunk = f.read(8192)
                 if chunk:
                     buffer += chunk
-                    # Scan for complete tracebacks
                     while True:
                         start = buffer.find('Traceback (most recent call last)')
                         if start == -1: break
@@ -769,7 +747,7 @@ def tail_stderr_for_tracebacks(uid, key, name, stderr_path, process):
                             if line and not line.startswith((' ', '\t')):
                                 end_idx = i + 1
                                 break
-                        if end_idx is None: break  # incomplete, wait for more
+                        if end_idx is None: break
 
                         tb_raw  = '\n'.join(lines[:end_idx]).strip()
                         tb_clean = '\n'.join(l for l in tb_raw.splitlines() if not NOISE.search(l)).strip()
@@ -793,7 +771,6 @@ def tail_stderr_for_tracebacks(uid, key, name, stderr_path, process):
 
 # ==================== SCRIPT EXECUTOR ====================
 def execute_script(uid, file_path, msg=None, work_dir=None, zip_name=None):
-    """zip_name: track this script under the ZIP's name so each ZIP is independent."""
     name = os.path.basename(file_path)
     ext  = os.path.splitext(file_path)[1].lower()
     key  = f"{uid}_{zip_name}" if zip_name else f"{uid}_{name}"
@@ -814,7 +791,6 @@ def execute_script(uid, file_path, msg=None, work_dir=None, zip_name=None):
 def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
     display_name = zip_name if zip_name else name
 
-    # Static file — just host it
     if ext in STATIC_EXTS:
         if msg:
             url = get_file_url(uid, name)
@@ -823,7 +799,6 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
             safe_edit(msg.chat.id, msg.message_id, f"✅ *Hosted*\n`{name}`", 'Markdown', mk if url else None)
         return True, "Hosted"
 
-    # ZIP — route through handle_zip
     if ext == '.zip':
         return handle_zip(file_path, uid,
                           os.path.join(EXTRACT_DIR, f"{uid}_{int(time.time())}"),
@@ -848,7 +823,6 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
             safe_edit(msg.chat.id, msg.message_id,
                       f"{icon} *{lang}* — `{display_name}`\n📦 Deps:\n{dep_text}", 'Markdown')
 
-        # Build command
         if ext in ('.py', '.pyw'):
             cmd = [sys.executable, file_path]
         elif ext in ('.js', '.mjs', '.cjs'):
@@ -939,7 +913,6 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
         else:
             cmd = [file_path]
 
-        # Stable log paths — one per script, keyed by display name
         safe_name   = re.sub(r'[^\w]', '_', display_name)
         log_path    = os.path.join(LOGS_DIR, f"{uid}_{safe_name}.log")
         stderr_path = os.path.join(LOGS_DIR, f"{uid}_{safe_name}.err")
@@ -954,7 +927,6 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
                 res = subprocess.run(cmd, capture_output=True, text=True,
                                      timeout=30, cwd=cwd, env=env)
 
-                # Auto-install missing Python modules then retry
                 if res.returncode != 0 and "ModuleNotFoundError" in res.stderr:
                     match = re.search(r"No module named '(\w+)'", res.stderr)
                     if match:
@@ -977,12 +949,10 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
                             installed.add(pkg)
                             continue
 
-                # Write logs
                 with open(log_path, 'w') as lf:
                     if res.stdout: lf.write(f"STDOUT:\n{res.stdout}\n")
                     if res.stderr: lf.write(f"STDERR:\n{res.stderr}\n")
                     lf.write(f"\nExit: {res.returncode}")
-                # Write stderr separately for clean crash reporting
                 with open(stderr_path, 'w') as ef:
                     if res.stderr: ef.write(res.stderr)
 
@@ -1006,7 +976,6 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
                 return True, f"Exit {res.returncode}"
 
             except subprocess.TimeoutExpired:
-                # Long-running — launch as background process
                 with open(log_path, 'w') as lf, open(stderr_path, 'w') as ef:
                     p = subprocess.Popen(cmd, stdout=lf, stderr=ef, cwd=cwd, env=env)
 
@@ -1019,14 +988,12 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
                 msg_chat_id = msg.chat.id if msg else None
                 msg_id_val  = msg.message_id if msg else None
 
-                # Thread 1: waits for exit, DMs on crash
                 threading.Thread(
                     target=monitor_script,
                     args=(uid, key, display_name, p, log_path, msg_chat_id, msg_id_val),
                     daemon=True
                 ).start()
 
-                # Thread 2: tails stderr live, DMs on each new traceback
                 threading.Thread(
                     target=tail_stderr_for_tracebacks,
                     args=(uid, key, display_name, stderr_path, p),
@@ -1049,7 +1016,6 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
         return False, str(e)
 
 # ==================== SHELL ====================
-# Persistent shell processes: uid -> {process, output_lines, lock, waiting_input}
 shell_procs = {}
 
 def _get_or_create_shell(uid):
@@ -1093,37 +1059,31 @@ def _run_shell_cmd(message, cmd_text):
     try:
         info = _get_or_create_shell(uid)
 
-        # If previous command timed out and is still waiting for input,
-        # pipe this text directly to its stdin instead of starting a new command
+        # If previous command is waiting for input, pipe this as stdin, not a new command
         if info.get('waiting_input') and info['process'].poll() is None:
             info['waiting_input'] = False
-            with info['lock']:
-                info['output_lines'].clear()
-            status = safe_reply(message, f"📥 `{cmd_text}` → stdin\n⏳ Running...", 'Markdown', exit_mk)
+            # Just send the input, no status message needed, but we can acknowledge
             try:
                 info['process'].stdin.write(cmd_text + '\n')
                 info['process'].stdin.flush()
+                safe_reply(message, f"📥 Input sent: `{cmd_text}`", 'Markdown', exit_mk)
             except BrokenPipeError:
                 _kill_shell(uid)
-                return safe_edit(status.chat.id, status.message_id,
-                                 "❌ Shell died. Send a command to reopen.", 'Markdown', exit_mk)
-            # Wait for output with sentinel
-            sentinel = f"__DONE_{int(time.time())}__"
-            info['process'].stdin.write(f"echo {sentinel}\n")
-            info['process'].stdin.flush()
-        else:
-            with info['lock']:
-                info['output_lines'].clear()
-            status = safe_reply(message, f"`$ {cmd_text}`\n⏳ Running...", 'Markdown', exit_mk)
-            sentinel = f"__DONE_{int(time.time())}__"
-            info['process'].stdin.write(cmd_text + '\n')
-            info['process'].stdin.write(f"echo {sentinel}\n")
-            info['process'].stdin.flush()
+                safe_reply(message, "❌ Shell died. Send a command to reopen.", 'Markdown', exit_mk)
+            return
+
+        # Normal command
+        with info['lock']:
+            info['output_lines'].clear()
+        status = safe_reply(message, f"`$ {cmd_text}`\n⏳ Running...", 'Markdown', exit_mk)
+        sentinel = f"__DONE_{int(time.time())}__"
+        info['process'].stdin.write(cmd_text + '\n')
+        info['process'].stdin.write(f"echo {sentinel}\n")
+        info['process'].stdin.flush()
 
         collected = []
         deadline  = time.time() + 30
         last_edit = time.time()
-        prefix    = f"`$ {cmd_text}`" if not info.get('_was_stdin') else f"📥 `{cmd_text}` → stdin"
 
         while time.time() < deadline:
             time.sleep(0.3)
@@ -1147,7 +1107,6 @@ def _run_shell_cmd(message, cmd_text):
                 if done: break
 
         if time.time() >= deadline:
-            # Command is still running / waiting for input
             info['waiting_input'] = True
             visible = [l for l in collected if sentinel not in l]
             preview = "".join(visible)[-2500:].strip()
@@ -1186,7 +1145,7 @@ def cmd_shell(message):
         _run_shell_cmd(message, parts[1].strip())
     else:
         shell_sessions[uid] = True
-        _get_or_create_shell(uid)   # pre-spawn shell process
+        _get_or_create_shell(uid)
         mk = types.InlineKeyboardMarkup()
         mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
         safe_reply(message, "💻 *Shell Active*\nSend commands directly. Multiple lines supported.\nShell is persistent — `Y/n` prompts work.", 'Markdown', mk)
@@ -1200,8 +1159,8 @@ def cb_exit_shell(c):
     except: pass
     bot.answer_callback_query(c.id, "Shell closed")
 
-# ==================== ENV VAR COMMANDS ====================
-def _env_file_picker(uid, chat_id, action):
+# ==================== ENV VAR COMMANDS (improved inline flow) ====================
+def _env_file_picker(uid, chat_id, action, msg_id=None):
     files = [(n, t) for n, t in user_files.get(uid, []) if t == 'executable']
     if not files:
         safe_send(chat_id, "❌ No executable files. Upload a script first.", 'Markdown')
@@ -1209,7 +1168,10 @@ def _env_file_picker(uid, chat_id, action):
     mk = types.InlineKeyboardMarkup(row_width=1)
     for n, _ in files:
         mk.add(types.InlineKeyboardButton(f"📄 {n}", callback_data=f"envpick_{action}_{uid}_{n}"))
-    safe_send(chat_id, "📂 *Pick a file:*", 'Markdown', mk)
+    if msg_id:
+        safe_edit(chat_id, msg_id, "📂 *Pick a file:*", 'Markdown', mk)
+    else:
+        safe_send(chat_id, "📂 *Pick a file:*", 'Markdown', mk)
 
 @bot.message_handler(commands=['setenv'])
 def cmd_setenv(message):
@@ -1225,7 +1187,6 @@ def cmd_delenv(message):
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('envpick_'))
 def cb_envpick(c):
-    # envpick_<action>_<uid>_<filename>
     parts  = c.data.split('_', 3)
     action = parts[1]; uid = int(parts[2]); filename = parts[3]
     if c.from_user.id != uid and c.from_user.id not in admins:
@@ -1237,7 +1198,6 @@ def cb_envpick(c):
         safe_edit(c.message.chat.id, c.message.message_id,
                   f"🔑 *Set env var for* `{filename}`\n\nSend the variable name (e.g. `BOT_TOKEN`):",
                   'Markdown')
-
     elif action == 'list':
         envs = user_envs.get(uid, {}).get(filename, {})
         if not envs:
@@ -1252,7 +1212,6 @@ def cb_envpick(c):
             mk.add(types.InlineKeyboardButton("➕ Add Var", callback_data=f"envpick_set_{uid}_{filename}"))
             mk.add(types.InlineKeyboardButton("🗑️ Clear All", callback_data=f"clearenv_{uid}_{filename}"))
             safe_edit(c.message.chat.id, c.message.message_id, text, 'Markdown', mk)
-
     elif action == 'del':
         envs = user_envs.get(uid, {}).get(filename, {})
         if not envs:
@@ -1265,12 +1224,10 @@ def cb_envpick(c):
             mk.add(types.InlineKeyboardButton("🗑️ Clear All", callback_data=f"clearenv_{uid}_{filename}"))
             safe_edit(c.message.chat.id, c.message.message_id,
                       f"🗑️ *Delete env var from* `{filename}`\n\nPick a key:", 'Markdown', mk)
-
     bot.answer_callback_query(c.id)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('deloneenv_'))
 def cb_deloneenv(c):
-    # deloneenv_<uid>_<filename>_<key>
     parts = c.data.split('_', 3); uid = int(parts[1]); filename = parts[2]; key = parts[3]
     if c.from_user.id != uid and c.from_user.id not in admins:
         return bot.answer_callback_query(c.id, "Access denied")
@@ -1364,9 +1321,9 @@ def cmd_help(message):
     is_owner = uid == OWNER_ID
     lines = [
         "📖 *Help*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
-        "`/start` — Home\n`/help` — Help\n`/clone` — Clone this bot\n`/shell [cmd]` — Shell (all users)",
+        "`/start` — Home\n`/help` — Help\n`/clone` — Clone this bot\n`/shell [cmd]` — Shell",
         "\n*Env Vars*",
-        "`/setenv <file>` — Set env var\n`/listenv <file>` — List vars\n`/delenv <file> <KEY>` — Delete var",
+        "`/setenv` — Set env var\n`/listenv` — List vars\n`/delenv` — Delete var",
     ]
     if is_admin:
         lines.append("\n*Admin Commands*")
@@ -1680,7 +1637,6 @@ def cmd_unban(message):
 
 @bot.message_handler(commands=['delete'])
 def cmd_delete_file(message):
-    """Owner/admin: /delete <uid> <filename> — force-delete any user's file."""
     if message.from_user.id not in admins:
         return safe_reply(message, "🚫 *Admin Only*", 'Markdown')
     try:
@@ -1693,7 +1649,6 @@ def cmd_delete_file(message):
         stop_script(target_uid, fname)
         path = os.path.join(get_user_folder(target_uid), fname)
         if os.path.exists(path): os.remove(path)
-        # Remove site folder if applicable
         slug = site_slugs.get(target_uid, {}).get(fname)
         if slug:
             sd = os.path.join(SITES_DIR, slug)
@@ -1720,7 +1675,6 @@ def cmd_delete_file(message):
 
 @bot.message_handler(commands=['get'])
 def cmd_get_file(message):
-    """Owner/admin: /get <uid> <filename> — retrieve any user's hosted file."""
     if message.from_user.id not in admins:
         return safe_reply(message, "🚫 *Admin Only*", 'Markdown')
     try:
@@ -1766,7 +1720,6 @@ def cb_confirm_restart(c):
             time.sleep(0.05)
         time.sleep(1)
         clear_old_data()
-        # Write restart marker so next boot can edit this message to show "Done"
         try:
             marker = os.path.join(DB_DIR, 'restart_marker.json')
             with open(marker, 'w') as f:
@@ -1804,7 +1757,7 @@ def cb_broadcast_confirm(c):
               f"📢 Broadcasting to {len(active_users)} users...", 'Markdown')
     sent = failed = 0
     for target_uid in active_users:
-        try: bot.send_message(target_uid, f"📢 *Broadcast*\n\n{text}", 'Markdown'); sent += 1; time.sleep(0.05)
+        try: bot.send_message(target_uid, text, 'Markdown'); sent += 1; time.sleep(0.05)
         except: failed += 1
     safe_edit(c.message.chat.id, c.message.message_id,
               f"📢 *Done*\n✅ {sent} sent  •  ❌ {failed} failed", 'Markdown')
@@ -1838,7 +1791,6 @@ def handle_upload(message):
 
         old_path = os.path.join(folder, name)
         if os.path.exists(old_path):
-            # Detect Telegram cache serving same bytes
             if hashlib.md5(open(old_path,'rb').read()).hexdigest() == hashlib.md5(data).hexdigest():
                 os.remove(temp)
                 safe_edit(status.chat.id, status.message_id,
@@ -1846,7 +1798,6 @@ def handle_upload(message):
                          "Telegram served a cached copy — no changes found.\n"
                          "Rename the file slightly and re-upload.", 'Markdown')
                 return
-            # Kill old process and clear caches
             old_key = f"{uid}_{name}"
             if old_key in scripts: scripts[old_key]['stopped_intentionally'] = True
             stop_script(uid, name)
@@ -1856,7 +1807,6 @@ def handle_upload(message):
             if old_key in scripts: del scripts[old_key]
             os.remove(old_path)
 
-        # Security scan
         if uid == OWNER_ID or uid in admins:
             safe_file, scan = True, "Trusted"
         elif ext == '.zip':
@@ -1866,7 +1816,12 @@ def handle_upload(message):
 
         if not safe_file:
             fhash = hashlib.md5(f"{uid}_{name}_{time.time()}".encode()).hexdigest()
-            pending_path = os.path.join(PENDING_DIR, f"{fhash}_{name}")
+            # Save pending file with original name only (avoid extra hash prefix)
+            pending_path = os.path.join(PENDING_DIR, name)
+            # Ensure uniqueness
+            if os.path.exists(pending_path):
+                base, ext_ = os.path.splitext(name)
+                pending_path = os.path.join(PENDING_DIR, f"{base}_{fhash[:6]}{ext_}")
             shutil.move(temp, pending_path)
             pending[fhash] = {'uid': uid, 'name': name, 'path': pending_path}
             conn = sqlite3.connect(DB_PATH)
@@ -1900,7 +1855,6 @@ def handle_upload(message):
         final = os.path.join(folder, name)
         shutil.move(temp, final)
 
-        # Website ZIP
         if ext == '.zip' and is_website_zip(final):
             ftype = 'site'
             user_files.setdefault(uid, [])
@@ -2057,13 +2011,24 @@ def get_script_logs(key, max_chars=3500):
     content = "\n".join(parts).strip()
     return ("…" + content[-max_chars:]) if len(content) > max_chars else content
 
+def file_exists_check(uid, name, callback_query):
+    """Return True if file still exists in user_files, else edit message."""
+    files = user_files.get(uid, [])
+    exists = any(n == name for n, _ in files)
+    if not exists:
+        safe_edit(callback_query.message.chat.id, callback_query.message.message_id,
+                  f"🗑️ *File has been deleted*\n`{name}`", 'Markdown')
+        bot.answer_callback_query(callback_query.id, "File deleted")
+        return False
+    return True
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith('file_'))
 def cb_file(c):
     parts = c.data.split('_', 2); uid, name = int(parts[1]), parts[2]
     if c.from_user.id != uid and c.from_user.id not in admins:
         return bot.answer_callback_query(c.id, "❌ Access denied")
+    if not file_exists_check(uid, name, c): return
     ftype = next((t for n, t in user_files.get(uid, []) if n == name), None)
-    if not ftype: return bot.answer_callback_query(c.id, "❌ File not found")
     path = os.path.join(get_user_folder(uid), name)
     size = fmt_size(os.path.getsize(path)) if os.path.exists(path) else "?"
     if ftype == 'executable':
@@ -2095,6 +2060,7 @@ def cb_start(c):
     parts = c.data.split('_', 2); uid, name = int(parts[1]), parts[2]
     if c.from_user.id != uid and c.from_user.id not in admins:
         return bot.answer_callback_query(c.id, "❌ Access denied")
+    if not file_exists_check(uid, name, c): return
     path = os.path.join(get_user_folder(uid), name)
     if not os.path.exists(path): return bot.answer_callback_query(c.id, "❌ File missing")
     if is_running(uid, name): return bot.answer_callback_query(c.id, "⚠️ Already running")
@@ -2108,6 +2074,7 @@ def cb_stop(c):
     parts = c.data.split('_', 2); uid, name = int(parts[1]), parts[2]
     if c.from_user.id != uid and c.from_user.id not in admins:
         return bot.answer_callback_query(c.id, "❌ Access denied")
+    if not file_exists_check(uid, name, c): return
     if stop_script(uid, name):
         safe_edit(c.message.chat.id, c.message.message_id,
                   f"⏹ *Stopped* `{name}`", 'Markdown', build_control_markup(uid, name, 'executable'))
@@ -2120,6 +2087,7 @@ def cb_restart(c):
     parts = c.data.split('_', 2); uid, name = int(parts[1]), parts[2]
     if c.from_user.id != uid and c.from_user.id not in admins:
         return bot.answer_callback_query(c.id, "❌ Access denied")
+    if not file_exists_check(uid, name, c): return
     stop_script(uid, name)
     path = os.path.join(get_user_folder(uid), name)
     if not os.path.exists(path): return bot.answer_callback_query(c.id, "❌ File missing")
@@ -2132,6 +2100,7 @@ def cb_logs(c):
     parts = c.data.split('_', 2); uid, name = int(parts[1]), parts[2]
     if c.from_user.id != uid and c.from_user.id not in admins:
         return bot.answer_callback_query(c.id, "❌ Access denied")
+    if not file_exists_check(uid, name, c): return
     key = f"{uid}_{name}"
     if key not in scripts: return bot.answer_callback_query(c.id, "📭 No logs yet")
     content    = get_script_logs(key)
@@ -2139,16 +2108,36 @@ def cb_logs(c):
     code       = scripts[key].get('code')
     status_txt = "🟢 Running" if running else (f"⭕ Stopped (exit {code})" if code is not None else "⭕ Stopped")
     display    = content if content else "(no output yet)"
-    mk = types.InlineKeyboardMarkup()
-    mk.add(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{uid}_{name}"))
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.add(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{uid}_{name}"),
+           types.InlineKeyboardButton("🛠️ Get txt", callback_data=f"getlogtxt_{uid}_{name}"))
     bot.send_message(c.message.chat.id,
                      f"📜 *Logs:* `{name}`\n{status_txt}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n{display}\n```",
                      parse_mode='Markdown', reply_markup=mk)
     bot.answer_callback_query(c.id)
 
+@bot.callback_query_handler(func=lambda c: c.data.startswith('getlogtxt_'))
+def cb_getlogtxt(c):
+    parts = c.data.split('_', 2); uid, name = int(parts[1]), parts[2]
+    if c.from_user.id != uid and c.from_user.id not in admins:
+        return bot.answer_callback_query(c.id, "❌ Access denied")
+    key = f"{uid}_{name}"
+    if key not in scripts: return bot.answer_callback_query(c.id, "No logs")
+    log_path = scripts[key].get('log')
+    if not log_path or not os.path.exists(log_path):
+        return bot.answer_callback_query(c.id, "Log file missing")
+    try:
+        with open(log_path, 'rb') as f:
+            bot.send_document(c.message.chat.id, f,
+                              caption=f"📜 `{name}` full log", parse_mode='Markdown')
+        bot.answer_callback_query(c.id, "Log sent")
+    except Exception as e:
+        bot.answer_callback_query(c.id, f"Error: {e}")
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith('refresh_'))
 def cb_refresh(c):
     parts = c.data.split('_', 2); uid, name = int(parts[1]), parts[2]
+    if not file_exists_check(uid, name, c): return
     key = f"{uid}_{name}"
     if key not in scripts: return bot.answer_callback_query(c.id, "📭 No logs")
     content    = get_script_logs(key)
@@ -2156,8 +2145,9 @@ def cb_refresh(c):
     code       = scripts[key].get('code')
     status_txt = "🟢 Running" if running else (f"⭕ Stopped (exit {code})" if code is not None else "⭕ Stopped")
     display    = content if content else "(no output yet)"
-    mk = types.InlineKeyboardMarkup()
-    mk.add(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{uid}_{name}"))
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.add(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{uid}_{name}"),
+           types.InlineKeyboardButton("🛠️ Get txt", callback_data=f"getlogtxt_{uid}_{name}"))
     safe_edit(c.message.chat.id, c.message.message_id,
               f"📜 *Logs:* `{name}`\n{status_txt}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n{display}\n```",
               'Markdown', mk)
@@ -2168,6 +2158,7 @@ def cb_delete(c):
     parts = c.data.split('_', 2); uid, name = int(parts[1]), parts[2]
     if c.from_user.id != uid and c.from_user.id not in admins:
         return bot.answer_callback_query(c.id, "❌ Access denied")
+    if not file_exists_check(uid, name, c): return
     key = f"{uid}_{name}"
     if key in scripts: scripts[key]['stopped_intentionally'] = True
     stop_script(uid, name)
@@ -2177,7 +2168,6 @@ def cb_delete(c):
         try: os.remove(path)
         except: pass
 
-    # Remove site folder if applicable
     slug = site_slugs.get(uid, {}).get(name)
     if slug:
         site_dir = os.path.join(SITES_DIR, slug)
@@ -2239,6 +2229,8 @@ def cb_back(c):
 # ==================== BUTTON HANDLERS ====================
 def exit_shell_if_active(uid):
     shell_sessions.pop(uid, None)
+    waiting_env.pop(uid, None)
+    waiting_slug.pop(uid, None)
 
 @bot.message_handler(func=lambda m: m.text == "📂 Files")
 def btn_files(m):
@@ -2464,7 +2456,8 @@ def env_conversation(m):
     if state['step'] == 'key':
         if not re.match(r'^[A-Z_][A-Z0-9_]*$', text.upper()):
             return safe_reply(m, "❌ Invalid name. Use uppercase letters, numbers, underscores only.\nTry again:", 'Markdown')
-        waiting_env[uid] = {'step': 'val', 'name': state['name'], 'key': text.upper()}
+        waiting_env[uid] = {'step': 'val', 'name': state['name'], 'key': text.upper(),
+                            'chat_id': state['chat_id'], 'msg_id': state['msg_id']}
         safe_reply(m, f"🔑 Key: `{text.upper()}`\n\nNow send the *value*:", 'Markdown')
     elif state['step'] == 'val':
         key = state['key']; filename = state['name']
@@ -2478,8 +2471,10 @@ def env_conversation(m):
 def cb_addenv(c):
     parts = c.data.split('_', 2); uid, filename = int(parts[1]), parts[2]
     if c.from_user.id != uid: return bot.answer_callback_query(c.id, "Not yours")
-    waiting_env[uid] = {'step': 'key', 'name': filename}
-    safe_send(c.message.chat.id, f"🔑 Send the next variable *name* for `{filename}`:", 'Markdown')
+    waiting_env[uid] = {'step': 'key', 'name': filename,
+                        'chat_id': c.message.chat.id, 'msg_id': c.message.message_id}
+    safe_edit(c.message.chat.id, c.message.message_id,
+              f"🔑 Send the next variable *name* for `{filename}`:", 'Markdown')
     bot.answer_callback_query(c.id)
 
 @bot.message_handler(func=lambda m: m.from_user and m.from_user.id in waiting_slug and m.text)
@@ -2519,7 +2514,6 @@ atexit.register(cleanup)
 # ==================== AUTO-BROADCAST ON START ====================
 def broadcast_restart():
     time.sleep(3)
-    # If a /restart was triggered, edit the "Restarting..." message to show Done
     try:
         marker = os.path.join(DB_DIR, 'restart_marker.json')
         if os.path.exists(marker):
@@ -2558,7 +2552,6 @@ if __name__ == "__main__":
 
     logger.info(f"Started — Owner: {OWNER_ID} — Platform: {HOST_URL or 'local'}")
 
-    # Always run broadcast_restart — handles /restart marker + notifies users
     threading.Thread(target=broadcast_restart, daemon=True).start()
 
     try: bot.send_chat_action(OWNER_ID, 'typing')
