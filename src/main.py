@@ -87,14 +87,21 @@ def home():
 @app.route('/file/<file_hash>')
 def serve_file(file_hash):
     try:
-        for uid in user_files:
-            for fname, _ in user_files[uid]:
-                if hashlib.md5(f"{uid}_{fname}".encode()).hexdigest() == file_hash:
+        logger.info(f"Serving file hash: {file_hash}")
+        for uid, files in user_files.items():
+            for fname, _ in files:
+                computed = hashlib.md5(f"{uid}_{fname}".encode()).hexdigest()
+                if computed == file_hash:
                     fpath = os.path.join(get_user_folder(uid), fname)
                     if os.path.exists(fpath):
+                        logger.info(f"Serving file: {fpath}")
                         return send_file(fpath, as_attachment=False)
+                    else:
+                        logger.error(f"File path does not exist: {fpath}")
+        logger.warning(f"File not found for hash: {file_hash}")
         return "File not found", 404
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error serving file {file_hash}: {e}")
         return "Error", 500
 
 @app.route('/s/<slug>')
@@ -1062,7 +1069,6 @@ def _run_shell_cmd(message, cmd_text):
         # If previous command is waiting for input, pipe this as stdin, not a new command
         if info.get('waiting_input') and info['process'].poll() is None:
             info['waiting_input'] = False
-            # Just send the input, no status message needed, but we can acknowledge
             try:
                 info['process'].stdin.write(cmd_text + '\n')
                 info['process'].stdin.flush()
@@ -1072,7 +1078,6 @@ def _run_shell_cmd(message, cmd_text):
                 safe_reply(message, "❌ Shell died. Send a command to reopen.", 'Markdown', exit_mk)
             return
 
-        # Normal command
         with info['lock']:
             info['output_lines'].clear()
         status = safe_reply(message, f"`$ {cmd_text}`\n⏳ Running...", 'Markdown', exit_mk)
@@ -1159,7 +1164,7 @@ def cb_exit_shell(c):
     except: pass
     bot.answer_callback_query(c.id, "Shell closed")
 
-# ==================== ENV VAR COMMANDS (improved inline flow) ====================
+# ==================== ENV VAR COMMANDS ====================
 def _env_file_picker(uid, chat_id, action, msg_id=None):
     files = [(n, t) for n, t in user_files.get(uid, []) if t == 'executable']
     if not files:
@@ -1816,9 +1821,7 @@ def handle_upload(message):
 
         if not safe_file:
             fhash = hashlib.md5(f"{uid}_{name}_{time.time()}".encode()).hexdigest()
-            # Save pending file with original name only (avoid extra hash prefix)
             pending_path = os.path.join(PENDING_DIR, name)
-            # Ensure uniqueness
             if os.path.exists(pending_path):
                 base, ext_ = os.path.splitext(name)
                 pending_path = os.path.join(PENDING_DIR, f"{base}_{fhash[:6]}{ext_}")
@@ -2012,7 +2015,6 @@ def get_script_logs(key, max_chars=3500):
     return ("…" + content[-max_chars:]) if len(content) > max_chars else content
 
 def file_exists_check(uid, name, callback_query):
-    """Return True if file still exists in user_files, else edit message."""
     files = user_files.get(uid, [])
     exists = any(n == name for n, _ in files)
     if not exists:
@@ -2121,18 +2123,28 @@ def cb_getlogtxt(c):
     parts = c.data.split('_', 2); uid, name = int(parts[1]), parts[2]
     if c.from_user.id != uid and c.from_user.id not in admins:
         return bot.answer_callback_query(c.id, "❌ Access denied")
+    if not file_exists_check(uid, name, c): return
     key = f"{uid}_{name}"
-    if key not in scripts: return bot.answer_callback_query(c.id, "No logs")
+    if key not in scripts:
+        return bot.answer_callback_query(c.id, "No logs")
     log_path = scripts[key].get('log')
     if not log_path or not os.path.exists(log_path):
         return bot.answer_callback_query(c.id, "Log file missing")
     try:
+        size = os.path.getsize(log_path)
+        if size < 4000:
+            with open(log_path, 'r', errors='ignore') as f:
+                content = f.read().strip()
+            if content:
+                safe_send(c.message.chat.id, f"📜 *Full log for* `{name}`\n```\n{content[-3500:]}\n```", 'Markdown')
+                return bot.answer_callback_query(c.id, "Log sent")
         with open(log_path, 'rb') as f:
             bot.send_document(c.message.chat.id, f,
                               caption=f"📜 `{name}` full log", parse_mode='Markdown')
         bot.answer_callback_query(c.id, "Log sent")
     except Exception as e:
-        bot.answer_callback_query(c.id, f"Error: {e}")
+        logger.error(f"Failed to send log: {e}")
+        bot.answer_callback_query(c.id, f"Error: {str(e)[:40]}")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('refresh_'))
 def cb_refresh(c):
