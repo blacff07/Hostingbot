@@ -2132,16 +2132,25 @@ def cb_getlogtxt(c):
         return bot.answer_callback_query(c.id, "Log file missing")
     try:
         size = os.path.getsize(log_path)
+        # For small logs, send as text message (more reliable)
         if size < 4000:
             with open(log_path, 'r', errors='ignore') as f:
                 content = f.read().strip()
             if content:
                 safe_send(c.message.chat.id, f"📜 *Full log for* `{name}`\n```\n{content[-3500:]}\n```", 'Markdown')
                 return bot.answer_callback_query(c.id, "Log sent")
-        with open(log_path, 'rb') as f:
-            bot.send_document(c.message.chat.id, f,
-                              caption=f"📜 `{name}` full log", parse_mode='Markdown')
-        bot.answer_callback_query(c.id, "Log sent")
+        # For larger logs, send as document with retry
+        for attempt in range(3):
+            try:
+                with open(log_path, 'rb') as f:
+                    bot.send_document(c.message.chat.id, f,
+                                      caption=f"📜 `{name}` full log", parse_mode='Markdown',
+                                      timeout=10)
+                return bot.answer_callback_query(c.id, "Log sent")
+            except Exception as e:
+                logger.warning(f"send_document attempt {attempt+1} failed: {e}")
+                time.sleep(1)
+        bot.answer_callback_query(c.id, "Failed to send log after retries")
     except Exception as e:
         logger.error(f"Failed to send log: {e}")
         bot.answer_callback_query(c.id, f"Error: {str(e)[:40]}")
