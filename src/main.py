@@ -87,7 +87,10 @@ def home():
 @app.route('/file/<uid>/<path:filename>')
 def serve_file(uid, filename):
     user_dir = os.path.join(UPLOAD_DIR, str(uid))
-    if not os.path.exists(os.path.join(user_dir, filename)):
+    full_path = os.path.join(user_dir, filename)
+    logger.info(f"Serving file: uid={uid}, filename={filename}, full_path={full_path}")
+    if not os.path.exists(full_path):
+        logger.warning(f"File not found: {full_path}")
         return "File not found", 404
     return send_from_directory(user_dir, filename)
 
@@ -945,8 +948,8 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
                             continue
 
                 with open(log_path, 'w') as lf:
-                    if res.stdout: lf.write(f"STDOUT:\n{res.stdout}\n")
-                    if res.stderr: lf.write(f"STDERR:\n{res.stderr}\n")
+                    if res.stdout: lf.write(res.stdout)
+                    if res.stderr: lf.write(res.stderr)
                     lf.write(f"\nExit: {res.returncode}")
                 with open(stderr_path, 'w') as ef:
                     if res.stderr: ef.write(res.stderr)
@@ -1279,6 +1282,7 @@ def build_main_keyboard(uid):
         mk.row(types.KeyboardButton("👑 Admin"))
         if is_owner:
             mk.row(types.KeyboardButton("🔒 Lock"), types.KeyboardButton("📁 All Files"))
+            mk.row(types.KeyboardButton("📜 Bot Logs"))
     return mk
 
 # ==================== COMMANDS ====================
@@ -1324,9 +1328,84 @@ def cmd_help(message):
         lines.append("`/delete <uid> <file>` — Delete any user's file\n`/get <uid> <file>` — Retrieve any user's file")
         lines.append("`/broadcast <msg>` — Broadcast to all users")
     if is_owner:
-        lines.append("`/restart` — Wipe all data & restart bot")
+        lines.append("`/restart` — Wipe all data & restart bot\n`/botlogs` — View bot logs")
     lines.append("\n*Features*\n30+ languages • Auto deps • Background hosting\nLive logs • Crash DMs • Mid-run error alerts\nZIP websites • Custom slugs • Env vars")
     safe_reply(message, "\n".join(lines), 'Markdown')
+
+# ==================== BOT LOGS (OWNER ONLY) ====================
+def get_bot_log_content(max_chars=3500):
+    log_path = os.path.join(LOGS_DIR, 'bot.log')
+    if not os.path.exists(log_path):
+        return ""
+    try:
+        with open(log_path, 'r', errors='ignore') as f:
+            content = f.read().strip()
+        if len(content) > max_chars:
+            content = "…" + content[-max_chars:]
+        return content
+    except:
+        return ""
+
+@bot.message_handler(commands=['botlogs'])
+def cmd_botlogs(message):
+    if message.from_user.id != OWNER_ID:
+        return safe_reply(message, "🚫 *Owner Only*", 'Markdown')
+    content = get_bot_log_content()
+    display = content if content else "(no output yet)"
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="refresh_botlogs"),
+           types.InlineKeyboardButton("🛠️ Get txt", callback_data="getbotlogtxt"))
+    safe_reply(message,
+               f"📜 *Bot Logs*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n{display}\n```",
+               'Markdown', mk)
+
+@bot.message_handler(func=lambda m: m.text == "📜 Bot Logs")
+def btn_botlogs(m):
+    if m.from_user.id != OWNER_ID:
+        return safe_reply(m, "🚫 *Owner Only*", 'Markdown')
+    cmd_botlogs(m)
+
+@bot.callback_query_handler(func=lambda c: c.data == "refresh_botlogs")
+def cb_refresh_botlogs(c):
+    if c.from_user.id != OWNER_ID:
+        return bot.answer_callback_query(c.id, "Owner only")
+    content = get_bot_log_content()
+    display = content if content else "(no output yet)"
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="refresh_botlogs"),
+           types.InlineKeyboardButton("🛠️ Get txt", callback_data="getbotlogtxt"))
+    safe_edit(c.message.chat.id, c.message.message_id,
+              f"📜 *Bot Logs*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n{display}\n```",
+              'Markdown', mk)
+    bot.answer_callback_query(c.id, "Refreshed")
+
+@bot.callback_query_handler(func=lambda c: c.data == "getbotlogtxt")
+def cb_getbotlogtxt(c):
+    if c.from_user.id != OWNER_ID:
+        return bot.answer_callback_query(c.id, "Owner only")
+    log_path = os.path.join(LOGS_DIR, 'bot.log')
+    if not os.path.exists(log_path):
+        return bot.answer_callback_query(c.id, "Log file missing")
+    try:
+        with open(log_path, 'r', errors='ignore') as f:
+            content = f.read()
+        if not content.strip():
+            safe_send(c.message.chat.id, "📭 *No log output yet*", 'Markdown')
+            return bot.answer_callback_query(c.id, "Empty log")
+        # Truncate to ~49.5 MB
+        MAX_BYTES = 49_500_000
+        if len(content.encode('utf-8')) > MAX_BYTES:
+            content = content.encode('utf-8')[-MAX_BYTES:].decode('utf-8', errors='ignore')
+        temp_path = os.path.join(LOGS_DIR, "bot_full.log")
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        with open(temp_path, 'rb') as f:
+            bot.send_document(c.message.chat.id, f)
+        os.remove(temp_path)
+        bot.answer_callback_query(c.id, "Log sent")
+    except Exception as e:
+        logger.error(f"Failed to send bot log: {e}")
+        bot.answer_callback_query(c.id, f"Error: {str(e)[:40]}")
 
 # ==================== ADMIN MANAGEMENT ====================
 @bot.message_handler(commands=['addadmin'])
@@ -2132,13 +2211,10 @@ def cb_getlogtxt(c):
         safe_send(c.message.chat.id, f"📭 *No log output yet* for `{name}`", 'Markdown')
         return bot.answer_callback_query(c.id, "Empty log")
 
-    # Truncate to last ~49.5 MB to avoid Telegram limit (max 50 MB)
     MAX_BYTES = 49_500_000
     if len(combined.encode('utf-8')) > MAX_BYTES:
-        # Keep latest bytes
         combined = combined.encode('utf-8')[-MAX_BYTES:].decode('utf-8', errors='ignore')
 
-    # Create a clean log file named exactly as the original file + .log
     log_filename = f"{name}.log"
     temp_path = os.path.join(LOGS_DIR, log_filename)
     try:
@@ -2424,7 +2500,7 @@ def btn_admin(m):
             f"Users: `{len(active_users)}`  •  Files: `{sum(len(f) for f in user_files.values())}`\n"
             f"Running: `{total_running}`  •  Pending: `{len(pending)}`  •  Clones: `{clones}`{sys_info}\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-            f"`/shell`  `/broadcast`  `/restart`\n`/addadmin`  `/removeadmin`\n`/addsub`  `/checksub`")
+            f"`/shell`  `/broadcast`  `/restart`\n`/addadmin`  `/removeadmin`\n`/addsub`  `/checksub`  `/botlogs`")
     safe_reply(m, text, 'Markdown')
 
 @bot.message_handler(func=lambda m: m.text == "💻 Shell")
