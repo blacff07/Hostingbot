@@ -71,7 +71,7 @@ def detect_host_url():
 HOST_URL = detect_host_url()
 
 # ==================== FLASK ====================
-from flask import Flask, send_file, jsonify, abort
+from flask import Flask, send_file, jsonify, abort, request
 from threading import Thread
 
 app = Flask(__name__)
@@ -98,6 +98,16 @@ def serve_file(file_hash):
                         return send_file(fpath, as_attachment=False)
                     else:
                         logger.error(f"File path does not exist: {fpath}")
+        # Fallback: try to find by iterating all user folders (in case user_files is out of sync)
+        for uid in os.listdir(UPLOAD_DIR):
+            ufolder = os.path.join(UPLOAD_DIR, uid)
+            if not os.path.isdir(ufolder): continue
+            for fname in os.listdir(ufolder):
+                computed = hashlib.md5(f"{uid}_{fname}".encode()).hexdigest()
+                if computed == file_hash:
+                    fpath = os.path.join(ufolder, fname)
+                    logger.info(f"Fallback serving: {fpath}")
+                    return send_file(fpath, as_attachment=False)
         logger.warning(f"File not found for hash: {file_hash}")
         return "File not found", 404
     except Exception as e:
@@ -129,6 +139,16 @@ def health():
                     "users": len(active_users),
                     "files": sum(len(f) for f in user_files.values()),
                     "platform": HOST_URL or "local"})
+
+@app.route('/debug/files')
+def debug_files():
+    # Only accessible if request comes from owner (check via query param for simplicity)
+    if request.args.get('key') != str(OWNER_ID):
+        return "Unauthorized", 403
+    result = {}
+    for uid, files in user_files.items():
+        result[str(uid)] = [{"name": n, "type": t} for n, t in files]
+    return jsonify(result)
 
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
@@ -1066,7 +1086,6 @@ def _run_shell_cmd(message, cmd_text):
     try:
         info = _get_or_create_shell(uid)
 
-        # If previous command is waiting for input, pipe this as stdin, not a new command
         if info.get('waiting_input') and info['process'].poll() is None:
             info['waiting_input'] = False
             try:
@@ -1127,7 +1146,6 @@ def _run_shell_cmd(message, cmd_text):
                                'Markdown', exit_mk)
                 except: pass
 
-        # Log command
         try:
             visible_out = "".join([l for l in collected if sentinel not in l])[:500]
             conn = sqlite3.connect(DB_PATH)
@@ -2127,33 +2145,35 @@ def cb_getlogtxt(c):
     key = f"{uid}_{name}"
     if key not in scripts:
         return bot.answer_callback_query(c.id, "No logs")
-    log_path = scripts[key].get('log')
-    if not log_path or not os.path.exists(log_path):
-        return bot.answer_callback_query(c.id, "Log file missing")
-    try:
-        size = os.path.getsize(log_path)
-        # For small logs, send as text message (more reliable)
-        if size < 4000:
-            with open(log_path, 'r', errors='ignore') as f:
-                content = f.read().strip()
-            if content:
-                safe_send(c.message.chat.id, f"📜 *Full log for* `{name}`\n```\n{content[-3500:]}\n```", 'Markdown')
-                return bot.answer_callback_query(c.id, "Log sent")
-        # For larger logs, send as document with retry
-        for attempt in range(3):
+    info = scripts[key]
+    combined = ""
+    for log_key in ('log', 'stderr_log'):
+        path = info.get(log_key)
+        if path and os.path.exists(path):
             try:
-                with open(log_path, 'rb') as f:
-                    bot.send_document(c.message.chat.id, f,
-                                      caption=f"📜 `{name}` full log", parse_mode='Markdown',
-                                      timeout=10)
-                return bot.answer_callback_query(c.id, "Log sent")
+                with open(path, 'r', errors='ignore') as f:
+                    content = f.read().strip()
+                    if content:
+                        combined += f"--- {os.path.basename(path)} ---\n{content}\n\n"
             except Exception as e:
-                logger.warning(f"send_document attempt {attempt+1} failed: {e}")
-                time.sleep(1)
-        bot.answer_callback_query(c.id, "Failed to send log after retries")
+                logger.warning(f"Failed to read {path}: {e}")
+    if not combined.strip():
+        safe_send(c.message.chat.id, f"📭 *No log output yet* for `{name}`", 'Markdown')
+        return bot.answer_callback_query(c.id, "Empty log")
+    temp_path = os.path.join(LOGS_DIR, f"temp_{uid}_{name}_full.log")
+    try:
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            f.write(combined)
+        with open(temp_path, 'rb') as f:
+            bot.send_document(c.message.chat.id, f,
+                              caption=f"📜 `{name}` full log", parse_mode='Markdown')
+        bot.answer_callback_query(c.id, "Log sent")
     except Exception as e:
-        logger.error(f"Failed to send log: {e}")
+        logger.error(f"Document send failed: {e}")
         bot.answer_callback_query(c.id, f"Error: {str(e)[:40]}")
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('refresh_'))
 def cb_refresh(c):
