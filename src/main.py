@@ -71,7 +71,7 @@ def detect_host_url():
 HOST_URL = detect_host_url()
 
 # ==================== FLASK ====================
-from flask import Flask, send_file, jsonify, abort, request
+from flask import Flask, send_file, send_from_directory, jsonify, abort, request
 from threading import Thread
 
 app = Flask(__name__)
@@ -84,35 +84,12 @@ def home():
             "color:white;padding:50px;'>"
             "<h1>HostingBot</h1><p>by <b>@NottBlac</b> — Running</p></body></html>")
 
-@app.route('/file/<file_hash>')
-def serve_file(file_hash):
-    try:
-        logger.info(f"Serving file hash: {file_hash}")
-        for uid, files in user_files.items():
-            for fname, _ in files:
-                computed = hashlib.md5(f"{uid}_{fname}".encode()).hexdigest()
-                if computed == file_hash:
-                    fpath = os.path.join(get_user_folder(uid), fname)
-                    if os.path.exists(fpath):
-                        logger.info(f"Serving file: {fpath}")
-                        return send_file(fpath, as_attachment=False)
-                    else:
-                        logger.error(f"File path does not exist: {fpath}")
-        # Fallback: try to find by iterating all user folders (in case user_files is out of sync)
-        for uid in os.listdir(UPLOAD_DIR):
-            ufolder = os.path.join(UPLOAD_DIR, uid)
-            if not os.path.isdir(ufolder): continue
-            for fname in os.listdir(ufolder):
-                computed = hashlib.md5(f"{uid}_{fname}".encode()).hexdigest()
-                if computed == file_hash:
-                    fpath = os.path.join(ufolder, fname)
-                    logger.info(f"Fallback serving: {fpath}")
-                    return send_file(fpath, as_attachment=False)
-        logger.warning(f"File not found for hash: {file_hash}")
+@app.route('/file/<uid>/<path:filename>')
+def serve_file(uid, filename):
+    user_dir = os.path.join(UPLOAD_DIR, str(uid))
+    if not os.path.exists(os.path.join(user_dir, filename)):
         return "File not found", 404
-    except Exception as e:
-        logger.error(f"Error serving file {file_hash}: {e}")
-        return "Error", 500
+    return send_from_directory(user_dir, filename)
 
 @app.route('/s/<slug>')
 @app.route('/s/<slug>/<path:subpath>')
@@ -140,16 +117,6 @@ def health():
                     "files": sum(len(f) for f in user_files.values()),
                     "platform": HOST_URL or "local"})
 
-@app.route('/debug/files')
-def debug_files():
-    # Only accessible if request comes from owner (check via query param for simplicity)
-    if request.args.get('key') != str(OWNER_ID):
-        return "Unauthorized", 403
-    result = {}
-    for uid, files in user_files.items():
-        result[str(uid)] = [{"name": n, "type": t} for n, t in files]
-    return jsonify(result)
-
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
@@ -159,8 +126,9 @@ def keep_alive():
     t.start()
 
 def get_file_url(uid, name):
-    if not HOST_URL: return None
-    return f"{HOST_URL}/file/{hashlib.md5(f'{uid}_{name}'.encode()).hexdigest()}"
+    if not HOST_URL:
+        return None
+    return f"{HOST_URL}/file/{uid}/{name}"
 
 def get_site_url(slug):
     if not HOST_URL: return None
@@ -2138,10 +2106,12 @@ def cb_logs(c):
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('getlogtxt_'))
 def cb_getlogtxt(c):
-    parts = c.data.split('_', 2); uid, name = int(parts[1]), parts[2]
+    parts = c.data.split('_', 2)
+    uid, name = int(parts[1]), parts[2]
     if c.from_user.id != uid and c.from_user.id not in admins:
         return bot.answer_callback_query(c.id, "❌ Access denied")
-    if not file_exists_check(uid, name, c): return
+    if not file_exists_check(uid, name, c):
+        return
     key = f"{uid}_{name}"
     if key not in scripts:
         return bot.answer_callback_query(c.id, "No logs")
@@ -2152,21 +2122,30 @@ def cb_getlogtxt(c):
         if path and os.path.exists(path):
             try:
                 with open(path, 'r', errors='ignore') as f:
-                    content = f.read().strip()
+                    content = f.read()
                     if content:
-                        combined += f"--- {os.path.basename(path)} ---\n{content}\n\n"
+                        combined += content
             except Exception as e:
                 logger.warning(f"Failed to read {path}: {e}")
+
     if not combined.strip():
         safe_send(c.message.chat.id, f"📭 *No log output yet* for `{name}`", 'Markdown')
         return bot.answer_callback_query(c.id, "Empty log")
-    temp_path = os.path.join(LOGS_DIR, f"temp_{uid}_{name}_full.log")
+
+    # Truncate to last ~49.5 MB to avoid Telegram limit (max 50 MB)
+    MAX_BYTES = 49_500_000
+    if len(combined.encode('utf-8')) > MAX_BYTES:
+        # Keep latest bytes
+        combined = combined.encode('utf-8')[-MAX_BYTES:].decode('utf-8', errors='ignore')
+
+    # Create a clean log file named exactly as the original file + .log
+    log_filename = f"{name}.log"
+    temp_path = os.path.join(LOGS_DIR, log_filename)
     try:
         with open(temp_path, 'w', encoding='utf-8') as f:
             f.write(combined)
         with open(temp_path, 'rb') as f:
-            bot.send_document(c.message.chat.id, f,
-                              caption=f"📜 `{name}` full log", parse_mode='Markdown')
+            bot.send_document(c.message.chat.id, f)
         bot.answer_callback_query(c.id, "Log sent")
     except Exception as e:
         logger.error(f"Document send failed: {e}")
