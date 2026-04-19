@@ -20,6 +20,7 @@ import sys
 import atexit
 import hashlib
 import threading
+import glob
 
 # ==================== CONFIGURATION ====================
 TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -270,27 +271,72 @@ def get_user_tier(uid):
     return "👤 Free"
 
 def kill_process_tree(pid):
+    """Forcefully kill a process and all its children."""
     try:
         parent = psutil.Process(pid)
-        for child in parent.children(recursive=True):
-            try: child.kill()
-            except: pass
-        parent.kill()
+        children = parent.children(recursive=True)
+        for child in children:
+            try:
+                child.terminate()
+            except:
+                pass
+        parent.terminate()
+        # Give them time to terminate gracefully
+        gone, alive = psutil.wait_procs(children + [parent], timeout=3)
+        for p in alive:
+            try:
+                p.kill()
+            except:
+                pass
         return True
-    except: return False
+    except psutil.NoSuchProcess:
+        return True
+    except Exception as e:
+        logger.error(f"kill_process_tree error: {e}")
+        return False
+
+def cleanup_pyrogram_sessions(folder):
+    """Delete any .session and .session-journal files in the folder."""
+    try:
+        for pattern in ['*.session', '*.session-journal']:
+            for f in glob.glob(os.path.join(folder, pattern)):
+                try:
+                    os.remove(f)
+                    logger.info(f"Cleaned up session file: {f}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove {f}: {e}")
+    except Exception as e:
+        logger.error(f"cleanup_pyrogram_sessions error: {e}")
 
 def stop_script(uid, name):
+    """Stop a running script and clean up its session files."""
     key = f"{uid}_{name}"
-    if key in scripts and scripts[key].get('process'):
-        try:
-            scripts[key]['stopped_intentionally'] = True
-            scripts[key]['running'] = False
-            kill_process_tree(scripts[key]['process'].pid)
-            try: scripts[key]['process'].wait(timeout=2)
-            except: pass
-            return True
-        except: pass
-    return False
+    stopped = False
+    
+    if key in scripts:
+        scripts[key]['stopped_intentionally'] = True
+        scripts[key]['running'] = False
+        
+        if scripts[key].get('process'):
+            try:
+                kill_process_tree(scripts[key]['process'].pid)
+                stopped = True
+            except Exception as e:
+                logger.error(f"Error stopping process for {key}: {e}")
+    
+    # Clean up Pyrogram session files in the user's folder
+    folder = get_user_folder(uid)
+    base_name = os.path.splitext(name)[0]
+    cleanup_pyrogram_sessions(folder)
+    
+    # Also clean up any session files in the current working directory
+    # (some scripts create sessions in cwd)
+    cleanup_pyrogram_sessions(os.getcwd())
+    
+    # Wait a moment for port/file locks to release
+    time.sleep(0.5)
+    
+    return stopped
 
 def is_running(uid, name):
     key = f"{uid}_{name}"
@@ -1056,13 +1102,11 @@ def _run_shell_cmd(message, cmd_text):
     try:
         info = _get_or_create_shell(uid)
 
-        # If previous command is waiting for input, pipe this as stdin silently
         if info.get('waiting_input') and info['process'].poll() is None:
             info['waiting_input'] = False
             try:
                 info['process'].stdin.write(cmd_text + '\n')
                 info['process'].stdin.flush()
-                # No message sent for input
             except BrokenPipeError:
                 _kill_shell(uid)
                 safe_reply(message, "❌ Shell died. Send a command to reopen.", 'Markdown', exit_mk)
@@ -1077,7 +1121,7 @@ def _run_shell_cmd(message, cmd_text):
         info['process'].stdin.flush()
 
         collected = []
-        deadline  = time.time() + 10   # reduced timeout for responsiveness
+        deadline  = time.time() + 10
         last_edit = time.time()
 
         while time.time() < deadline:
@@ -1106,13 +1150,11 @@ def _run_shell_cmd(message, cmd_text):
             visible = [l for l in collected if sentinel not in l]
             preview = "".join(visible)[-2500:].strip()
             display = f"```\n{preview}\n```" if preview else ""
-            # No extra "waiting for input" text, just show current output
             try:
                 safe_edit(status.chat.id, status.message_id,
                           f"`$ {cmd_text}`\n\n{display}", 'Markdown', exit_mk)
             except: pass
 
-        # Log command
         try:
             visible_out = "".join([l for l in collected if sentinel not in l])[:500]
             conn = sqlite3.connect(DB_PATH)
@@ -1790,7 +1832,6 @@ def cb_confirm_restart(c):
             with open(marker, 'w') as f:
                 json.dump({'chat_id': chat_id, 'msg_id': msg_id}, f)
         except: pass
-        # Replace the current process with a fresh one
         os.execv(sys.executable, ['python'] + sys.argv)
     threading.Thread(target=_do, daemon=False).start()
 
@@ -1864,14 +1905,22 @@ def handle_upload(message):
                          "Telegram served a cached copy — no changes found.\n"
                          "Rename the file slightly and re-upload.", 'Markdown')
                 return
+            # Force stop old script and clean up session files
             old_key = f"{uid}_{name}"
-            if old_key in scripts: scripts[old_key]['stopped_intentionally'] = True
+            if old_key in scripts:
+                scripts[old_key]['stopped_intentionally'] = True
             stop_script(uid, name)
             for d in os.listdir(EXTRACT_DIR):
                 if d.startswith(f"{uid}_"):
                     shutil.rmtree(os.path.join(EXTRACT_DIR, d), ignore_errors=True)
-            if old_key in scripts: del scripts[old_key]
-            os.remove(old_path)
+            if old_key in scripts:
+                del scripts[old_key]
+            # Wait for file locks to release
+            time.sleep(1)
+            try:
+                os.remove(old_path)
+            except Exception as e:
+                logger.warning(f"Could not remove old file {old_path}: {e}")
 
         if uid == OWNER_ID or uid in admins:
             safe_file, scan = True, "Trusted"
