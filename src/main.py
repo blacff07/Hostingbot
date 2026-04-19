@@ -71,7 +71,7 @@ def detect_host_url():
 HOST_URL = detect_host_url()
 
 # ==================== FLASK ====================
-from flask import Flask, send_file, send_from_directory, jsonify, abort, request
+from flask import Flask, send_file, send_from_directory, jsonify, abort
 from threading import Thread
 
 app = Flask(__name__)
@@ -156,7 +156,7 @@ user_envs       = {}   # uid -> {filename -> {KEY: VALUE}}
 site_slugs      = {}   # uid -> {filename -> slug}
 waiting_slug    = {}   # uid -> {name, uid}
 waiting_env     = {}   # uid -> {step, name, key, chat_id, msg_id}
-banned_users    = set()  # uid -> banned from using bot
+banned_users    = set()
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -358,7 +358,6 @@ def get_user_first_seen(uid):
     return "Unknown"
 
 def get_user_env(uid, name):
-    """Build a clean env for user scripts — strips all host secrets."""
     safe_env = {
         'PATH': os.environ.get('PATH', '/usr/bin:/bin:/usr/local/bin'),
         'HOME': get_user_folder(uid),
@@ -422,45 +421,45 @@ _DANGEROUS_STRINGS = [
 ]
 
 _DANGEROUS_REGEX = [
-    (re.compile(r'\bos\.listdir\s*\('),          'os.listdir'),
-    (re.compile(r'\bos\.walk\s*\('),             'os.walk'),
-    (re.compile(r'\bos\.scandir\s*\('),          'os.scandir'),
-    (re.compile(r'\bos\.getcwd\s*\('),           'os.getcwd'),
-    (re.compile(r'\bos\.chdir\s*\('),            'os.chdir'),
-    (re.compile(r'\bos\.environ\b'),             'os.environ'),
-    (re.compile(r'\bos\.getenv\s*\('),           'os.getenv'),
-    (re.compile(r'\bos\.path\.abspath\s*\('),    'os.path.abspath'),
-    (re.compile(r'\bos\.system\s*\('),           'os.system'),
-    (re.compile(r'\bos\.popen\s*\('),            'os.popen'),
-    (re.compile(r'\bos\.remove\s*\('),           'os.remove'),
-    (re.compile(r'\bopen\s*\('),                 'open()'),
-    (re.compile(r'\bsubprocess\s*\.'),           'subprocess'),
-    (re.compile(r'\bimport\s+subprocess\b'),     'import subprocess'),
-    (re.compile(r'\bfrom\s+subprocess\b'),       'from subprocess'),
-    (re.compile(r'\bimport\s+socket\b'),         'import socket'),
-    (re.compile(r'\bfrom\s+socket\b'),           'from socket'),
-    (re.compile(r'\brequests\s*\.'),             'requests'),
-    (re.compile(r'\bhttpx\s*\.'),                'httpx'),
-    (re.compile(r'\baiohttp\s*\.'),              'aiohttp'),
-    (re.compile(r'\burllib\s*\.'),               'urllib'),
-    (re.compile(r'\bhttp\.client\b'),            'http.client'),
-    (re.compile(r'\bsend_document\s*\('),        'send_document'),
-    (re.compile(r'\bsend_photo\s*\('),           'send_photo'),
-    (re.compile(r'\bsend_video\s*\('),           'send_video'),
-    (re.compile(r'\bsend_audio\s*\('),           'send_audio'),
-    (re.compile(r'\bsend_file\s*\('),            'send_file'),
-    (re.compile(r'\bsend_media_group\s*\('),     'send_media_group'),
-    (re.compile(r'\bzipfile\s*\.'),              'zipfile'),
-    (re.compile(r'\bimport\s+zipfile\b'),        'import zipfile'),
-    (re.compile(r'\btarfile\s*\.'),              'tarfile'),
-    (re.compile(r'\bshutil\.copy\b'),            'shutil.copy'),
-    (re.compile(r'\bshutil\.move\b'),            'shutil.move'),
-    (re.compile(r'\bshutil\.make_archive\b'),    'shutil.make_archive'),
-    (re.compile(r'\beval\s*\('),                 'eval()'),
-    (re.compile(r'\bexec\s*\('),                 'exec()'),
-    (re.compile(r'\b__import__\s*\('),           '__import__'),
-    (re.compile(r'\bimportlib\b'),               'importlib'),
-    (re.compile(r'\bcompile\s*\('),              'compile()'),
+    (re.compile(r'\bos\.listdir\s*\('), 'os.listdir'),
+    (re.compile(r'\bos\.walk\s*\('), 'os.walk'),
+    (re.compile(r'\bos\.scandir\s*\('), 'os.scandir'),
+    (re.compile(r'\bos\.getcwd\s*\('), 'os.getcwd'),
+    (re.compile(r'\bos\.chdir\s*\('), 'os.chdir'),
+    (re.compile(r'\bos\.environ\b'), 'os.environ'),
+    (re.compile(r'\bos\.getenv\s*\('), 'os.getenv'),
+    (re.compile(r'\bos\.path\.abspath\s*\('), 'os.path.abspath'),
+    (re.compile(r'\bos\.system\s*\('), 'os.system'),
+    (re.compile(r'\bos\.popen\s*\('), 'os.popen'),
+    (re.compile(r'\bos\.remove\s*\('), 'os.remove'),
+    (re.compile(r'\bopen\s*\('), 'open()'),
+    (re.compile(r'\bsubprocess\s*\.'), 'subprocess'),
+    (re.compile(r'\bimport\s+subprocess\b'), 'import subprocess'),
+    (re.compile(r'\bfrom\s+subprocess\b'), 'from subprocess'),
+    (re.compile(r'\bimport\s+socket\b'), 'import socket'),
+    (re.compile(r'\bfrom\s+socket\b'), 'from socket'),
+    (re.compile(r'\brequests\s*\.'), 'requests'),
+    (re.compile(r'\bhttpx\s*\.'), 'httpx'),
+    (re.compile(r'\baiohttp\s*\.'), 'aiohttp'),
+    (re.compile(r'\burllib\s*\.'), 'urllib'),
+    (re.compile(r'\bhttp\.client\b'), 'http.client'),
+    (re.compile(r'\bsend_document\s*\('), 'send_document'),
+    (re.compile(r'\bsend_photo\s*\('), 'send_photo'),
+    (re.compile(r'\bsend_video\s*\('), 'send_video'),
+    (re.compile(r'\bsend_audio\s*\('), 'send_audio'),
+    (re.compile(r'\bsend_file\s*\('), 'send_file'),
+    (re.compile(r'\bsend_media_group\s*\('), 'send_media_group'),
+    (re.compile(r'\bzipfile\s*\.'), 'zipfile'),
+    (re.compile(r'\bimport\s+zipfile\b'), 'import zipfile'),
+    (re.compile(r'\btarfile\s*\.'), 'tarfile'),
+    (re.compile(r'\bshutil\.copy\b'), 'shutil.copy'),
+    (re.compile(r'\bshutil\.move\b'), 'shutil.move'),
+    (re.compile(r'\bshutil\.make_archive\b'), 'shutil.make_archive'),
+    (re.compile(r'\beval\s*\('), 'eval()'),
+    (re.compile(r'\bexec\s*\('), 'exec()'),
+    (re.compile(r'\b__import__\s*\('), '__import__'),
+    (re.compile(r'\bimportlib\b'), 'importlib'),
+    (re.compile(r'\bcompile\s*\('), 'compile()'),
 ]
 
 def _scan_content(content):
@@ -1057,12 +1056,13 @@ def _run_shell_cmd(message, cmd_text):
     try:
         info = _get_or_create_shell(uid)
 
+        # If previous command is waiting for input, pipe this as stdin silently
         if info.get('waiting_input') and info['process'].poll() is None:
             info['waiting_input'] = False
             try:
                 info['process'].stdin.write(cmd_text + '\n')
                 info['process'].stdin.flush()
-                safe_reply(message, f"📥 Input sent: `{cmd_text}`", 'Markdown', exit_mk)
+                # No message sent for input
             except BrokenPipeError:
                 _kill_shell(uid)
                 safe_reply(message, "❌ Shell died. Send a command to reopen.", 'Markdown', exit_mk)
@@ -1077,11 +1077,11 @@ def _run_shell_cmd(message, cmd_text):
         info['process'].stdin.flush()
 
         collected = []
-        deadline  = time.time() + 30
+        deadline  = time.time() + 10   # reduced timeout for responsiveness
         last_edit = time.time()
 
         while time.time() < deadline:
-            time.sleep(0.3)
+            time.sleep(0.2)
             with info['lock']:
                 new_lines = info['output_lines'].copy()
                 info['output_lines'].clear()
@@ -1091,7 +1091,7 @@ def _run_shell_cmd(message, cmd_text):
             visible = [l for l in collected if sentinel not in l]
 
             now = time.time()
-            if now - last_edit >= 1.5 or done:
+            if now - last_edit >= 1.0 or done:
                 preview = "".join(visible)[-2500:].strip()
                 display = f"```\n{preview}\n```" if preview else "✅ No output"
                 try:
@@ -1106,17 +1106,13 @@ def _run_shell_cmd(message, cmd_text):
             visible = [l for l in collected if sentinel not in l]
             preview = "".join(visible)[-2500:].strip()
             display = f"```\n{preview}\n```" if preview else ""
-            msg = (f"`$ {cmd_text}`\n\n{display}\n\n"
-                   f"⏱️ *Waiting for input or still running*\n"
-                   f"Send your response \\(e\\.g\\. `Y` or `n`\\) or wait\\.")
+            # No extra "waiting for input" text, just show current output
             try:
-                safe_edit(status.chat.id, status.message_id, msg, 'MarkdownV2', exit_mk)
-            except:
-                try: safe_edit(status.chat.id, status.message_id,
-                               f"`$ {cmd_text}`\n\n{display}\n\n⏱️ Waiting for input — send your response.",
-                               'Markdown', exit_mk)
-                except: pass
+                safe_edit(status.chat.id, status.message_id,
+                          f"`$ {cmd_text}`\n\n{display}", 'Markdown', exit_mk)
+            except: pass
 
+        # Log command
         try:
             visible_out = "".join([l for l in collected if sentinel not in l])[:500]
             conn = sqlite3.connect(DB_PATH)
@@ -1142,7 +1138,7 @@ def cmd_shell(message):
         _get_or_create_shell(uid)
         mk = types.InlineKeyboardMarkup()
         mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
-        safe_reply(message, "💻 *Shell Active*\nSend commands directly. Multiple lines supported.\nShell is persistent — `Y/n` prompts work.", 'Markdown', mk)
+        safe_reply(message, "💻 *Shell Active*\nSend commands directly. Multiple lines supported.", 'Markdown', mk)
 
 @bot.callback_query_handler(func=lambda c: c.data == "exit_shell")
 def cb_exit_shell(c):
@@ -1392,7 +1388,6 @@ def cb_getbotlogtxt(c):
         if not content.strip():
             safe_send(c.message.chat.id, "📭 *No log output yet*", 'Markdown')
             return bot.answer_callback_query(c.id, "Empty log")
-        # Truncate to ~49.5 MB
         MAX_BYTES = 49_500_000
         if len(content.encode('utf-8')) > MAX_BYTES:
             content = content.encode('utf-8')[-MAX_BYTES:].decode('utf-8', errors='ignore')
@@ -1795,7 +1790,8 @@ def cb_confirm_restart(c):
             with open(marker, 'w') as f:
                 json.dump({'chat_id': chat_id, 'msg_id': msg_id}, f)
         except: pass
-        os._exit(0)
+        # Replace the current process with a fresh one
+        os.execv(sys.executable, ['python'] + sys.argv)
     threading.Thread(target=_do, daemon=False).start()
 
 # ==================== BROADCAST ====================
