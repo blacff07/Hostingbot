@@ -332,7 +332,6 @@ def stop_script(uid, name):
     cleanup_pyrogram_sessions(folder)
     
     # Also clean up any session files in the current working directory
-    # (some scripts create sessions in cwd)
     cleanup_pyrogram_sessions(os.getcwd())
     
     # Wait a moment for port/file locks to release
@@ -459,6 +458,25 @@ def extract_error_snippet(stderr, stdout=""):
     snippet = tb.group(1).strip() if tb else "\n".join(text.splitlines()[-30:]).strip()
     return ("..." + snippet[-1800:]) if len(snippet) > 1800 else snippet
 
+# ==================== VENV MANAGEMENT ====================
+def get_script_venv(uid, script_name):
+    """Get or create a per‑script virtual environment."""
+    safe = re.sub(r'[^\w]', '_', script_name)
+    venv_dir = os.path.join(get_user_folder(uid), f'.venv_{safe}')
+    venv_python = os.path.join(venv_dir, 'bin', 'python')
+    if not os.path.exists(venv_python):
+        subprocess.run([sys.executable, '-m', 'venv', '--clear', venv_dir],
+                       capture_output=True, timeout=60)
+    return venv_dir, venv_python
+
+def cleanup_script_venv(uid, script_name):
+    """Delete the virtual environment for a script."""
+    safe = re.sub(r'[^\w]', '_', script_name)
+    venv_dir = os.path.join(get_user_folder(uid), f'.venv_{safe}')
+    if os.path.exists(venv_dir):
+        shutil.rmtree(venv_dir, ignore_errors=True)
+        logger.info(f"Cleaned up venv: {venv_dir}")
+
 # ==================== SECURITY ====================
 _DANGEROUS_STRINGS = [
     'rm -rf', 'fdisk', 'mkfs', 'dd if=', 'shutdown', 'reboot', 'halt',
@@ -555,11 +573,12 @@ def is_website_zip(zip_path):
     except: return False
 
 # ==================== DEPENDENCY INSTALLER ====================
-def install_deps(file_path, ext, folder, installed=None):
+def install_deps(file_path, ext, folder, uid, script_name, installed=None):
     if installed is None: installed = set()
     new = set(); msgs = []
     try:
         if ext in ('.py', '.pyw'):
+            venv_dir, venv_python = get_script_venv(uid, script_name)
             with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
             pkg_map = {
                 'requests':'requests','flask':'flask','django':'django',
@@ -570,18 +589,28 @@ def install_deps(file_path, ext, folder, installed=None):
                 'telethon':'telethon','cryptg':'cryptg','yaml':'pyyaml',
                 'dotenv':'python-dotenv','psutil':'psutil','cryptography':'cryptography',
                 'aiohttp':'aiohttp','fastapi':'fastapi','uvicorn':'uvicorn',
-                'sqlalchemy':'sqlalchemy','pymongo':'pymongo','redis':'redis','pydantic':'pydantic'
+                'sqlalchemy':'sqlalchemy','pymongo':'pymongo','redis':'redis','pydantic':'pydantic',
+                'tgcalls':'py-tgcalls','py_tgcalls':'py-tgcalls',
             }
             for imp in re.findall(r'(?:from\s+(\w+)|import\s+(\w+))', content):
                 mod = imp[0] or imp[1]
                 pkg = pkg_map.get(mod)
                 if pkg and pkg not in installed and pkg not in new:
                     try:
-                        r = subprocess.run([sys.executable,'-m','pip','install','--quiet',pkg],
-                                           capture_output=True, text=True, timeout=30)
+                        r = subprocess.run([venv_python, '-m', 'pip', 'install', '--quiet', pkg],
+                                           capture_output=True, text=True, timeout=60)
                         if r.returncode == 0: msgs.append(f"✅ {pkg}"); new.add(pkg)
                         else: msgs.append(f"❌ {pkg}")
                     except: msgs.append(f"⚠️ {pkg}")
+            # Handle requirements.txt if present in the same folder
+            req_file = os.path.join(folder, 'requirements.txt')
+            if os.path.exists(req_file):
+                r = subprocess.run([venv_python, '-m', 'pip', 'install', '--quiet', '-r', req_file],
+                                   capture_output=True, text=True, timeout=120)
+                if r.returncode == 0:
+                    msgs.append("✅ requirements.txt installed")
+                else:
+                    msgs.append("⚠️ requirements.txt failed")
         elif ext in ('.js', '.mjs', '.cjs'):
             pjson = os.path.join(folder, 'package.json')
             if not os.path.exists(pjson):
@@ -861,7 +890,7 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
                           f"{icon} *{lang}* — `{display_name}`\n⚙️ Starting...", 'Markdown')
 
         installed = set()
-        deps, new = install_deps(file_path, ext, folder)
+        deps, new = install_deps(file_path, ext, folder, uid, display_name)
         installed.update(new)
         if deps and msg:
             dep_text = "\n".join(deps[:4]) + (f"\n+{len(deps)-4} more" if len(deps) > 4 else "")
@@ -869,19 +898,22 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
                       f"{icon} *{lang}* — `{display_name}`\n📦 Deps:\n{dep_text}", 'Markdown')
 
         if ext in ('.py', '.pyw'):
-            cmd = [sys.executable, file_path]
+            venv_dir, venv_python = get_script_venv(uid, display_name)
+            cmd = [venv_python, file_path]
         elif ext in ('.js', '.mjs', '.cjs'):
             cmd = ['node', file_path]
         elif ext == '.java':
             classname = os.path.splitext(name)[0]
-            r = subprocess.run(['javac', file_path], capture_output=True, text=True, timeout=60)
+            compile_dir = os.path.join(TEMP_DIR, f"{uid}_{display_name}")
+            os.makedirs(compile_dir, exist_ok=True)
+            r = subprocess.run(['javac', '-d', compile_dir, file_path], capture_output=True, text=True, timeout=60)
             if r.returncode != 0:
                 if msg: safe_edit(msg.chat.id, msg.message_id,
                                   f"❌ *Java compile failed*\n```\n{r.stderr[:400]}\n```", 'Markdown')
                 return False, "Java compile failed"
-            cmd = ['java', '-cp', os.path.dirname(file_path), classname]
+            cmd = ['java', '-cp', compile_dir, classname]
         elif ext in ('.cpp', '.cc', '.cxx', '.c'):
-            out  = os.path.join(folder, os.path.splitext(name)[0] + '.out')
+            out  = os.path.join(TEMP_DIR, f"{uid}_{display_name}.out")
             comp = 'g++' if ext in ('.cpp', '.cc', '.cxx') else 'gcc'
             r = subprocess.run([comp, file_path, '-o', out], capture_output=True, text=True, timeout=60)
             if r.returncode != 0:
@@ -892,7 +924,7 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
         elif ext == '.go':
             cmd = ['go', 'run', file_path]
         elif ext == '.rs':
-            out = os.path.join(folder, os.path.splitext(name)[0] + '.out')
+            out = os.path.join(TEMP_DIR, f"{uid}_{display_name}.out")
             r = subprocess.run(['rustc', file_path, '-o', out], capture_output=True, text=True, timeout=60)
             if r.returncode != 0:
                 if msg: safe_edit(msg.chat.id, msg.message_id,
@@ -928,7 +960,7 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
         elif ext == '.swift':
             cmd = ['swift', file_path]
         elif ext == '.kt':
-            jar = os.path.join(folder, os.path.splitext(name)[0] + '.jar')
+            jar = os.path.join(TEMP_DIR, f"{uid}_{display_name}.jar")
             r = subprocess.run(['kotlinc', file_path, '-include-runtime', '-d', jar],
                                capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
@@ -937,17 +969,19 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
                 return False, "Kotlin compile failed"
             cmd = ['java', '-jar', jar]
         elif ext == '.scala':
-            r = subprocess.run(['scalac', file_path, '-d', folder],
+            compile_dir = os.path.join(TEMP_DIR, f"{uid}_{display_name}")
+            os.makedirs(compile_dir, exist_ok=True)
+            r = subprocess.run(['scalac', '-d', compile_dir, file_path],
                                capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
                 if msg: safe_edit(msg.chat.id, msg.message_id,
                                   f"❌ *Scala compile failed*\n```\n{r.stderr[:400]}\n```", 'Markdown')
                 return False, "Scala compile failed"
-            cmd = ['scala', '-cp', folder, os.path.splitext(name)[0]]
+            cmd = ['scala', '-cp', compile_dir, os.path.splitext(name)[0]]
         elif ext in ('.ex', '.exs'):
             cmd = ['elixir', file_path]
         elif ext == '.hs':
-            out = os.path.join(folder, os.path.splitext(name)[0])
+            out = os.path.join(TEMP_DIR, f"{uid}_{display_name}.out")
             r = subprocess.run(['ghc', file_path, '-o', out],
                                capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
@@ -982,15 +1016,21 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
                             'cv2':'opencv-python','PIL':'Pillow','bs4':'beautifulsoup4',
                             'yaml':'pyyaml','dotenv':'python-dotenv','flask':'flask',
                             'django':'django','requests':'requests','numpy':'numpy',
-                            'pandas':'pandas','aiohttp':'aiohttp','fastapi':'fastapi'
+                            'pandas':'pandas','aiohttp':'aiohttp','fastapi':'fastapi',
+                            'tgcalls':'py-tgcalls','py_tgcalls':'py-tgcalls',
                         }
                         pkg = aliases.get(mod, mod)
                         if pkg not in installed:
                             if msg: safe_edit(msg.chat.id, msg.message_id,
                                               f"{icon} *{lang}* — `{display_name}`\n📦 Installing `{pkg}`...",
                                               'Markdown')
-                            subprocess.run([sys.executable, '-m', 'pip', 'install', '--quiet', pkg],
-                                           capture_output=True, text=True, timeout=60)
+                            if ext in ('.py', '.pyw'):
+                                venv_dir, venv_python = get_script_venv(uid, display_name)
+                                subprocess.run([venv_python, '-m', 'pip', 'install', '--quiet', pkg],
+                                               capture_output=True, text=True, timeout=60)
+                            else:
+                                subprocess.run([sys.executable, '-m', 'pip', 'install', '--quiet', pkg],
+                                               capture_output=True, text=True, timeout=60)
                             installed.add(pkg)
                             continue
 
@@ -1369,7 +1409,7 @@ def cmd_help(message):
         lines.append("`/broadcast <msg>` — Broadcast to all users")
     if is_owner:
         lines.append("`/restart` — Wipe all data & restart bot\n`/botlogs` — View bot logs")
-    lines.append("\n*Features*\n30+ languages • Auto deps • Background hosting\nLive logs • Crash DMs • Mid-run error alerts\nZIP websites • Custom slugs • Env vars\nGitHub cloning")
+    lines.append("\n*Features*\n30+ languages • Auto deps • Background hosting\nLive logs • Crash DMs • Mid-run error alerts\nZIP websites • Custom slugs • Env vars\nGitHub cloning • Per‑script virtual environments")
     safe_reply(message, "\n".join(lines), 'Markdown')
 
 # ==================== GITHUB CLONING ====================
@@ -1875,6 +1915,8 @@ def cmd_delete_file(message):
             conn.commit(); conn.close()
         except: pass
         if key in scripts: del scripts[key]
+        # Clean up venv
+        cleanup_script_venv(target_uid, fname)
         safe_reply(message, f"✅ *Deleted* `{fname}` from uid `{target_uid}`", 'Markdown')
         try: bot.send_message(target_uid, f"🗑️ *File removed by admin:* `{fname}`", 'Markdown')
         except: pass
@@ -2016,6 +2058,8 @@ def handle_upload(message):
                     shutil.rmtree(os.path.join(EXTRACT_DIR, d), ignore_errors=True)
             if old_key in scripts:
                 del scripts[old_key]
+            # Clean up old venv
+            cleanup_script_venv(uid, name)
             # Wait for file locks to release
             time.sleep(1)
             try:
@@ -2447,6 +2491,9 @@ def cb_delete(c):
                 try: os.remove(lp)
                 except: pass
         del scripts[key]
+
+    # Clean up venv
+    cleanup_script_venv(uid, name)
 
     bot.answer_callback_query(c.id, "✅ Deleted")
     files = user_files.get(uid, [])
