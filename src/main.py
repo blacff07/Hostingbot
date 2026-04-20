@@ -21,6 +21,7 @@ import atexit
 import hashlib
 import threading
 import glob
+import tempfile
 
 # ==================== CONFIGURATION ====================
 TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -39,6 +40,7 @@ LOGS_DIR    = os.path.join(BASE_DIR, 'logs')
 PENDING_DIR = os.path.join(BASE_DIR, 'pending')
 EXTRACT_DIR = os.path.join(BASE_DIR, 'extracted')
 SITES_DIR   = os.path.join(BASE_DIR, 'sites')
+TEMP_DIR    = os.path.join(BASE_DIR, 'temp')
 
 # Limits
 FREE_LIMIT  = 5
@@ -46,7 +48,7 @@ SUB_LIMIT   = 25
 ADMIN_LIMIT = 999
 OWNER_LIMIT = float('inf')
 
-for _d in [UPLOAD_DIR, DB_DIR, LOGS_DIR, PENDING_DIR, EXTRACT_DIR, SITES_DIR]:
+for _d in [UPLOAD_DIR, DB_DIR, LOGS_DIR, PENDING_DIR, EXTRACT_DIR, SITES_DIR, TEMP_DIR]:
     os.makedirs(_d, exist_ok=True)
 
 # ==================== PLATFORM AUTO-DETECT ====================
@@ -199,7 +201,7 @@ def clear_old_data():
             try: kill_process_tree(info['process'].pid)
             except: pass
     scripts.clear()
-    for d in [UPLOAD_DIR, EXTRACT_DIR, PENDING_DIR, SITES_DIR]:
+    for d in [UPLOAD_DIR, EXTRACT_DIR, PENDING_DIR, SITES_DIR, TEMP_DIR]:
         if os.path.exists(d): shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d, exist_ok=True)
     try:
@@ -1354,7 +1356,7 @@ def cmd_help(message):
     is_owner = uid == OWNER_ID
     lines = [
         "📖 *Help*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
-        "`/start` — Home\n`/help` — Help\n`/clone` — Clone this bot\n`/shell [cmd]` — Shell",
+        "`/start` — Home\n`/help` — Help\n`/clone` — Clone this bot\n`/shell [cmd]` — Shell\n`/git <url>` — Host from GitHub",
         "\n*Env Vars*",
         "`/setenv` — Set env var\n`/listenv` — List vars\n`/delenv` — Delete var",
     ]
@@ -1367,8 +1369,107 @@ def cmd_help(message):
         lines.append("`/broadcast <msg>` — Broadcast to all users")
     if is_owner:
         lines.append("`/restart` — Wipe all data & restart bot\n`/botlogs` — View bot logs")
-    lines.append("\n*Features*\n30+ languages • Auto deps • Background hosting\nLive logs • Crash DMs • Mid-run error alerts\nZIP websites • Custom slugs • Env vars")
+    lines.append("\n*Features*\n30+ languages • Auto deps • Background hosting\nLive logs • Crash DMs • Mid-run error alerts\nZIP websites • Custom slugs • Env vars\nGitHub cloning")
     safe_reply(message, "\n".join(lines), 'Markdown')
+
+# ==================== GITHUB CLONING ====================
+def clone_github_repo(url, uid):
+    """Clone a GitHub repository and return path to zipped file."""
+    temp_dir = tempfile.mkdtemp(dir=TEMP_DIR)
+    repo_name = url.rstrip('/').split('/')[-1].replace('.git', '') or "repo"
+    
+    try:
+        # Clone with depth 1 for speed
+        subprocess.run(['git', 'clone', '--depth', '1', url, repo_name],
+                       cwd=temp_dir, check=True, capture_output=True, timeout=60)
+        repo_path = os.path.join(temp_dir, repo_name)
+        
+        # Create zip
+        zip_name = f"{repo_name}.zip"
+        zip_path = os.path.join(temp_dir, zip_name)
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(repo_path):
+                for file in files:
+                    full_path = os.path.join(root, file)
+                    arcname = os.path.relpath(full_path, repo_path)
+                    zf.write(full_path, arcname)
+        
+        return zip_path, repo_name, temp_dir
+    except Exception as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise e
+
+@bot.message_handler(commands=['git'])
+def cmd_git(message):
+    uid = message.from_user.id
+    try:
+        url = message.text.split(' ', 1)[1].strip()
+    except:
+        return safe_reply(message, "❌ Usage: `/git <github_url>`", 'Markdown')
+    process_github_url(message, url)
+
+def process_github_url(message, url):
+    uid = message.from_user.id
+    if uid in banned_users:
+        return safe_reply(message, "🚫 *You are banned from using this bot*", 'Markdown')
+    if bot_locked and uid not in admins:
+        return safe_reply(message, "🔒 *Bot Locked*\nUploads disabled temporarily", 'Markdown')
+    if get_user_count(uid) >= get_user_limit(uid) and uid != OWNER_ID:
+        return safe_reply(message, f"❌ *Limit reached* — max {get_user_limit(uid)} files", 'Markdown')
+
+    status = safe_reply(message, f"⏳ *Cloning from GitHub*\n`{url}`", 'Markdown')
+    try:
+        zip_path, repo_name, temp_dir = clone_github_repo(url, uid)
+        
+        # Process like a regular zip upload
+        if is_website_zip(zip_path):
+            ftype = 'site'
+            name = f"{repo_name}.zip"
+        else:
+            ftype = 'executable'
+            name = f"{repo_name}.zip"
+        
+        # Move to user's folder
+        folder = get_user_folder(uid)
+        final_path = os.path.join(folder, name)
+        
+        # Remove old if exists
+        if os.path.exists(final_path):
+            stop_script(uid, name)
+            os.remove(final_path)
+        
+        shutil.move(zip_path, final_path)
+        
+        # Clean up temp dir
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        # Register file
+        user_files.setdefault(uid, [])
+        user_files[uid] = [(n, t) for n, t in user_files[uid] if n != name]
+        user_files[uid].append((name, ftype))
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute('INSERT OR REPLACE INTO files VALUES (?,?,?)', (uid, name, ftype))
+        conn.commit(); conn.close()
+        
+        if ftype == 'site':
+            safe_edit(status.chat.id, status.message_id, f"🌐 *Extracting website...*\n`{name}`", 'Markdown')
+            handle_zip_website(final_path, uid, name, status)
+        else:
+            safe_edit(status.chat.id, status.message_id, f"🚀 *Launching*\n`{name}`", 'Markdown')
+            execute_script(uid, final_path, status)
+            
+    except subprocess.CalledProcessError as e:
+        error_msg = e.stderr.decode() if e.stderr else str(e)
+        safe_edit(status.chat.id, status.message_id, f"❌ *Git clone failed*\n`{error_msg[:200]}`", 'Markdown')
+    except Exception as e:
+        logger.error(f"Git clone error: {e}", exc_info=True)
+        safe_edit(status.chat.id, status.message_id, f"❌ *Error*\n`{str(e)[:200]}`", 'Markdown')
+
+# Detect GitHub URLs in messages
+@bot.message_handler(func=lambda m: m.text and re.search(r'https?://(?:www\.)?github\.com/[^\s]+', m.text))
+def handle_github_url(message):
+    url = re.search(r'https?://(?:www\.)?github\.com/[^\s]+', message.text).group()
+    process_github_url(message, url)
 
 # ==================== BOT LOGS (OWNER ONLY) ====================
 def get_bot_log_content(max_chars=3500):
@@ -2136,11 +2237,22 @@ def file_exists_check(uid, name, callback_query):
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('file_'))
 def cb_file(c):
-    parts = c.data.split('_', 2); uid, name = int(parts[1]), parts[2]
+    parts = c.data.split('_')
+    if len(parts) == 3:
+        # New index-based: file_uid_idx
+        uid = int(parts[1])
+        idx = int(parts[2])
+        files = user_files.get(uid, [])
+        if idx >= len(files):
+            return bot.answer_callback_query(c.id, "❌ File not found")
+        name, ftype = files[idx]
+    else:
+        # Fallback for old format (may be truncated)
+        return bot.answer_callback_query(c.id, "❌ Invalid callback, please refresh")
+
     if c.from_user.id != uid and c.from_user.id not in admins:
         return bot.answer_callback_query(c.id, "❌ Access denied")
     if not file_exists_check(uid, name, c): return
-    ftype = next((t for n, t in user_files.get(uid, []) if n == name), None)
     path = os.path.join(get_user_folder(uid), name)
     size = fmt_size(os.path.getsize(path)) if os.path.exists(path) else "?"
     if ftype == 'executable':
@@ -2343,11 +2455,11 @@ def cb_delete(c):
                   "📂 *No files*\nSend a file to upload it", 'Markdown'); return
     text = f"📂 *Files* ({len(files)})\n"
     mk = types.InlineKeyboardMarkup(row_width=1)
-    for n, t in files:
+    for i, (n, t) in enumerate(files):
         dot  = "🟢" if t == 'executable' and is_running(uid, n) else ("🌐" if t == 'site' else "⚪")
         icon = "🚀" if t == 'executable' else ("🌐" if t == 'site' else "📄")
         dn   = n if len(n) < 30 else n[:27] + "..."
-        mk.add(types.InlineKeyboardButton(f"{dot} {icon} {dn}", callback_data=f"file_{uid}_{n}"))
+        mk.add(types.InlineKeyboardButton(f"{dot} {icon} {dn}", callback_data=f"file_{uid}_{i}"))
     safe_edit(c.message.chat.id, c.message.message_id, text, 'Markdown', mk)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('back_'))
@@ -2359,11 +2471,11 @@ def cb_back(c):
         return bot.answer_callback_query(c.id)
     text = f"📂 *Files* ({len(files)})\n"
     mk   = types.InlineKeyboardMarkup(row_width=1)
-    for n, t in files:
+    for i, (n, t) in enumerate(files):
         dot  = "🟢" if t == 'executable' and is_running(uid, n) else ("🌐" if t == 'site' else "⚪")
         icon = "🚀" if t == 'executable' else ("🌐" if t == 'site' else "📄")
         dn   = n if len(n) < 30 else n[:27] + "..."
-        mk.add(types.InlineKeyboardButton(f"{dot} {icon} {dn}", callback_data=f"file_{uid}_{n}"))
+        mk.add(types.InlineKeyboardButton(f"{dot} {icon} {dn}", callback_data=f"file_{uid}_{i}"))
     safe_edit(c.message.chat.id, c.message.message_id, text, 'Markdown', mk)
     bot.answer_callback_query(c.id)
 
@@ -2380,11 +2492,11 @@ def btn_files(m):
     if not files: return safe_reply(m, "📂 *No files*\nSend a file to upload it", 'Markdown')
     text = f"📂 *Files* ({len(files)})\n"
     mk   = types.InlineKeyboardMarkup(row_width=1)
-    for n, t in files:
+    for i, (n, t) in enumerate(files):
         dot  = "🟢" if t == 'executable' and is_running(uid, n) else ("🌐" if t == 'site' else "⚪")
         icon = "🚀" if t == 'executable' else ("🌐" if t == 'site' else "📄")
         dn   = n if len(n) < 30 else n[:27] + "..."
-        mk.add(types.InlineKeyboardButton(f"{dot} {icon} {dn}", callback_data=f"file_{uid}_{n}"))
+        mk.add(types.InlineKeyboardButton(f"{dot} {icon} {dn}", callback_data=f"file_{uid}_{i}"))
     safe_reply(m, text, 'Markdown', mk)
 
 @bot.message_handler(func=lambda m: m.text == "👤 Profile")
@@ -2545,7 +2657,7 @@ def btn_admin(m):
             f"Users: `{len(active_users)}`  •  Files: `{sum(len(f) for f in user_files.values())}`\n"
             f"Running: `{total_running}`  •  Pending: `{len(pending)}`  •  Clones: `{clones}`{sys_info}\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-            f"`/shell`  `/broadcast`  `/restart`\n`/addadmin`  `/removeadmin`\n`/addsub`  `/checksub`  `/botlogs`")
+            f"`/shell`  `/broadcast`  `/restart`\n`/addadmin`  `/removeadmin`\n`/addsub`  `/checksub`  `/botlogs`  `/git`")
     safe_reply(m, text, 'Markdown')
 
 @bot.message_handler(func=lambda m: m.text == "💻 Shell")
