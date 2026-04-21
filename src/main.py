@@ -396,6 +396,7 @@ export HOME="{home}"
 export PATH="$HOME/.pyenv/bin:$HOME/.nvm/versions/node/*/bin:$HOME/bin:$PATH"
 export PYENV_ROOT="$HOME/.pyenv"
 export NVM_DIR="$HOME/.nvm"
+export LC_ALL=C.UTF-8
 
 # Initialize pyenv if present
 if [ -d "$PYENV_ROOT" ]; then
@@ -431,6 +432,7 @@ def get_user_env(uid, name=None):
         'NVM_DIR': f"{home}/.nvm",
         'USER': str(uid),
         'LANG': 'en_US.UTF-8',
+        'LC_ALL': 'C.UTF-8',
     }
     if name and uid in user_envs and name in user_envs[uid]:
         env.update(user_envs[uid][name])
@@ -1410,19 +1412,16 @@ def cmd_start(message):
 
 @bot.message_handler(commands=['help'])
 def cmd_help(message):
-    uid = message.from_user.id
     mk = types.InlineKeyboardMarkup()
     mk.row(types.InlineKeyboardButton("📖 General", callback_data="help_general"),
            types.InlineKeyboardButton("⚙️ Advanced", callback_data="help_advanced"))
-    safe_reply(message,
-               "📚 *Help Menu*\nSelect a category below:",
-               'Markdown', mk)
+    # Send General help by default
+    text = get_help_text('general', message.from_user.id)
+    safe_reply(message, text, 'Markdown', mk)
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith('help_'))
-def cb_help(c):
-    data = c.data[5:]
-    if data == 'general':
-        text = (
+def get_help_text(section, uid):
+    if section == 'general':
+        return (
             "📖 *General Help*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             "`/start` – Main menu\n"
             "`/help` – Show this help\n"
@@ -1437,10 +1436,10 @@ def cb_help(c):
             "• Per‑user isolated environment"
         )
     else:  # advanced
-        tier = get_user_tier(c.from_user.id)
-        ram = get_user_ram_limit(c.from_user.id)
+        tier = get_user_tier(uid)
+        ram = get_user_ram_limit(uid)
         ram_str = "Unlimited" if ram is None else f"{ram//(1024**3)} GB"
-        text = (
+        return (
             "⚙️ *Advanced Help*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             "*Your Private VPS*\n"
             f"• Tier: `{tier.capitalize()}`\n"
@@ -1456,7 +1455,15 @@ def cb_help(c):
             "\n*Resource Limits*\n"
             "Free: 1 GB RAM | Premium: 2 GB | Admin: 4 GB | Owner: Unlimited"
         )
-    safe_edit(c.message.chat.id, c.message.message_id, text, 'Markdown')
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('help_'))
+def cb_help(c):
+    section = c.data[5:]  # 'general' or 'advanced'
+    text = get_help_text(section, c.from_user.id)
+    mk = types.InlineKeyboardMarkup()
+    mk.row(types.InlineKeyboardButton("📖 General", callback_data="help_general"),
+           types.InlineKeyboardButton("⚙️ Advanced", callback_data="help_advanced"))
+    safe_edit(c.message.chat.id, c.message.message_id, text, 'Markdown', mk)
     bot.answer_callback_query(c.id)
 
 # ==================== GITHUB CLONING ====================
