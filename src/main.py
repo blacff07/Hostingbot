@@ -439,13 +439,32 @@ def get_user_env(uid, name=None):
     return env
 
 def resource_limits(uid):
-    ram_limit = get_user_ram_limit(uid)
+    tier = get_user_tier(uid)
+    
+    # Owner gets no limits
+    if tier == 'owner':
+        return lambda: None
+    
+    ram_limit = TIER_RAM[tier]
+    cpu_seconds = 3600  # 1 hour
+    
+    if tier == 'free':
+        nproc = 128
+        nofile = 4096
+    elif tier == 'premium':
+        nproc = 256
+        nofile = 8192
+    else:  # admin
+        nproc = 512
+        nofile = 16384
+    
     def set_limits():
         if ram_limit is not None:
             resource.setrlimit(resource.RLIMIT_AS, (ram_limit, ram_limit))
-        resource.setrlimit(resource.RLIMIT_CPU, (3600, 3600))          # 1 hour CPU
-        resource.setrlimit(resource.RLIMIT_FSIZE, (100*1024*1024, 100*1024*1024))  # 100 MB file size
-        resource.setrlimit(resource.RLIMIT_NPROC, (50, 50))            # max 50 processes
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (100*1024*1024, 100*1024*1024))
+        resource.setrlimit(resource.RLIMIT_NPROC, (nproc, nproc))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (nofile, nofile))
     return set_limits
 
 def save_env_var(uid, filename, key, value):
@@ -1435,10 +1454,22 @@ def get_help_text(section, uid):
             "• Websites from ZIP files\n"
             "• Per‑user isolated environment"
         )
-    else:  # advanced
+    else:
         tier = get_user_tier(uid)
         ram = get_user_ram_limit(uid)
         ram_str = "Unlimited" if ram is None else f"{ram//(1024**3)} GB"
+        if tier == 'free':
+            nproc = 128
+            nofile = 4096
+        elif tier == 'premium':
+            nproc = 256
+            nofile = 8192
+        elif tier == 'admin':
+            nproc = 512
+            nofile = 16384
+        else:
+            nproc = "Unlimited"
+            nofile = "Unlimited"
         return (
             "⚙️ *Advanced Help*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             "*Your Private VPS*\n"
@@ -1446,14 +1477,15 @@ def get_help_text(section, uid):
             f"• RAM limit: `{ram_str}`\n"
             f"• CPU limit: `1 hour` per process\n"
             f"• File size limit: `100 MB`\n"
-            f"• Max processes: `50`\n\n"
+            f"• Max processes: `{nproc}`\n"
+            f"• Open files: `{nofile}`\n\n"
             "*Inside your shell*\n"
             "• `pyenv install 3.10.11` – install any Python\n"
             "• `pyenv global 3.10.11` – switch version\n"
             "• `nvm install 18` – install Node.js\n"
             "• `pip install ...`, `npm install ...` – freely\n"
             "\n*Resource Limits*\n"
-            "Free: 1 GB RAM | Premium: 2 GB | Admin: 4 GB | Owner: Unlimited"
+            "Free: 1 GB / 128 procs | Premium: 2 GB / 256 procs | Admin: 4 GB / 512 procs | Owner: Unlimited"
         )
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('help_'))
