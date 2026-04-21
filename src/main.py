@@ -24,8 +24,6 @@ import threading
 import glob
 import tempfile
 import resource
-import pwd
-import grp
 
 # ==================== CONFIGURATION ====================
 TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -54,10 +52,10 @@ OWNER_LIMIT = float('inf')
 
 # Resource limits (RAM in bytes)
 TIER_RAM = {
-    'free': 1024 * 1024 * 1024,      # 1 GB
-    'premium': 2 * 1024 * 1024 * 1024,  # 2 GB
-    'admin': 4 * 1024 * 1024 * 1024,    # 4 GB
-    'owner': None                      # unlimited
+    'free': 1024 * 1024 * 1024,          # 1 GB
+    'premium': 2 * 1024 * 1024 * 1024,   # 2 GB
+    'admin': 4 * 1024 * 1024 * 1024,     # 4 GB
+    'owner': None                        # unlimited
 }
 
 for _d in [UPLOAD_DIR, DB_DIR, LOGS_DIR, PENDING_DIR, EXTRACT_DIR, SITES_DIR, TEMP_DIR]:
@@ -1160,7 +1158,7 @@ def _get_or_create_shell(uid):
         node_versions = os.path.join(nvm_dir, 'versions', 'node')
         if not os.path.exists(node_versions) or not os.listdir(node_versions):
             subprocess.run(['bash', '-c', f'source "{nvm_script}" && nvm install --lts'],
-                           cwd=home, env=env, capture_output=True, timeout=180)
+                           cwd=home, env=env, capture_output=True, timeout=300)
 
     p = subprocess.Popen(
         ['bash', '--rcfile', bashrc],
@@ -1238,7 +1236,7 @@ def _run_shell_cmd(message, cmd_text):
                 display = f"```\n{preview}\n```" if preview else "✅ No output"
                 try:
                     safe_edit(status.chat.id, status.message_id,
-                              f"`$ {cmd_text}`\n\n{display}", 'Markdown', exit_mk)
+                              f"$ `{cmd_text}`\n\n{display}", 'Markdown', exit_mk)
                     last_edit = now
                 except: pass
                 if done: break
@@ -1278,7 +1276,7 @@ def cmd_shell(message):
         _get_or_create_shell(uid)
         mk = types.InlineKeyboardMarkup()
         mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
-        safe_reply(message, "💻 *Shell Active*\nYour private VPS environment is ready.\nUse `pyenv` / `nvm` to manage versions.\nSend commands directly.", 'Markdown', mk)
+        safe_reply(message, "💻 *Shell Active*\nYour private VPS environment is ready.\nUse `pyenv` / `nvm` to manage versions.", 'Markdown', mk)
 
 @bot.callback_query_handler(func=lambda c: c.data == "exit_shell")
 def cb_exit_shell(c):
@@ -1445,15 +1443,6 @@ def cmd_start(message):
                f"Send a file to upload and host it")
     safe_send(message.chat.id, welcome, 'Markdown', build_main_keyboard(uid))
 
-@bot.message_handler(commands=['help'])
-def cmd_help(message):
-    mk = types.InlineKeyboardMarkup()
-    mk.row(types.InlineKeyboardButton("📖 General", callback_data="help_general"),
-           types.InlineKeyboardButton("⚙️ Advanced", callback_data="help_advanced"))
-    # Send General help by default
-    text = get_help_text('general', message.from_user.id)
-    safe_reply(message, text, 'Markdown', mk)
-
 def get_help_text(section, uid):
     if section == 'general':
         return (
@@ -1470,7 +1459,7 @@ def get_help_text(section, uid):
             "• Websites from ZIP files\n"
             "• Per‑user isolated environment"
         )
-    else:
+    else:  # advanced
         tier = get_user_tier(uid)
         ram = get_user_ram_limit(uid)
         ram_str = "Unlimited" if ram is None else f"{ram//(1024**3)} GB"
@@ -1503,6 +1492,14 @@ def get_help_text(section, uid):
             "\n*Resource Limits*\n"
             "Free: 1 GB / 128 procs | Premium: 2 GB / 256 procs | Admin: 4 GB / 512 procs | Owner: Unlimited"
         )
+
+@bot.message_handler(commands=['help'])
+def cmd_help(message):
+    mk = types.InlineKeyboardMarkup()
+    mk.row(types.InlineKeyboardButton("📖 General", callback_data="help_general"),
+           types.InlineKeyboardButton("⚙️ Advanced", callback_data="help_advanced"))
+    text = get_help_text('general', message.from_user.id)
+    safe_reply(message, text, 'Markdown', mk)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('help_'))
 def cb_help(c):
