@@ -1148,15 +1148,19 @@ def _get_or_create_shell(uid):
     info = shell_procs.get(uid)
     if info and info['process'].poll() is None:
         return info
+
     home = setup_user_home(uid)
     bashrc = os.path.join(home, '.bashrc')
     env = get_user_env(uid)
 
-    # Pre‑install latest Node.js LTS if no Node versions are present
-    nvm_node_dir = os.path.join(home, '.nvm', 'versions', 'node')
-    if not os.path.exists(nvm_node_dir) or not os.listdir(nvm_node_dir):
-        subprocess.run(['bash', '-c', 'source "$NVM_DIR/nvm.sh" && nvm install --lts'],
-                       cwd=home, env=env, capture_output=True, timeout=180)
+    # Ensure nvm is installed and install latest Node.js LTS if no versions present
+    nvm_dir = os.path.join(home, '.nvm')
+    nvm_script = os.path.join(nvm_dir, 'nvm.sh')
+    if os.path.exists(nvm_script):
+        node_versions = os.path.join(nvm_dir, 'versions', 'node')
+        if not os.path.exists(node_versions) or not os.listdir(node_versions):
+            subprocess.run(['bash', '-c', f'source "{nvm_script}" && nvm install --lts'],
+                           cwd=home, env=env, capture_output=True, timeout=180)
 
     p = subprocess.Popen(
         ['bash', '--rcfile', bashrc],
@@ -1166,6 +1170,7 @@ def _get_or_create_shell(uid):
     )
     info = {'process': p, 'output_lines': [], 'lock': threading.Lock(), 'waiting_input': False}
     shell_procs[uid] = info
+
     def _reader():
         try:
             for line in p.stdout:
