@@ -425,13 +425,6 @@ alias pip=pip3
         subprocess.run(['git', 'clone', '--depth', '1', 'https://github.com/nvm-sh/nvm.git', nvm_dir],
                        capture_output=True, timeout=60)
 
-    # Pre-install latest Node.js LTS for the user (optional)
-    node_versions = os.path.join(nvm_dir, 'versions', 'node')
-    if not os.path.exists(node_versions) or not os.listdir(node_versions):
-        env = get_user_env(uid)
-        subprocess.run(['bash', '-c', 'source "$NVM_DIR/nvm.sh" && nvm install --lts'],
-                       cwd=home, env=env, capture_output=True, timeout=120)
-
     return home
 
 def get_user_env(uid, name=None):
@@ -1158,6 +1151,13 @@ def _get_or_create_shell(uid):
     home = setup_user_home(uid)
     bashrc = os.path.join(home, '.bashrc')
     env = get_user_env(uid)
+
+    # Pre‑install latest Node.js LTS if no Node versions are present
+    nvm_node_dir = os.path.join(home, '.nvm', 'versions', 'node')
+    if not os.path.exists(nvm_node_dir) or not os.listdir(nvm_node_dir):
+        subprocess.run(['bash', '-c', 'source "$NVM_DIR/nvm.sh" && nvm install --lts'],
+                       cwd=home, env=env, capture_output=True, timeout=180)
+
     p = subprocess.Popen(
         ['bash', '--rcfile', bashrc],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
