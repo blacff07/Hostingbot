@@ -406,21 +406,32 @@ fi
 # Initialize nvm if present
 if [ -d "$NVM_DIR" ]; then
     [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+    [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
 fi
 
 alias python=python3
 alias pip=pip3
 '''.replace('{home}', home))
+
     # Install pyenv if missing
     pyenv_dir = os.path.join(home, '.pyenv')
     if not os.path.exists(pyenv_dir):
         subprocess.run(['git', 'clone', '--depth', '1', 'https://github.com/pyenv/pyenv.git', pyenv_dir],
                        capture_output=True, timeout=60)
+
     # Install nvm if missing
     nvm_dir = os.path.join(home, '.nvm')
     if not os.path.exists(nvm_dir):
         subprocess.run(['git', 'clone', '--depth', '1', 'https://github.com/nvm-sh/nvm.git', nvm_dir],
                        capture_output=True, timeout=60)
+
+    # Pre-install latest Node.js LTS for the user (optional)
+    node_versions = os.path.join(nvm_dir, 'versions', 'node')
+    if not os.path.exists(node_versions) or not os.listdir(node_versions):
+        env = get_user_env(uid)
+        subprocess.run(['bash', '-c', 'source "$NVM_DIR/nvm.sh" && nvm install --lts'],
+                       cwd=home, env=env, capture_output=True, timeout=120)
+
     return home
 
 def get_user_env(uid, name=None):
@@ -1196,7 +1207,7 @@ def _run_shell_cmd(message, cmd_text):
 
         with info['lock']:
             info['output_lines'].clear()
-        status = safe_reply(message, f"`$ {cmd_text}`\n⏳ Running...", 'Markdown', exit_mk)
+        status = safe_reply(message, f"$ `{cmd_text}`\n⏳ Running...", 'Markdown', exit_mk)
         sentinel = f"__DONE_{int(time.time())}__"
         info['process'].stdin.write(cmd_text + '\n')
         info['process'].stdin.write(f"echo {sentinel}\n")
@@ -1234,7 +1245,7 @@ def _run_shell_cmd(message, cmd_text):
             display = f"```\n{preview}\n```" if preview else ""
             try:
                 safe_edit(status.chat.id, status.message_id,
-                          f"`$ {cmd_text}`\n\n{display}", 'Markdown', exit_mk)
+                          f"$ `{cmd_text}`\n\n{display}", 'Markdown', exit_mk)
             except: pass
 
         try:
