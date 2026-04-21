@@ -391,7 +391,7 @@ def setup_user_home(uid):
     bashrc = os.path.join(home, '.bashrc')
     if not os.path.exists(bashrc):
         with open(bashrc, 'w') as f:
-            f.write('''# User private environment
+            f.write(r'''# User private environment
 export HOME="{home}"
 export PATH="$HOME/.pyenv/bin:$HOME/.nvm/versions/node/*/bin:$HOME/bin:$PATH"
 export PYENV_ROOT="$HOME/.pyenv"
