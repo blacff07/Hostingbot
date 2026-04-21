@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 HostingBot — by Blac (@NottBlac)
+A professional multi‑user hosting bot with isolated per‑user VPS environments.
 """
 
 import telebot
@@ -22,6 +23,9 @@ import hashlib
 import threading
 import glob
 import tempfile
+import resource
+import pwd
+import grp
 
 # ==================== CONFIGURATION ====================
 TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -42,11 +46,19 @@ EXTRACT_DIR = os.path.join(BASE_DIR, 'extracted')
 SITES_DIR   = os.path.join(BASE_DIR, 'sites')
 TEMP_DIR    = os.path.join(BASE_DIR, 'temp')
 
-# Limits
+# Limits (tier‑based)
 FREE_LIMIT  = 5
 SUB_LIMIT   = 25
 ADMIN_LIMIT = 999
 OWNER_LIMIT = float('inf')
+
+# Resource limits (RAM in bytes)
+TIER_RAM = {
+    'free': 1024 * 1024 * 1024,      # 1 GB
+    'premium': 2 * 1024 * 1024 * 1024,  # 2 GB
+    'admin': 4 * 1024 * 1024 * 1024,    # 4 GB
+    'owner': None                      # unlimited
+}
 
 for _d in [UPLOAD_DIR, DB_DIR, LOGS_DIR, PENDING_DIR, EXTRACT_DIR, SITES_DIR, TEMP_DIR]:
     os.makedirs(_d, exist_ok=True)
@@ -252,11 +264,27 @@ def get_user_folder(uid):
     os.makedirs(folder, exist_ok=True)
     return folder
 
+def get_user_home(uid):
+    home = os.path.join(get_user_folder(uid), 'home')
+    os.makedirs(home, exist_ok=True)
+    return home
+
+def get_user_tier(uid):
+    if uid == OWNER_ID: return 'owner'
+    if uid in admins: return 'admin'
+    if uid in subscriptions and subscriptions[uid]['expiry'] > datetime.now(): return 'premium'
+    return 'free'
+
 def get_user_limit(uid):
-    if uid == OWNER_ID: return OWNER_LIMIT
-    if uid in admins: return ADMIN_LIMIT
-    if uid in subscriptions and subscriptions[uid]['expiry'] > datetime.now(): return SUB_LIMIT
+    tier = get_user_tier(uid)
+    if tier == 'owner': return OWNER_LIMIT
+    if tier == 'admin': return ADMIN_LIMIT
+    if tier == 'premium': return SUB_LIMIT
     return FREE_LIMIT
+
+def get_user_ram_limit(uid):
+    tier = get_user_tier(uid)
+    return TIER_RAM[tier]
 
 def get_user_count(uid):
     return len(user_files.get(uid, []))
@@ -266,30 +294,18 @@ def fmt_size(sz):
     if sz < 1024*1024: return f"{sz/1024:.1f}KB"
     return f"{sz/(1024*1024):.1f}MB"
 
-def get_user_tier(uid):
-    if uid == OWNER_ID: return "👑 Owner"
-    if uid in admins: return "🛡️ Admin"
-    if uid in subscriptions and subscriptions[uid]['expiry'] > datetime.now(): return "⭐ Premium"
-    return "👤 Free"
-
 def kill_process_tree(pid):
-    """Forcefully kill a process and all its children."""
     try:
         parent = psutil.Process(pid)
         children = parent.children(recursive=True)
         for child in children:
-            try:
-                child.terminate()
-            except:
-                pass
+            try: child.terminate()
+            except: pass
         parent.terminate()
-        # Give them time to terminate gracefully
         gone, alive = psutil.wait_procs(children + [parent], timeout=3)
         for p in alive:
-            try:
-                p.kill()
-            except:
-                pass
+            try: p.kill()
+            except: pass
         return True
     except psutil.NoSuchProcess:
         return True
@@ -297,47 +313,16 @@ def kill_process_tree(pid):
         logger.error(f"kill_process_tree error: {e}")
         return False
 
-def cleanup_pyrogram_sessions(folder):
-    """Delete any .session and .session-journal files in the folder."""
-    try:
-        for pattern in ['*.session', '*.session-journal']:
-            for f in glob.glob(os.path.join(folder, pattern)):
-                try:
-                    os.remove(f)
-                    logger.info(f"Cleaned up session file: {f}")
-                except Exception as e:
-                    logger.warning(f"Failed to remove {f}: {e}")
-    except Exception as e:
-        logger.error(f"cleanup_pyrogram_sessions error: {e}")
-
 def stop_script(uid, name):
-    """Stop a running script and clean up its session files."""
     key = f"{uid}_{name}"
-    stopped = False
-    
     if key in scripts:
         scripts[key]['stopped_intentionally'] = True
         scripts[key]['running'] = False
-        
         if scripts[key].get('process'):
-            try:
-                kill_process_tree(scripts[key]['process'].pid)
-                stopped = True
-            except Exception as e:
-                logger.error(f"Error stopping process for {key}: {e}")
-    
-    # Clean up Pyrogram session files in the user's folder
-    folder = get_user_folder(uid)
-    base_name = os.path.splitext(name)[0]
-    cleanup_pyrogram_sessions(folder)
-    
-    # Also clean up any session files in the current working directory
-    cleanup_pyrogram_sessions(os.getcwd())
-    
-    # Wait a moment for port/file locks to release
+            try: kill_process_tree(scripts[key]['process'].pid)
+            except: pass
     time.sleep(0.5)
-    
-    return stopped
+    return True
 
 def is_running(uid, name):
     key = f"{uid}_{name}"
@@ -361,18 +346,15 @@ def get_process_stats(pid):
 def safe_send(chat_id, text, parse=None, markup=None):
     try: return bot.send_message(chat_id, text, parse_mode=parse, reply_markup=markup)
     except Exception as e:
-        if "can't parse" in str(e):
-            return bot.send_message(chat_id, text, reply_markup=markup)
-        if "Too Many Requests" in str(e):
-            time.sleep(1); return safe_send(chat_id, text, parse, markup)
+        if "can't parse" in str(e): return bot.send_message(chat_id, text, reply_markup=markup)
+        if "Too Many Requests" in str(e): time.sleep(1); return safe_send(chat_id, text, parse, markup)
         raise
 
 def safe_edit(chat_id, msg_id, text, parse=None, markup=None):
     try: return bot.edit_message_text(text, chat_id, msg_id, parse_mode=parse, reply_markup=markup)
     except Exception as e:
         if "not modified" in str(e): return None
-        if "can't parse" in str(e):
-            return bot.edit_message_text(text, chat_id, msg_id, reply_markup=markup)
+        if "can't parse" in str(e): return bot.edit_message_text(text, chat_id, msg_id, reply_markup=markup)
 
 def safe_reply(msg, text, parse=None, markup=None):
     try: return bot.reply_to(msg, text, parse_mode=parse, reply_markup=markup)
@@ -404,20 +386,65 @@ def get_user_first_seen(uid):
     except: pass
     return "Unknown"
 
-def get_user_env(uid, name):
-    safe_env = {
-        'PATH': os.environ.get('PATH', '/usr/bin:/bin:/usr/local/bin'),
-        'HOME': get_user_folder(uid),
+def setup_user_home(uid):
+    home = get_user_home(uid)
+    bashrc = os.path.join(home, '.bashrc')
+    if not os.path.exists(bashrc):
+        with open(bashrc, 'w') as f:
+            f.write('''# User private environment
+export HOME="{home}"
+export PATH="$HOME/.pyenv/bin:$HOME/.nvm/versions/node/*/bin:$HOME/bin:$PATH"
+export PYENV_ROOT="$HOME/.pyenv"
+export NVM_DIR="$HOME/.nvm"
+
+# Initialize pyenv if present
+if [ -d "$PYENV_ROOT" ]; then
+    eval "$(pyenv init -)"
+fi
+
+# Initialize nvm if present
+if [ -d "$NVM_DIR" ]; then
+    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+fi
+
+alias python=python3
+alias pip=pip3
+'''.replace('{home}', home))
+    # Install pyenv if missing
+    pyenv_dir = os.path.join(home, '.pyenv')
+    if not os.path.exists(pyenv_dir):
+        subprocess.run(['git', 'clone', '--depth', '1', 'https://github.com/pyenv/pyenv.git', pyenv_dir],
+                       capture_output=True, timeout=60)
+    # Install nvm if missing
+    nvm_dir = os.path.join(home, '.nvm')
+    if not os.path.exists(nvm_dir):
+        subprocess.run(['git', 'clone', '--depth', '1', 'https://github.com/nvm-sh/nvm.git', nvm_dir],
+                       capture_output=True, timeout=60)
+    return home
+
+def get_user_env(uid, name=None):
+    home = setup_user_home(uid)
+    env = {
+        'HOME': home,
+        'PATH': f"{home}/.pyenv/bin:{home}/.nvm/versions/node/*/bin:{home}/bin:" + os.environ.get('PATH', '/usr/bin:/bin:/usr/local/bin'),
+        'PYENV_ROOT': f"{home}/.pyenv",
+        'NVM_DIR': f"{home}/.nvm",
         'USER': str(uid),
         'LANG': 'en_US.UTF-8',
-        'PYTHONPATH': '',
-        'NODE_PATH': os.environ.get('NODE_PATH', ''),
     }
-    for k in ('VIRTUAL_ENV', 'npm_config_prefix'):
-        if k in os.environ:
-            safe_env[k] = os.environ[k]
-    safe_env.update(user_envs.get(uid, {}).get(name, {}))
-    return safe_env
+    if name and uid in user_envs and name in user_envs[uid]:
+        env.update(user_envs[uid][name])
+    return env
+
+def resource_limits(uid):
+    ram_limit = get_user_ram_limit(uid)
+    def set_limits():
+        if ram_limit is not None:
+            resource.setrlimit(resource.RLIMIT_AS, (ram_limit, ram_limit))
+        resource.setrlimit(resource.RLIMIT_CPU, (3600, 3600))          # 1 hour CPU
+        resource.setrlimit(resource.RLIMIT_FSIZE, (100*1024*1024, 100*1024*1024))  # 100 MB file size
+        resource.setrlimit(resource.RLIMIT_NPROC, (50, 50))            # max 50 processes
+    return set_limits
 
 def save_env_var(uid, filename, key, value):
     user_envs.setdefault(uid, {}).setdefault(filename, {})[key] = value
@@ -457,25 +484,6 @@ def extract_error_snippet(stderr, stdout=""):
     tb = re.search(r'(Traceback \(most recent call last\).*)', text, re.DOTALL)
     snippet = tb.group(1).strip() if tb else "\n".join(text.splitlines()[-30:]).strip()
     return ("..." + snippet[-1800:]) if len(snippet) > 1800 else snippet
-
-# ==================== VENV MANAGEMENT ====================
-def get_script_venv(uid, script_name):
-    """Get or create a per‑script virtual environment."""
-    safe = re.sub(r'[^\w]', '_', script_name)
-    venv_dir = os.path.join(get_user_folder(uid), f'.venv_{safe}')
-    venv_python = os.path.join(venv_dir, 'bin', 'python')
-    if not os.path.exists(venv_python):
-        subprocess.run([sys.executable, '-m', 'venv', '--clear', venv_dir],
-                       capture_output=True, timeout=60)
-    return venv_dir, venv_python
-
-def cleanup_script_venv(uid, script_name):
-    """Delete the virtual environment for a script."""
-    safe = re.sub(r'[^\w]', '_', script_name)
-    venv_dir = os.path.join(get_user_folder(uid), f'.venv_{safe}')
-    if os.path.exists(venv_dir):
-        shutil.rmtree(venv_dir, ignore_errors=True)
-        logger.info(f"Cleaned up venv: {venv_dir}")
 
 # ==================== SECURITY ====================
 _DANGEROUS_STRINGS = [
@@ -578,7 +586,10 @@ def install_deps(file_path, ext, folder, uid, script_name, installed=None):
     new = set(); msgs = []
     try:
         if ext in ('.py', '.pyw'):
-            venv_dir, venv_python = get_script_venv(uid, script_name)
+            home = get_user_home(uid)
+            python_bin = os.path.join(home, '.pyenv', 'shims', 'python')
+            if not os.path.exists(python_bin):
+                python_bin = sys.executable
             with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
             pkg_map = {
                 'requests':'requests','flask':'flask','django':'django',
@@ -597,20 +608,17 @@ def install_deps(file_path, ext, folder, uid, script_name, installed=None):
                 pkg = pkg_map.get(mod)
                 if pkg and pkg not in installed and pkg not in new:
                     try:
-                        r = subprocess.run([venv_python, '-m', 'pip', 'install', '--quiet', pkg],
-                                           capture_output=True, text=True, timeout=60)
+                        r = subprocess.run([python_bin, '-m', 'pip', 'install', '--quiet', pkg],
+                                           capture_output=True, text=True, timeout=60, env=get_user_env(uid))
                         if r.returncode == 0: msgs.append(f"✅ {pkg}"); new.add(pkg)
                         else: msgs.append(f"❌ {pkg}")
                     except: msgs.append(f"⚠️ {pkg}")
-            # Handle requirements.txt if present in the same folder
             req_file = os.path.join(folder, 'requirements.txt')
             if os.path.exists(req_file):
-                r = subprocess.run([venv_python, '-m', 'pip', 'install', '--quiet', '-r', req_file],
-                                   capture_output=True, text=True, timeout=120)
-                if r.returncode == 0:
-                    msgs.append("✅ requirements.txt installed")
-                else:
-                    msgs.append("⚠️ requirements.txt failed")
+                r = subprocess.run([python_bin, '-m', 'pip', 'install', '--quiet', '-r', req_file],
+                                   capture_output=True, text=True, timeout=120, env=get_user_env(uid))
+                if r.returncode == 0: msgs.append("✅ requirements.txt installed")
+                else: msgs.append("⚠️ requirements.txt failed")
         elif ext in ('.js', '.mjs', '.cjs'):
             pjson = os.path.join(folder, 'package.json')
             if not os.path.exists(pjson):
@@ -625,7 +633,7 @@ def install_deps(file_path, ext, folder, uid, script_name, installed=None):
                 if pkg and pkg not in installed and pkg not in new:
                     try:
                         r = subprocess.run(['npm','install','--silent',pkg],
-                                           cwd=folder, capture_output=True, text=True, timeout=30)
+                                           cwd=folder, capture_output=True, text=True, timeout=30, env=get_user_env(uid))
                         if r.returncode == 0: msgs.append(f"✅ {pkg}"); new.add(pkg)
                         else: msgs.append(f"❌ {pkg}")
                     except: msgs.append(f"⚠️ {pkg}")
@@ -866,8 +874,8 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
     display_name = zip_name if zip_name else name
 
     if ext in STATIC_EXTS:
+        url = get_file_url(uid, name)
         if msg:
-            url = get_file_url(uid, name)
             mk = types.InlineKeyboardMarkup()
             if url: mk.add(types.InlineKeyboardButton("🔗 View File", url=url))
             safe_edit(msg.chat.id, msg.message_id, f"✅ *Hosted*\n`{name}`", 'Markdown', mk if url else None)
@@ -897,16 +905,20 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
             safe_edit(msg.chat.id, msg.message_id,
                       f"{icon} *{lang}* — `{display_name}`\n📦 Deps:\n{dep_text}", 'Markdown')
 
+        env = get_user_env(uid, name)
         if ext in ('.py', '.pyw'):
-            venv_dir, venv_python = get_script_venv(uid, display_name)
-            cmd = [venv_python, file_path]
+            home = get_user_home(uid)
+            python_bin = os.path.join(home, '.pyenv', 'shims', 'python')
+            if not os.path.exists(python_bin):
+                python_bin = sys.executable
+            cmd = [python_bin, file_path]
         elif ext in ('.js', '.mjs', '.cjs'):
             cmd = ['node', file_path]
         elif ext == '.java':
             classname = os.path.splitext(name)[0]
             compile_dir = os.path.join(TEMP_DIR, f"{uid}_{display_name}")
             os.makedirs(compile_dir, exist_ok=True)
-            r = subprocess.run(['javac', '-d', compile_dir, file_path], capture_output=True, text=True, timeout=60)
+            r = subprocess.run(['javac', '-d', compile_dir, file_path], capture_output=True, text=True, timeout=60, env=env)
             if r.returncode != 0:
                 if msg: safe_edit(msg.chat.id, msg.message_id,
                                   f"❌ *Java compile failed*\n```\n{r.stderr[:400]}\n```", 'Markdown')
@@ -915,7 +927,7 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
         elif ext in ('.cpp', '.cc', '.cxx', '.c'):
             out  = os.path.join(TEMP_DIR, f"{uid}_{display_name}.out")
             comp = 'g++' if ext in ('.cpp', '.cc', '.cxx') else 'gcc'
-            r = subprocess.run([comp, file_path, '-o', out], capture_output=True, text=True, timeout=60)
+            r = subprocess.run([comp, file_path, '-o', out], capture_output=True, text=True, timeout=60, env=env)
             if r.returncode != 0:
                 if msg: safe_edit(msg.chat.id, msg.message_id,
                                   f"❌ *Compile failed*\n```\n{r.stderr[:400]}\n```", 'Markdown')
@@ -925,7 +937,7 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
             cmd = ['go', 'run', file_path]
         elif ext == '.rs':
             out = os.path.join(TEMP_DIR, f"{uid}_{display_name}.out")
-            r = subprocess.run(['rustc', file_path, '-o', out], capture_output=True, text=True, timeout=60)
+            r = subprocess.run(['rustc', file_path, '-o', out], capture_output=True, text=True, timeout=60, env=env)
             if r.returncode != 0:
                 if msg: safe_edit(msg.chat.id, msg.message_id,
                                   f"❌ *Rust compile failed*\n```\n{r.stderr[:400]}\n```", 'Markdown')
@@ -943,7 +955,7 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
         elif ext in ('.ts', '.tsx'):
             js = file_path.rsplit('.', 1)[0] + '.js'
             r = subprocess.run(['tsc', file_path, '--outDir', os.path.dirname(file_path)],
-                               capture_output=True, text=True, timeout=60)
+                               capture_output=True, text=True, timeout=60, env=env)
             if r.returncode != 0:
                 if msg: safe_edit(msg.chat.id, msg.message_id,
                                   f"❌ *TS compile failed*\n```\n{r.stderr[:400]}\n```", 'Markdown')
@@ -962,7 +974,7 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
         elif ext == '.kt':
             jar = os.path.join(TEMP_DIR, f"{uid}_{display_name}.jar")
             r = subprocess.run(['kotlinc', file_path, '-include-runtime', '-d', jar],
-                               capture_output=True, text=True, timeout=120)
+                               capture_output=True, text=True, timeout=120, env=env)
             if r.returncode != 0:
                 if msg: safe_edit(msg.chat.id, msg.message_id,
                                   f"❌ *Kotlin compile failed*\n```\n{r.stderr[:400]}\n```", 'Markdown')
@@ -972,7 +984,7 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
             compile_dir = os.path.join(TEMP_DIR, f"{uid}_{display_name}")
             os.makedirs(compile_dir, exist_ok=True)
             r = subprocess.run(['scalac', '-d', compile_dir, file_path],
-                               capture_output=True, text=True, timeout=120)
+                               capture_output=True, text=True, timeout=120, env=env)
             if r.returncode != 0:
                 if msg: safe_edit(msg.chat.id, msg.message_id,
                                   f"❌ *Scala compile failed*\n```\n{r.stderr[:400]}\n```", 'Markdown')
@@ -983,7 +995,7 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
         elif ext == '.hs':
             out = os.path.join(TEMP_DIR, f"{uid}_{display_name}.out")
             r = subprocess.run(['ghc', file_path, '-o', out],
-                               capture_output=True, text=True, timeout=120)
+                               capture_output=True, text=True, timeout=120, env=env)
             if r.returncode != 0:
                 if msg: safe_edit(msg.chat.id, msg.message_id,
                                   f"❌ *Haskell compile failed*\n```\n{r.stderr[:400]}\n```", 'Markdown')
@@ -995,7 +1007,6 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
         safe_name   = re.sub(r'[^\w]', '_', display_name)
         log_path    = os.path.join(LOGS_DIR, f"{uid}_{safe_name}.log")
         stderr_path = os.path.join(LOGS_DIR, f"{uid}_{safe_name}.err")
-        env = get_user_env(uid, name)
         cwd = work_dir or os.path.dirname(file_path)
 
         for attempt in range(1, 11):
@@ -1004,7 +1015,8 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
                           f"{icon} *{lang}* — `{display_name}`\n🔄 Retry {attempt}...", 'Markdown')
             try:
                 res = subprocess.run(cmd, capture_output=True, text=True,
-                                     timeout=30, cwd=cwd, env=env)
+                                     timeout=30, cwd=cwd, env=env,
+                                     preexec_fn=resource_limits(uid))
 
                 if res.returncode != 0 and "ModuleNotFoundError" in res.stderr:
                     match = re.search(r"No module named '(\w+)'", res.stderr)
@@ -1025,12 +1037,15 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
                                               f"{icon} *{lang}* — `{display_name}`\n📦 Installing `{pkg}`...",
                                               'Markdown')
                             if ext in ('.py', '.pyw'):
-                                venv_dir, venv_python = get_script_venv(uid, display_name)
-                                subprocess.run([venv_python, '-m', 'pip', 'install', '--quiet', pkg],
-                                               capture_output=True, text=True, timeout=60)
+                                home = get_user_home(uid)
+                                python_bin = os.path.join(home, '.pyenv', 'shims', 'python')
+                                if not os.path.exists(python_bin):
+                                    python_bin = sys.executable
+                                subprocess.run([python_bin, '-m', 'pip', 'install', '--quiet', pkg],
+                                               capture_output=True, text=True, timeout=60, env=env)
                             else:
                                 subprocess.run([sys.executable, '-m', 'pip', 'install', '--quiet', pkg],
-                                               capture_output=True, text=True, timeout=60)
+                                               capture_output=True, text=True, timeout=60, env=env)
                             installed.add(pkg)
                             continue
 
@@ -1062,7 +1077,8 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
 
             except subprocess.TimeoutExpired:
                 with open(log_path, 'w') as lf, open(stderr_path, 'w') as ef:
-                    p = subprocess.Popen(cmd, stdout=lf, stderr=ef, cwd=cwd, env=env)
+                    p = subprocess.Popen(cmd, stdout=lf, stderr=ef, cwd=cwd, env=env,
+                                         preexec_fn=resource_limits(uid))
 
                 scripts[key] = {
                     'process': p, 'key': key, 'uid': uid, 'name': display_name,
@@ -1107,11 +1123,14 @@ def _get_or_create_shell(uid):
     info = shell_procs.get(uid)
     if info and info['process'].poll() is None:
         return info
+    home = setup_user_home(uid)
+    bashrc = os.path.join(home, '.bashrc')
+    env = get_user_env(uid)
     p = subprocess.Popen(
-        ['bash', '--norc', '--noprofile'],
+        ['bash', '--rcfile', bashrc],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, cwd=BASE_DIR,
-        env={**os.environ, 'PS1': '', 'TERM': 'dumb', 'DEBIAN_FRONTEND': 'noninteractive'}
+        text=True, bufsize=1, cwd=home, env=env,
+        preexec_fn=resource_limits(uid)
     )
     info = {'process': p, 'output_lines': [], 'lock': threading.Lock(), 'waiting_input': False}
     shell_procs[uid] = info
@@ -1222,7 +1241,7 @@ def cmd_shell(message):
         _get_or_create_shell(uid)
         mk = types.InlineKeyboardMarkup()
         mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
-        safe_reply(message, "💻 *Shell Active*\nSend commands directly. Multiple lines supported.", 'Markdown', mk)
+        safe_reply(message, "💻 *Shell Active*\nYour private VPS environment is ready.\nUse `pyenv` / `nvm` to manage versions.\nSend commands directly.", 'Markdown', mk)
 
 @bot.callback_query_handler(func=lambda c: c.data == "exit_shell")
 def cb_exit_shell(c):
@@ -1381,7 +1400,7 @@ def cmd_start(message):
         d = diff.days; h = diff.seconds // 3600; m = (diff.seconds % 3600) // 60
         sub_badge = f"  ⭐ {d}d {h}h {m}m" if d > 0 else f"  ⭐ {h}h {m}m"
 
-    role    = get_user_tier(uid)
+    role    = get_user_tier(uid).capitalize()
     lim     = get_user_limit(uid)
     lim_txt = "∞" if lim == float('inf') else str(lim)
     welcome = (f"👋 *{name}*{sub_badge}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
@@ -1391,40 +1410,64 @@ def cmd_start(message):
 
 @bot.message_handler(commands=['help'])
 def cmd_help(message):
-    uid      = message.from_user.id
-    is_admin = uid in admins
-    is_owner = uid == OWNER_ID
-    lines = [
-        "📖 *Help*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
-        "`/start` — Home\n`/help` — Help\n`/clone` — Clone this bot\n`/shell [cmd]` — Shell\n`/git <url>` — Host from GitHub",
-        "\n*Env Vars*",
-        "`/setenv` — Set env var\n`/listenv` — List vars\n`/delenv` — Delete var",
-    ]
-    if is_admin:
-        lines.append("\n*Admin Commands*")
-        lines.append("`/addadmin <id>`\n`/removeadmin <id>`")
-        lines.append("`/addsub <id> <days>`\n`/removesub <id>`\n`/checksub <id>`")
-        lines.append("`/ban <uid>` — Ban user\n`/unban <uid>` — Unban user")
-        lines.append("`/delete <uid> <file>` — Delete any user's file\n`/get <uid> <file>` — Retrieve any user's file")
-        lines.append("`/broadcast <msg>` — Broadcast to all users")
-    if is_owner:
-        lines.append("`/restart` — Wipe all data & restart bot\n`/botlogs` — View bot logs")
-    lines.append("\n*Features*\n30+ languages • Auto deps • Background hosting\nLive logs • Crash DMs • Mid-run error alerts\nZIP websites • Custom slugs • Env vars\nGitHub cloning • Per‑script virtual environments")
-    safe_reply(message, "\n".join(lines), 'Markdown')
+    uid = message.from_user.id
+    mk = types.InlineKeyboardMarkup()
+    mk.row(types.InlineKeyboardButton("📖 General", callback_data="help_general"),
+           types.InlineKeyboardButton("⚙️ Advanced", callback_data="help_advanced"))
+    safe_reply(message,
+               "📚 *Help Menu*\nSelect a category below:",
+               'Markdown', mk)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('help_'))
+def cb_help(c):
+    data = c.data[5:]
+    if data == 'general':
+        text = (
+            "📖 *General Help*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            "`/start` – Main menu\n"
+            "`/help` – Show this help\n"
+            "`/shell [cmd]` – Open private VPS shell\n"
+            "`/git <url>` – Host from GitHub\n"
+            "`/setenv`, `/listenv`, `/delenv` – Manage env vars\n"
+            "`/clone` – Clone this bot\n"
+            "\n*Features*\n"
+            "• Upload any file to host it\n"
+            "• 30+ languages auto‑detected\n"
+            "• Websites from ZIP files\n"
+            "• Per‑user isolated environment"
+        )
+    else:  # advanced
+        tier = get_user_tier(c.from_user.id)
+        ram = get_user_ram_limit(c.from_user.id)
+        ram_str = "Unlimited" if ram is None else f"{ram//(1024**3)} GB"
+        text = (
+            "⚙️ *Advanced Help*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            "*Your Private VPS*\n"
+            f"• Tier: `{tier.capitalize()}`\n"
+            f"• RAM limit: `{ram_str}`\n"
+            f"• CPU limit: `1 hour` per process\n"
+            f"• File size limit: `100 MB`\n"
+            f"• Max processes: `50`\n\n"
+            "*Inside your shell*\n"
+            "• `pyenv install 3.10.11` – install any Python\n"
+            "• `pyenv global 3.10.11` – switch version\n"
+            "• `nvm install 18` – install Node.js\n"
+            "• `pip install ...`, `npm install ...` – freely\n"
+            "\n*Resource Limits*\n"
+            "Free: 1 GB RAM | Premium: 2 GB | Admin: 4 GB | Owner: Unlimited"
+        )
+    safe_edit(c.message.chat.id, c.message.message_id, text, 'Markdown')
+    bot.answer_callback_query(c.id)
 
 # ==================== GITHUB CLONING ====================
 def clone_github_repo(url, uid):
-    """Clone a GitHub repository and return path to zipped file."""
     temp_dir = tempfile.mkdtemp(dir=TEMP_DIR)
     repo_name = url.rstrip('/').split('/')[-1].replace('.git', '') or "repo"
-    
     try:
-        # Clone with depth 1 for speed
         subprocess.run(['git', 'clone', '--depth', '1', url, repo_name],
-                       cwd=temp_dir, check=True, capture_output=True, timeout=60)
+                       cwd=temp_dir, check=True, capture_output=True, timeout=60,
+                       env=get_user_env(uid))
         repo_path = os.path.join(temp_dir, repo_name)
-        
-        # Create zip
         zip_name = f"{repo_name}.zip"
         zip_path = os.path.join(temp_dir, zip_name)
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -1433,7 +1476,6 @@ def clone_github_repo(url, uid):
                     full_path = os.path.join(root, file)
                     arcname = os.path.relpath(full_path, repo_path)
                     zf.write(full_path, arcname)
-        
         return zip_path, repo_name, temp_dir
     except Exception as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1460,44 +1502,31 @@ def process_github_url(message, url):
     status = safe_reply(message, f"⏳ *Cloning from GitHub*\n`{url}`", 'Markdown')
     try:
         zip_path, repo_name, temp_dir = clone_github_repo(url, uid)
-        
-        # Process like a regular zip upload
         if is_website_zip(zip_path):
             ftype = 'site'
             name = f"{repo_name}.zip"
         else:
             ftype = 'executable'
             name = f"{repo_name}.zip"
-        
-        # Move to user's folder
         folder = get_user_folder(uid)
         final_path = os.path.join(folder, name)
-        
-        # Remove old if exists
         if os.path.exists(final_path):
             stop_script(uid, name)
             os.remove(final_path)
-        
         shutil.move(zip_path, final_path)
-        
-        # Clean up temp dir
         shutil.rmtree(temp_dir, ignore_errors=True)
-        
-        # Register file
         user_files.setdefault(uid, [])
         user_files[uid] = [(n, t) for n, t in user_files[uid] if n != name]
         user_files[uid].append((name, ftype))
         conn = sqlite3.connect(DB_PATH)
         conn.execute('INSERT OR REPLACE INTO files VALUES (?,?,?)', (uid, name, ftype))
         conn.commit(); conn.close()
-        
         if ftype == 'site':
             safe_edit(status.chat.id, status.message_id, f"🌐 *Extracting website...*\n`{name}`", 'Markdown')
             handle_zip_website(final_path, uid, name, status)
         else:
             safe_edit(status.chat.id, status.message_id, f"🚀 *Launching*\n`{name}`", 'Markdown')
             execute_script(uid, final_path, status)
-            
     except subprocess.CalledProcessError as e:
         error_msg = e.stderr.decode() if e.stderr else str(e)
         safe_edit(status.chat.id, status.message_id, f"❌ *Git clone failed*\n`{error_msg[:200]}`", 'Markdown')
@@ -1505,7 +1534,6 @@ def process_github_url(message, url):
         logger.error(f"Git clone error: {e}", exc_info=True)
         safe_edit(status.chat.id, status.message_id, f"❌ *Error*\n`{str(e)[:200]}`", 'Markdown')
 
-# Detect GitHub URLs in messages
 @bot.message_handler(func=lambda m: m.text and re.search(r'https?://(?:www\.)?github\.com/[^\s]+', m.text))
 def handle_github_url(message):
     url = re.search(r'https?://(?:www\.)?github\.com/[^\s]+', message.text).group()
@@ -1514,16 +1542,13 @@ def handle_github_url(message):
 # ==================== BOT LOGS (OWNER ONLY) ====================
 def get_bot_log_content(max_chars=3500):
     log_path = os.path.join(LOGS_DIR, 'bot.log')
-    if not os.path.exists(log_path):
-        return ""
+    if not os.path.exists(log_path): return ""
     try:
         with open(log_path, 'r', errors='ignore') as f:
             content = f.read().strip()
-        if len(content) > max_chars:
-            content = "…" + content[-max_chars:]
+        if len(content) > max_chars: content = "…" + content[-max_chars:]
         return content
-    except:
-        return ""
+    except: return ""
 
 @bot.message_handler(commands=['botlogs'])
 def cmd_botlogs(message):
@@ -1534,40 +1559,32 @@ def cmd_botlogs(message):
     mk = types.InlineKeyboardMarkup(row_width=2)
     mk.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="refresh_botlogs"),
            types.InlineKeyboardButton("🛠️ Get txt", callback_data="getbotlogtxt"))
-    safe_reply(message,
-               f"📜 *Bot Logs*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n{display}\n```",
-               'Markdown', mk)
+    safe_reply(message, f"📜 *Bot Logs*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n{display}\n```", 'Markdown', mk)
 
 @bot.message_handler(func=lambda m: m.text == "📜 Bot Logs")
 def btn_botlogs(m):
-    if m.from_user.id != OWNER_ID:
-        return safe_reply(m, "🚫 *Owner Only*", 'Markdown')
+    if m.from_user.id != OWNER_ID: return safe_reply(m, "🚫 *Owner Only*", 'Markdown')
     cmd_botlogs(m)
 
 @bot.callback_query_handler(func=lambda c: c.data == "refresh_botlogs")
 def cb_refresh_botlogs(c):
-    if c.from_user.id != OWNER_ID:
-        return bot.answer_callback_query(c.id, "Owner only")
+    if c.from_user.id != OWNER_ID: return bot.answer_callback_query(c.id, "Owner only")
     content = get_bot_log_content()
     display = content if content else "(no output yet)"
     mk = types.InlineKeyboardMarkup(row_width=2)
     mk.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="refresh_botlogs"),
            types.InlineKeyboardButton("🛠️ Get txt", callback_data="getbotlogtxt"))
     safe_edit(c.message.chat.id, c.message.message_id,
-              f"📜 *Bot Logs*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n{display}\n```",
-              'Markdown', mk)
+              f"📜 *Bot Logs*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n{display}\n```", 'Markdown', mk)
     bot.answer_callback_query(c.id, "Refreshed")
 
 @bot.callback_query_handler(func=lambda c: c.data == "getbotlogtxt")
 def cb_getbotlogtxt(c):
-    if c.from_user.id != OWNER_ID:
-        return bot.answer_callback_query(c.id, "Owner only")
+    if c.from_user.id != OWNER_ID: return bot.answer_callback_query(c.id, "Owner only")
     log_path = os.path.join(LOGS_DIR, 'bot.log')
-    if not os.path.exists(log_path):
-        return bot.answer_callback_query(c.id, "Log file missing")
+    if not os.path.exists(log_path): return bot.answer_callback_query(c.id, "Log file missing")
     try:
-        with open(log_path, 'r', errors='ignore') as f:
-            content = f.read()
+        with open(log_path, 'r', errors='ignore') as f: content = f.read()
         if not content.strip():
             safe_send(c.message.chat.id, "📭 *No log output yet*", 'Markdown')
             return bot.answer_callback_query(c.id, "Empty log")
@@ -1575,10 +1592,8 @@ def cb_getbotlogtxt(c):
         if len(content.encode('utf-8')) > MAX_BYTES:
             content = content.encode('utf-8')[-MAX_BYTES:].decode('utf-8', errors='ignore')
         temp_path = os.path.join(LOGS_DIR, "bot_full.log")
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        with open(temp_path, 'rb') as f:
-            bot.send_document(c.message.chat.id, f)
+        with open(temp_path, 'w', encoding='utf-8') as f: f.write(content)
+        with open(temp_path, 'rb') as f: bot.send_document(c.message.chat.id, f)
         os.remove(temp_path)
         bot.answer_callback_query(c.id, "Log sent")
     except Exception as e:
@@ -1915,8 +1930,6 @@ def cmd_delete_file(message):
             conn.commit(); conn.close()
         except: pass
         if key in scripts: del scripts[key]
-        # Clean up venv
-        cleanup_script_venv(target_uid, fname)
         safe_reply(message, f"✅ *Deleted* `{fname}` from uid `{target_uid}`", 'Markdown')
         try: bot.send_message(target_uid, f"🗑️ *File removed by admin:* `{fname}`", 'Markdown')
         except: pass
@@ -2048,7 +2061,6 @@ def handle_upload(message):
                          "Telegram served a cached copy — no changes found.\n"
                          "Rename the file slightly and re-upload.", 'Markdown')
                 return
-            # Force stop old script and clean up session files
             old_key = f"{uid}_{name}"
             if old_key in scripts:
                 scripts[old_key]['stopped_intentionally'] = True
@@ -2058,14 +2070,9 @@ def handle_upload(message):
                     shutil.rmtree(os.path.join(EXTRACT_DIR, d), ignore_errors=True)
             if old_key in scripts:
                 del scripts[old_key]
-            # Clean up old venv
-            cleanup_script_venv(uid, name)
-            # Wait for file locks to release
             time.sleep(1)
-            try:
-                os.remove(old_path)
-            except Exception as e:
-                logger.warning(f"Could not remove old file {old_path}: {e}")
+            try: os.remove(old_path)
+            except Exception as e: logger.warning(f"Could not remove old file {old_path}: {e}")
 
         if uid == OWNER_ID or uid in admins:
             safe_file, scan = True, "Trusted"
@@ -2283,7 +2290,6 @@ def file_exists_check(uid, name, callback_query):
 def cb_file(c):
     parts = c.data.split('_')
     if len(parts) == 3:
-        # New index-based: file_uid_idx
         uid = int(parts[1])
         idx = int(parts[2])
         files = user_files.get(uid, [])
@@ -2291,7 +2297,6 @@ def cb_file(c):
             return bot.answer_callback_query(c.id, "❌ File not found")
         name, ftype = files[idx]
     else:
-        # Fallback for old format (may be truncated)
         return bot.answer_callback_query(c.id, "❌ Invalid callback, please refresh")
 
     if c.from_user.id != uid and c.from_user.id not in admins:
@@ -2390,8 +2395,7 @@ def cb_getlogtxt(c):
     uid, name = int(parts[1]), parts[2]
     if c.from_user.id != uid and c.from_user.id not in admins:
         return bot.answer_callback_query(c.id, "❌ Access denied")
-    if not file_exists_check(uid, name, c):
-        return
+    if not file_exists_check(uid, name, c): return
     key = f"{uid}_{name}"
     if key not in scripts:
         return bot.answer_callback_query(c.id, "No logs")
@@ -2492,9 +2496,6 @@ def cb_delete(c):
                 except: pass
         del scripts[key]
 
-    # Clean up venv
-    cleanup_script_venv(uid, name)
-
     bot.answer_callback_query(c.id, "✅ Deleted")
     files = user_files.get(uid, [])
     if not files:
@@ -2549,7 +2550,7 @@ def btn_files(m):
 @bot.message_handler(func=lambda m: m.text == "👤 Profile")
 def btn_profile(m):
     uid = m.from_user.id; exit_shell_if_active(uid)
-    tier    = get_user_tier(uid)
+    tier    = get_user_tier(uid).capitalize()
     lim     = get_user_limit(uid); lim_txt = "∞" if lim == float('inf') else str(lim)
     count   = get_user_count(uid)
     joined  = get_user_first_seen(uid)
@@ -2711,9 +2712,10 @@ def btn_admin(m):
 def btn_shell(m):
     uid = m.from_user.id
     shell_sessions[uid] = True
+    _get_or_create_shell(uid)
     mk = types.InlineKeyboardMarkup()
     mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
-    safe_reply(m, "💻 *Shell Active*\nSend commands directly. Multiple lines supported.", 'Markdown', mk)
+    safe_reply(m, "💻 *Shell Active*\nYour private VPS environment is ready.\nUse `pyenv` / `nvm` to manage versions.", 'Markdown', mk)
 
 @bot.message_handler(func=lambda m: m.text == "📁 All Files")
 def btn_all_files(m):
