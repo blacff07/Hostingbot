@@ -1241,7 +1241,7 @@ def _get_or_create_shell(uid):
         if uid in shell_live_msg:
             try:
                 bot.edit_message_text(
-                    f"{shell_content.get(uid, '')}\n\n💀 *Shell session ended*",
+                    f"{shell_content.get(uid, '')}\n\n⚙ *Shell Session Ended*",
                     info['chat_id'], shell_live_msg[uid], parse_mode='Markdown'
                 )
             except:
@@ -1281,7 +1281,6 @@ def _get_clean_pty_output(info):
     # Extract the last prompt line for later use
     lines = text.splitlines()
     if lines:
-        # Keep only the last line as prompt if it doesn't look like command output
         last = lines[-1].strip()
         if last and not last.startswith('$') and not last.startswith('#'):
             info['last_prompt'] = last
@@ -1289,12 +1288,20 @@ def _get_clean_pty_output(info):
             info['last_prompt'] = lines[-1] if lines else ''
     return text
 
-def _format_shell_output(cmd, output):
+def _format_shell_message(command, output):
     """Format a command and its output for a new message."""
+    separator = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
     if output:
-        return f"$ `{cmd}`\n```\n{output}\n```"
+        # Find the command line in the output (first line)
+        lines = output.splitlines()
+        if lines and lines[0].strip().startswith(command):
+            # Keep the rest as output
+            actual_output = "\n".join(lines[1:]) if len(lines) > 1 else ""
+        else:
+            actual_output = output
+        return f"$ `{command}`\n{separator}\n```\n{actual_output}\n```"
     else:
-        return f"$ `{cmd}`\n```\n(no output)\n```"
+        return f"$ `{command}`\n{separator}\n```\n(no output)\n```"
 
 def build_shell_keyboard(uid):
     """Return inline keyboard for shell control."""
@@ -1302,7 +1309,7 @@ def build_shell_keyboard(uid):
     ctrl_text = "Ctrl ✓" if ctrl_active.get(uid, False) else "Ctrl"
     mk.row(
         types.InlineKeyboardButton("Esc", callback_data=f"shell_esc_{uid}"),
-        types.InlineKeyboardButton("Tab", callback_data=f"shell_tab_{uid}"),
+        types.InlineKeyboardButton("Alt", callback_data=f"shell_alt_{uid}"),
         types.InlineKeyboardButton(ctrl_text, callback_data=f"shell_ctrl_{uid}")
     )
     mk.row(
@@ -1341,9 +1348,7 @@ def cmd_shell(message):
                 output += "\n" + res.stderr
             if not output.strip():
                 output = "(no output)"
-            if len(output) > 3500:
-                output = output[-3500:]
-            safe_reply(message, _format_shell_output(cmd_text, output), 'Markdown')
+            safe_reply(message, _format_shell_message(cmd_text, output), 'Markdown')
         except subprocess.TimeoutExpired:
             safe_reply(message, f"$ `{cmd_text}`\n⏱️ *Command timed out*", 'Markdown')
         except Exception as e:
@@ -1360,7 +1365,7 @@ def cmd_shell(message):
         old_content = shell_content.get(uid, '')
         try:
             bot.edit_message_text(
-                f"{old_content}\n\n💻 *Shell closed (new session started)*",
+                f"{old_content}\n\n⚙ *Shell Session Ended*",
                 message.chat.id, old_msg, parse_mode='Markdown'
             )
         except:
@@ -1376,7 +1381,9 @@ def cmd_shell(message):
         "Your environment includes:\n"
         "• `pyenv` – manage Python versions\n"
         "• `nvm`  – manage Node.js versions\n\n"
-        "Type `exit` or click the *Exit* button to close the shell.\n\n"
+        "Type `exit` or click the *Exit* button to close the shell.\n"
+        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+        "```\n"
     )
 
     # Capture initial prompt
@@ -1385,7 +1392,7 @@ def cmd_shell(message):
     if not initial_output:
         initial_output = "user@host:~$"
 
-    content = intro + initial_output
+    content = intro + initial_output + "\n```"
     mk = build_shell_keyboard(uid)
 
     sent = safe_send(message.chat.id, content, 'Markdown', mk)
@@ -1419,8 +1426,8 @@ def shell_button_handler(c):
 
     elif action == "esc":
         os.write(info['fd'], b'\x1b')
-    elif action == "tab":
-        os.write(info['fd'], b'\t')
+    elif action == "alt":
+        os.write(info['fd'], b'\x1b')
     elif action == "up":
         os.write(info['fd'], b'\x1b[A')
     elif action == "down":
@@ -1435,7 +1442,7 @@ def shell_button_handler(c):
             old_content = shell_content.get(uid, '')
             try:
                 bot.edit_message_text(
-                    f"{old_content}\n\n💻 *Shell Closed*",
+                    f"{old_content}\n\n⚙ *Shell Session Ended*",
                     c.message.chat.id, shell_live_msg[uid], parse_mode='Markdown'
                 )
             except:
@@ -1445,20 +1452,23 @@ def shell_button_handler(c):
         bot.answer_callback_query(c.id)
         return
 
-    # For arrow keys / Esc / Tab / Enter, we update the live message in-place
+    # For arrow keys / Esc / Alt / Enter, we update the live message in-place
     time.sleep(0.3)
     new_output = _get_clean_pty_output(info)
 
     if uid in shell_live_msg:
-        # Rebuild content: keep the intro part if present, otherwise just the new output
         old_content = shell_content.get(uid, '')
-        # Find where the prompt starts (after the intro)
-        if 'Your environment includes:' in old_content:
-            # Keep the intro part
-            intro_part = old_content.split('Type `exit`')[0] + 'Type `exit` or click the *Exit* button to close the shell.\n\n'
-            new_content = intro_part + new_output
+        # Keep the intro and the command output, only update the prompt part
+        if '┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄' in old_content:
+            # Split at the separator to preserve output
+            parts = old_content.split('┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄')
+            if len(parts) >= 2:
+                # Keep the intro + separator, replace the code block content
+                new_content = parts[0] + '┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n' + new_output + '\n```'
+            else:
+                new_content = old_content
         else:
-            new_content = new_output
+            new_content = old_content
 
         mk = build_shell_keyboard(uid)
         try:
@@ -1472,6 +1482,7 @@ def shell_button_handler(c):
     bot.answer_callback_query(c.id)
 
 # ==================== SHELL SESSION INTERCEPT ====================
+# These texts should NOT trigger the shell handler
 BOT_COMMAND_TEXTS = {
     "📂 Files", "👤 Profile", "📊 Stats", "❓ Help",
     "📢 Channel", "📞 Contact", "💻 Shell", "🤖 Clone",
@@ -1484,6 +1495,7 @@ def shell_session_input(m):
     uid = m.from_user.id
     text = m.text.strip()
     
+    # Ignore bot commands and menu button texts
     if text.startswith('/') or text in BOT_COMMAND_TEXTS:
         return
     
@@ -1500,7 +1512,7 @@ def shell_session_input(m):
                 old_content = shell_content.get(uid, '')
                 try:
                     bot.edit_message_text(
-                        f"{old_content}{final_output}\n\n💻 *Shell Closed*",
+                        f"{old_content}\n\n⚙ *Shell Session Ended*",
                         m.chat.id, shell_live_msg[uid], parse_mode='Markdown'
                     )
                 except:
@@ -1519,8 +1531,7 @@ def shell_session_input(m):
     # Remove keyboard from old live message
     if uid in shell_live_msg:
         _remove_keyboard_from_message(m.chat.id, shell_live_msg[uid])
-        old_live_msg = shell_live_msg[uid]
-        shell_live_msg.pop(uid, None)
+        old_live_msg = shell_live_msg.pop(uid, None)
         shell_content.pop(uid, None)
     else:
         old_live_msg = None
@@ -1542,7 +1553,7 @@ def shell_session_input(m):
     output = _get_clean_pty_output(info)
 
     # Create new output message
-    formatted = _format_shell_output(text, output)
+    formatted = _format_shell_message(text, output)
     sent = safe_send(m.chat.id, formatted, 'Markdown')
     # The new message becomes the live shell message with buttons
     mk = build_shell_keyboard(uid)
@@ -3038,7 +3049,7 @@ def btn_shell(m):
         old_content = shell_content.get(uid, '')
         try:
             bot.edit_message_text(
-                f"{old_content}\n\n💻 *Shell closed (new session started)*",
+                f"{old_content}\n\n⚙ *Shell Session Ended*",
                 m.chat.id, old_msg, parse_mode='Markdown'
             )
         except:
@@ -3054,7 +3065,9 @@ def btn_shell(m):
         "Your environment includes:\n"
         "• `pyenv` – manage Python versions\n"
         "• `nvm`  – manage Node.js versions\n\n"
-        "Type `exit` or click the *Exit* button to close the shell.\n\n"
+        "Type `exit` or click the *Exit* button to close the shell.\n"
+        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+        "```\n"
     )
 
     time.sleep(0.5)
@@ -3062,7 +3075,7 @@ def btn_shell(m):
     if not initial_output:
         initial_output = "user@host:~$"
 
-    content = intro + initial_output
+    content = intro + initial_output + "\n```"
     mk = build_shell_keyboard(uid)
 
     sent = safe_send(m.chat.id, content, 'Markdown', mk)
