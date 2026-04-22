@@ -1155,6 +1155,7 @@ def _get_or_create_shell(uid):
     nvm_dir = os.path.join(home, '.nvm')
     nvm_script = os.path.join(nvm_dir, 'nvm.sh')
     if os.path.exists(nvm_script):
+        # Source nvm and install LTS
         node_versions = os.path.join(nvm_dir, 'versions', 'node')
         if not os.path.exists(node_versions) or not os.listdir(node_versions):
             subprocess.run(['bash', '-c', f'source "{nvm_script}" && nvm install --lts'],
@@ -1198,10 +1199,17 @@ def _run_shell_cmd(message, cmd_text):
     try:
         info = _get_or_create_shell(uid)
 
+        # Prepend source of nvm.sh to make nvm available in one-off commands
+        nvm_script = os.path.join(get_user_home(uid), '.nvm', 'nvm.sh')
+        if os.path.exists(nvm_script):
+            full_cmd = f'source "{nvm_script}" && {cmd_text}'
+        else:
+            full_cmd = cmd_text
+
         if info.get('waiting_input') and info['process'].poll() is None:
             info['waiting_input'] = False
             try:
-                info['process'].stdin.write(cmd_text + '\n')
+                info['process'].stdin.write(full_cmd + '\n')
                 info['process'].stdin.flush()
             except BrokenPipeError:
                 _kill_shell(uid)
@@ -1212,7 +1220,7 @@ def _run_shell_cmd(message, cmd_text):
             info['output_lines'].clear()
         status = safe_reply(message, f"$ `{cmd_text}`\n⏳ Running...", 'Markdown', exit_mk)
         sentinel = f"__DONE_{int(time.time())}__"
-        info['process'].stdin.write(cmd_text + '\n')
+        info['process'].stdin.write(full_cmd + '\n')
         info['process'].stdin.write(f"echo {sentinel}\n")
         info['process'].stdin.flush()
 
