@@ -440,7 +440,7 @@ def get_user_env(uid, name=None):
         'USER': str(uid),
         'LANG': 'en_US.UTF-8',
         'LC_ALL': 'C.UTF-8',
-        'TERM': 'xterm-256color',   # for PTY compatibility
+        'TERM': 'xterm-256color',
     }
     if name and uid in user_envs and name in user_envs[uid]:
         env.update(user_envs[uid][name])
