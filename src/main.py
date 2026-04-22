@@ -24,6 +24,11 @@ import threading
 import glob
 import tempfile
 import resource
+import pty
+import select
+import termios
+import struct
+import fcntl
 
 # ==================== CONFIGURATION ====================
 TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -435,6 +440,7 @@ def get_user_env(uid, name=None):
         'USER': str(uid),
         'LANG': 'en_US.UTF-8',
         'LC_ALL': 'C.UTF-8',
+        'TERM': 'xterm-256color',   # for PTY compatibility
     }
     if name and uid in user_envs and name in user_envs[uid]:
         env.update(user_envs[uid][name])
@@ -1139,161 +1145,263 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
             except: pass
         return False, str(e)
 
-# ==================== SHELL ====================
+# ==================== SHELL (REAL PTY) ====================
 shell_procs = {}
 
 def _get_or_create_shell(uid):
+    """Spawn a real PTY with bash, fully interactive."""
     info = shell_procs.get(uid)
-    if info and info['process'].poll() is None:
-        return info
+    if info and info['fd'] is not None:
+        try:
+            os.kill(info['pid'], 0)
+            return info
+        except OSError:
+            # process died, clean up
+            shell_procs.pop(uid, None)
 
     home = setup_user_home(uid)
     bashrc = os.path.join(home, '.bashrc')
     env = get_user_env(uid)
 
-    # Ensure nvm is installed and install latest Node.js LTS if no versions present
+    # Pre‑install Node.js LTS if needed
     nvm_dir = os.path.join(home, '.nvm')
     nvm_script = os.path.join(nvm_dir, 'nvm.sh')
     if os.path.exists(nvm_script):
-        # Source nvm and install LTS
         node_versions = os.path.join(nvm_dir, 'versions', 'node')
         if not os.path.exists(node_versions) or not os.listdir(node_versions):
             subprocess.run(['bash', '-c', f'source "{nvm_script}" && nvm install --lts'],
                            cwd=home, env=env, capture_output=True, timeout=300)
 
-    p = subprocess.Popen(
-        ['bash', '--rcfile', bashrc],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, cwd=home, env=env,
-        preexec_fn=resource_limits(uid)
-    )
-    info = {'process': p, 'output_lines': [], 'lock': threading.Lock(), 'waiting_input': False}
+    # Create PTY
+    master_fd, slave_fd = pty.openpty()
+    try:
+        # Set terminal size
+        winsize = struct.pack("HHHH", 80, 24, 0, 0)
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
+    except:
+        pass
+
+    # Spawn bash with PTY
+    pid = os.fork()
+    if pid == 0:  # child
+        os.setsid()
+        os.close(master_fd)
+        # Set terminal as controlling tty
+        try:
+            fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+        except:
+            pass
+        os.dup2(slave_fd, 0)
+        os.dup2(slave_fd, 1)
+        os.dup2(slave_fd, 2)
+        os.close(slave_fd)
+
+        # Apply resource limits
+        resource_limits(uid)()
+        # Change to home directory
+        os.chdir(home)
+        # Execute bash with rcfile
+        os.execvpe('bash', ['bash', '--rcfile', bashrc], env)
+        os._exit(1)
+
+    # parent
+    os.close(slave_fd)
+    info = {
+        'pid': pid,
+        'fd': master_fd,
+        'home': home,
+        'lock': threading.Lock(),
+        'output_buffer': bytearray(),
+        'chat_id': None,
+        'status_msg_id': None,
+        'last_update': 0,
+    }
     shell_procs[uid] = info
 
-    def _reader():
+    # Start reader thread
+    def reader():
+        fd = info['fd']
+        while True:
+            try:
+                r, _, _ = select.select([fd], [], [], 1.0)
+                if r:
+                    data = os.read(fd, 4096)
+                    if not data:
+                        break
+                    with info['lock']:
+                        info['output_buffer'].extend(data)
+            except:
+                break
+        # Process died, clean up
+        shell_procs.pop(uid, None)
         try:
-            for line in p.stdout:
-                with info['lock']:
-                    info['output_lines'].append(line)
-        except: pass
-    threading.Thread(target=_reader, daemon=True).start()
+            os.close(fd)
+        except:
+            pass
+        try:
+            os.kill(pid, 9)
+        except:
+            pass
+        # Notify user if we have a status message
+        if info.get('chat_id') and info.get('status_msg_id'):
+            try:
+                mk = types.InlineKeyboardMarkup()
+                mk.add(types.InlineKeyboardButton("💻 Reopen Shell", callback_data=f"reopen_shell_{uid}"))
+                bot.edit_message_text("💀 *Shell session ended*", info['chat_id'],
+                                      info['status_msg_id'], parse_mode='Markdown', reply_markup=mk)
+            except:
+                pass
+
+    threading.Thread(target=reader, daemon=True).start()
     return info
 
 def _kill_shell(uid):
     info = shell_procs.pop(uid, None)
     if info:
-        try: info['process'].stdin.close()
-        except: pass
-        try: info['process'].kill()
-        except: pass
-
-def _run_shell_cmd(message, cmd_text):
-    uid = message.from_user.id
-    for d in ['rm -rf /*', 'dd if=', 'mkfs', ':(){', '> /dev/sda']:
-        if d in cmd_text:
-            return safe_reply(message, f"🚫 *Blocked:* `{d}`", 'Markdown')
-
-    exit_mk = types.InlineKeyboardMarkup()
-    exit_mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
-
-    try:
-        info = _get_or_create_shell(uid)
-
-        # Prepend source of nvm.sh to make nvm available in one-off commands
-        nvm_script = os.path.join(get_user_home(uid), '.nvm', 'nvm.sh')
-        if os.path.exists(nvm_script):
-            full_cmd = f'source "{nvm_script}" && {cmd_text}'
-        else:
-            full_cmd = cmd_text
-
-        if info.get('waiting_input') and info['process'].poll() is None:
-            info['waiting_input'] = False
-            try:
-                info['process'].stdin.write(full_cmd + '\n')
-                info['process'].stdin.flush()
-            except BrokenPipeError:
-                _kill_shell(uid)
-                safe_reply(message, "❌ Shell died. Send a command to reopen.", 'Markdown', exit_mk)
-            return
-
-        with info['lock']:
-            info['output_lines'].clear()
-        status = safe_reply(message, f"$ `{cmd_text}`\n⏳ Running...", 'Markdown', exit_mk)
-        sentinel = f"__DONE_{int(time.time())}__"
-        info['process'].stdin.write(full_cmd + '\n')
-        info['process'].stdin.write(f"echo {sentinel}\n")
-        info['process'].stdin.flush()
-
-        collected = []
-        deadline  = time.time() + 10
-        last_edit = time.time()
-
-        while time.time() < deadline:
-            time.sleep(0.2)
-            with info['lock']:
-                new_lines = info['output_lines'].copy()
-                info['output_lines'].clear()
-            collected.extend(new_lines)
-
-            done    = any(sentinel in l for l in collected)
-            visible = [l for l in collected if sentinel not in l]
-
-            now = time.time()
-            if now - last_edit >= 1.0 or done:
-                preview = "".join(visible)[-2500:].strip()
-                display = f"```\n{preview}\n```" if preview else "✅ No output"
-                try:
-                    safe_edit(status.chat.id, status.message_id,
-                              f"$ `{cmd_text}`\n\n{display}", 'Markdown', exit_mk)
-                    last_edit = now
-                except: pass
-                if done: break
-
-        if time.time() >= deadline:
-            info['waiting_input'] = True
-            visible = [l for l in collected if sentinel not in l]
-            preview = "".join(visible)[-2500:].strip()
-            display = f"```\n{preview}\n```" if preview else ""
-            try:
-                safe_edit(status.chat.id, status.message_id,
-                          f"$ `{cmd_text}`\n\n{display}", 'Markdown', exit_mk)
-            except: pass
-
         try:
-            visible_out = "".join([l for l in collected if sentinel not in l])[:500]
-            conn = sqlite3.connect(DB_PATH)
-            conn.execute('INSERT INTO cmd_log (uid,cmd,time,output) VALUES (?,?,?,?)',
-                         (uid, cmd_text, datetime.now().isoformat(), visible_out))
-            conn.commit(); conn.close()
-        except: pass
+            os.close(info['fd'])
+        except:
+            pass
+        try:
+            os.kill(info['pid'], 9)
+        except:
+            pass
 
-    except BrokenPipeError:
-        _kill_shell(uid)
-        safe_reply(message, "❌ Shell died. Send a command to reopen.", 'Markdown', exit_mk)
-    except Exception as e:
-        safe_reply(message, f"❌ `{e}`", 'Markdown', exit_mk)
+def _send_pty_output(info, force=False):
+    """Send buffered PTY output to Telegram, throttled."""
+    now = time.time()
+    with info['lock']:
+        if not info['output_buffer']:
+            return
+        if not force and now - info['last_update'] < 0.8:
+            return
+        data = bytes(info['output_buffer'])
+        info['output_buffer'].clear()
+        info['last_update'] = now
+
+    if not data:
+        return
+
+    text = data.decode('utf-8', errors='replace')
+    # Escape for Telegram Markdown (keep it simple)
+    if len(text) > 3000:
+        text = text[-3000:]
+    # Use ``` to preserve formatting
+    formatted = f"```\n{text}\n```"
+
+    if info.get('chat_id') and info.get('status_msg_id'):
+        try:
+            bot.edit_message_text(formatted, info['chat_id'], info['status_msg_id'],
+                                  parse_mode='Markdown')
+        except Exception as e:
+            if "message is not modified" not in str(e):
+                logger.warning(f"PTY output edit failed: {e}")
 
 @bot.message_handler(commands=['shell'])
 def cmd_shell(message):
     uid = message.from_user.id
     parts = message.text.strip().split(' ', 1)
     if len(parts) > 1 and parts[1].strip():
-        _run_shell_cmd(message, parts[1].strip())
-    else:
-        shell_sessions[uid] = True
-        _get_or_create_shell(uid)
-        mk = types.InlineKeyboardMarkup()
-        mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
-        safe_reply(message, "💻 *Shell Active*\nYour private VPS environment is ready.\nUse `pyenv` / `nvm` to manage versions.", 'Markdown', mk)
+        # One‑off command: run raw, no PTY overhead
+        cmd_text = parts[1].strip()
+        home = setup_user_home(uid)
+        env = get_user_env(uid)
+        # Ensure nvm is available if needed
+        nvm_script = os.path.join(home, '.nvm', 'nvm.sh')
+        if os.path.exists(nvm_script):
+            full_cmd = f'source "{nvm_script}" && {cmd_text}'
+        else:
+            full_cmd = cmd_text
+        try:
+            res = subprocess.run(['bash', '-c', full_cmd], capture_output=True, text=True,
+                                 timeout=30, cwd=home, env=env, preexec_fn=resource_limits(uid))
+            output = res.stdout
+            if res.stderr:
+                output += "\n" + res.stderr
+            if not output.strip():
+                output = "(no output)"
+            if len(output) > 3500:
+                output = output[-3500:]
+            safe_reply(message, f"$ `{cmd_text}`\n```\n{output}\n```", 'Markdown')
+        except subprocess.TimeoutExpired:
+            safe_reply(message, f"$ `{cmd_text}`\n⏱️ *Command timed out*", 'Markdown')
+        except Exception as e:
+            safe_reply(message, f"❌ `{e}`", 'Markdown')
+        return
+
+    # Interactive shell
+    shell_sessions[uid] = True
+    info = _get_or_create_shell(uid)
+    info['chat_id'] = message.chat.id
+
+    mk = types.InlineKeyboardMarkup()
+    mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
+
+    sent = safe_reply(message, "💻 *Shell Active*\nInitializing PTY...", 'Markdown', mk)
+    info['status_msg_id'] = sent.message_id
+    # Send initial prompt after a short delay
+    time.sleep(0.5)
+    _send_pty_output(info, force=True)
 
 @bot.callback_query_handler(func=lambda c: c.data == "exit_shell")
 def cb_exit_shell(c):
     uid = c.from_user.id
     shell_sessions.pop(uid, None)
     _kill_shell(uid)
-    try: safe_edit(c.message.chat.id, c.message.message_id, "💻 *Shell Closed*", 'Markdown')
-    except: pass
+    try:
+        safe_edit(c.message.chat.id, c.message.message_id, "💻 *Shell Closed*", 'Markdown')
+    except:
+        pass
     bot.answer_callback_query(c.id, "Shell closed")
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('reopen_shell_'))
+def cb_reopen_shell(c):
+    uid = int(c.data.split('_')[2])
+    if c.from_user.id != uid:
+        return bot.answer_callback_query(c.id, "Access denied")
+    shell_sessions[uid] = True
+    info = _get_or_create_shell(uid)
+    info['chat_id'] = c.message.chat.id
+
+    mk = types.InlineKeyboardMarkup()
+    mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
+
+    sent = bot.send_message(c.message.chat.id, "💻 *Shell Active*\nInitializing PTY...",
+                            parse_mode='Markdown', reply_markup=mk)
+    info['status_msg_id'] = sent.message_id
+    time.sleep(0.5)
+    _send_pty_output(info, force=True)
+    bot.answer_callback_query(c.id)
+
+# ==================== SHELL SESSION INTERCEPT ====================
+@bot.message_handler(func=lambda m: m.from_user and shell_sessions.get(m.from_user.id) and m.text)
+def shell_session_input(m):
+    uid = m.from_user.id
+    text = m.text
+    if text.lower() in ('exit', 'quit', 'q'):
+        shell_sessions.pop(uid, None)
+        _kill_shell(uid)
+        safe_reply(m, "💻 *Shell closed*", 'Markdown')
+        return
+
+    info = shell_procs.get(uid)
+    if not info:
+        safe_reply(m, "⚠️ Shell session not active. Use /shell to start one.", 'Markdown')
+        shell_sessions.pop(uid, None)
+        return
+
+    # Send input to PTY
+    try:
+        os.write(info['fd'], (text + '\n').encode())
+    except:
+        shell_sessions.pop(uid, None)
+        _kill_shell(uid)
+        safe_reply(m, "❌ Shell died. Send /shell to reopen.", 'Markdown')
+        return
+
+    # Give the command a moment to produce output, then flush
+    time.sleep(0.3)
+    _send_pty_output(info, force=True)
 
 # ==================== ENV VAR COMMANDS ====================
 def _env_file_picker(uid, chat_id, action, msg_id=None):
@@ -1511,7 +1619,7 @@ def cmd_help(message):
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('help_'))
 def cb_help(c):
-    section = c.data[5:]  # 'general' or 'advanced'
+    section = c.data[5:]
     text = get_help_text(section, c.from_user.id)
     mk = types.InlineKeyboardMarkup()
     mk.row(types.InlineKeyboardButton("📖 General", callback_data="help_general"),
@@ -2772,10 +2880,14 @@ def btn_admin(m):
 def btn_shell(m):
     uid = m.from_user.id
     shell_sessions[uid] = True
-    _get_or_create_shell(uid)
+    info = _get_or_create_shell(uid)
+    info['chat_id'] = m.chat.id
     mk = types.InlineKeyboardMarkup()
     mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
-    safe_reply(m, "💻 *Shell Active*\nYour private VPS environment is ready.\nUse `pyenv` / `nvm` to manage versions.", 'Markdown', mk)
+    sent = safe_reply(m, "💻 *Shell Active*\nInitializing PTY...", 'Markdown', mk)
+    info['status_msg_id'] = sent.message_id
+    time.sleep(0.5)
+    _send_pty_output(info, force=True)
 
 @bot.message_handler(func=lambda m: m.text == "📁 All Files")
 def btn_all_files(m):
@@ -2800,16 +2912,6 @@ def btn_all_files(m):
 @bot.message_handler(func=lambda m: m.text == "🤖 Clone")
 def btn_clone(m):
     exit_shell_if_active(m.from_user.id); cmd_clone(m)
-
-# ==================== SHELL SESSION INTERCEPT ====================
-@bot.message_handler(func=lambda m: m.from_user and shell_sessions.get(m.from_user.id) and m.text)
-def shell_session_input(m):
-    uid = m.from_user.id; text = m.text.strip()
-    if not text: return
-    if text.lower() in ('exit', 'quit', 'q'):
-        shell_sessions.pop(uid, None)
-        return safe_reply(m, "💻 *Shell closed*", 'Markdown')
-    _run_shell_cmd(m, text)
 
 # ==================== ENV & SLUG CONVERSATION ====================
 @bot.message_handler(func=lambda m: m.from_user and m.from_user.id in waiting_env and m.text)
@@ -2866,6 +2968,8 @@ def fallback(m):
 
 # ==================== CLEANUP ====================
 def cleanup():
+    for uid, info in list(shell_procs.items()):
+        _kill_shell(uid)
     for info in scripts.values():
         if info.get('process') and info['process'].poll() is None:
             try: kill_process_tree(info['process'].pid)
