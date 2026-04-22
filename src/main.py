@@ -175,6 +175,7 @@ site_slugs      = {}   # uid -> {filename -> slug}
 waiting_slug    = {}   # uid -> {name, uid}
 waiting_env     = {}   # uid -> {step, name, key, chat_id, msg_id}
 banned_users    = set()
+ctrl_active     = {}   # uid -> bool (for Ctrl toggle)
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -1245,10 +1246,8 @@ def _get_or_create_shell(uid):
         # Notify user if we have a status message
         if info.get('chat_id') and info.get('status_msg_id'):
             try:
-                mk = types.InlineKeyboardMarkup()
-                mk.add(types.InlineKeyboardButton("💻 Reopen Shell", callback_data=f"reopen_shell_{uid}"))
                 bot.edit_message_text("💀 *Shell session ended*", info['chat_id'],
-                                      info['status_msg_id'], parse_mode='Markdown', reply_markup=mk)
+                                      info['status_msg_id'], parse_mode='Markdown')
             except:
                 pass
 
@@ -1283,7 +1282,14 @@ def _send_pty_output(info, force=False):
         return
 
     text = data.decode('utf-8', errors='replace')
-    # Escape for Telegram Markdown (keep it simple)
+    # Strip ANSI escape sequences and control characters for clean display
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    text = ansi_escape.sub('', text)
+    # Remove bracketed paste mode and other common control sequences
+    text = re.sub(r'\x1b\[\?2004[hl]', '', text)
+    # Keep only printable characters and newlines
+    text = ''.join(c for c in text if c.isprintable() or c in '\n\r\t')
+    
     if len(text) > 3000:
         text = text[-3000:]
     # Use ``` to preserve formatting
@@ -1296,6 +1302,22 @@ def _send_pty_output(info, force=False):
         except Exception as e:
             if "message is not modified" not in str(e):
                 logger.warning(f"PTY output edit failed: {e}")
+
+def build_shell_keyboard(uid):
+    """Build inline keyboard with control buttons."""
+    mk = types.InlineKeyboardMarkup(row_width=3)
+    ctrl_text = "Ctrl ✓" if ctrl_active.get(uid, False) else "Ctrl"
+    mk.row(
+        types.InlineKeyboardButton(ctrl_text, callback_data=f"shell_ctrl_{uid}"),
+        types.InlineKeyboardButton("Esc", callback_data=f"shell_esc_{uid}"),
+        types.InlineKeyboardButton("Tab", callback_data=f"shell_tab_{uid}")
+    )
+    mk.row(
+        types.InlineKeyboardButton("↑", callback_data=f"shell_up_{uid}"),
+        types.InlineKeyboardButton("↓", callback_data=f"shell_down_{uid}"),
+        types.InlineKeyboardButton("❌ Exit", callback_data=f"shell_exit_{uid}")
+    )
+    return mk
 
 @bot.message_handler(commands=['shell'])
 def cmd_shell(message):
@@ -1331,11 +1353,11 @@ def cmd_shell(message):
 
     # Interactive shell
     shell_sessions[uid] = True
+    ctrl_active[uid] = False
     info = _get_or_create_shell(uid)
     info['chat_id'] = message.chat.id
 
-    mk = types.InlineKeyboardMarkup()
-    mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
+    mk = build_shell_keyboard(uid)
 
     sent = safe_reply(message, "💻 *Shell Active*\nInitializing PTY...", 'Markdown', mk)
     info['status_msg_id'] = sent.message_id
@@ -1343,43 +1365,73 @@ def cmd_shell(message):
     time.sleep(0.5)
     _send_pty_output(info, force=True)
 
-@bot.callback_query_handler(func=lambda c: c.data == "exit_shell")
-def cb_exit_shell(c):
-    uid = c.from_user.id
-    shell_sessions.pop(uid, None)
-    _kill_shell(uid)
-    try:
-        safe_edit(c.message.chat.id, c.message.message_id, "💻 *Shell Closed*", 'Markdown')
-    except:
-        pass
-    bot.answer_callback_query(c.id, "Shell closed")
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith('reopen_shell_'))
-def cb_reopen_shell(c):
+# ==================== SHELL BUTTON CALLBACKS ====================
+@bot.callback_query_handler(func=lambda c: c.data.startswith('shell_'))
+def shell_button_handler(c):
     uid = int(c.data.split('_')[2])
     if c.from_user.id != uid:
         return bot.answer_callback_query(c.id, "Access denied")
-    shell_sessions[uid] = True
-    info = _get_or_create_shell(uid)
-    info['chat_id'] = c.message.chat.id
+    
+    action = c.data.split('_')[1]
+    info = shell_procs.get(uid)
+    if not info:
+        bot.answer_callback_query(c.id, "Shell not active")
+        return
 
-    mk = types.InlineKeyboardMarkup()
-    mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
+    if action == "ctrl":
+        # Toggle Ctrl mode
+        ctrl_active[uid] = not ctrl_active.get(uid, False)
+        # Update keyboard to reflect new state
+        mk = build_shell_keyboard(uid)
+        bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=mk)
+        state = "ON" if ctrl_active[uid] else "OFF"
+        bot.answer_callback_query(c.id, f"Ctrl mode {state}")
+    elif action == "esc":
+        os.write(info['fd'], b'\x1b')
+        bot.answer_callback_query(c.id, "Esc sent")
+    elif action == "tab":
+        os.write(info['fd'], b'\t')
+        bot.answer_callback_query(c.id, "Tab sent")
+    elif action == "up":
+        os.write(info['fd'], b'\x1b[A')
+        bot.answer_callback_query(c.id, "↑ sent")
+    elif action == "down":
+        os.write(info['fd'], b'\x1b[B')
+        bot.answer_callback_query(c.id, "↓ sent")
+    elif action == "exit":
+        shell_sessions.pop(uid, None)
+        ctrl_active.pop(uid, None)
+        _kill_shell(uid)
+        bot.edit_message_text("💻 *Shell Closed*", c.message.chat.id, c.message.message_id,
+                              parse_mode='Markdown')
+        bot.answer_callback_query(c.id, "Shell closed")
+        return
 
-    sent = bot.send_message(c.message.chat.id, "💻 *Shell Active*\nInitializing PTY...",
-                            parse_mode='Markdown', reply_markup=mk)
-    info['status_msg_id'] = sent.message_id
-    time.sleep(0.5)
+    # Give PTY a moment to process and then flush output
+    time.sleep(0.2)
     _send_pty_output(info, force=True)
-    bot.answer_callback_query(c.id)
 
 # ==================== SHELL SESSION INTERCEPT ====================
+# Texts that should NOT be sent to the shell (bot commands / menu buttons)
+BOT_COMMAND_TEXTS = {
+    "📂 Files", "👤 Profile", "📊 Stats", "❓ Help",
+    "📢 Channel", "📞 Contact", "💻 Shell", "🤖 Clone",
+    "🟢 Running", "💳 Subs", "⏳ Pending", "🤖 Clones",
+    "👑 Admin", "🔒 Lock", "📁 All Files", "📜 Bot Logs"
+}
+
 @bot.message_handler(func=lambda m: m.from_user and shell_sessions.get(m.from_user.id) and m.text)
 def shell_session_input(m):
     uid = m.from_user.id
-    text = m.text
+    text = m.text.strip()
+    
+    # Ignore bot commands and menu button texts
+    if text.startswith('/') or text in BOT_COMMAND_TEXTS:
+        return
+    
     if text.lower() in ('exit', 'quit', 'q'):
         shell_sessions.pop(uid, None)
+        ctrl_active.pop(uid, None)
         _kill_shell(uid)
         safe_reply(m, "💻 *Shell closed*", 'Markdown')
         return
@@ -1390,14 +1442,29 @@ def shell_session_input(m):
         shell_sessions.pop(uid, None)
         return
 
-    # Send input to PTY
-    try:
-        os.write(info['fd'], (text + '\n').encode())
-    except:
-        shell_sessions.pop(uid, None)
-        _kill_shell(uid)
-        safe_reply(m, "❌ Shell died. Send /shell to reopen.", 'Markdown')
-        return
+    # Check if Ctrl is active for this user
+    if ctrl_active.get(uid, False) and len(text) == 1:
+        # Convert letter to control character
+        c = text[0]
+        if 'a' <= c.lower() <= 'z':
+            ctrl_char = chr(ord(c.upper()) - 64)
+            os.write(info['fd'], ctrl_char.encode())
+            ctrl_active[uid] = False
+            # Update keyboard to reflect Ctrl off
+            mk = build_shell_keyboard(uid)
+            bot.edit_message_reply_markup(m.chat.id, info['status_msg_id'], reply_markup=mk)
+        else:
+            # Not a letter, send normally
+            os.write(info['fd'], (text + '\n').encode())
+    else:
+        # Send input normally to PTY
+        try:
+            os.write(info['fd'], (text + '\n').encode())
+        except:
+            shell_sessions.pop(uid, None)
+            _kill_shell(uid)
+            safe_reply(m, "❌ Shell died. Send /shell to reopen.", 'Markdown')
+            return
 
     # Give the command a moment to produce output, then flush
     time.sleep(0.3)
@@ -2698,6 +2765,7 @@ def cb_back(c):
 # ==================== BUTTON HANDLERS ====================
 def exit_shell_if_active(uid):
     shell_sessions.pop(uid, None)
+    ctrl_active.pop(uid, None)
     waiting_env.pop(uid, None)
     waiting_slug.pop(uid, None)
 
@@ -2880,10 +2948,11 @@ def btn_admin(m):
 def btn_shell(m):
     uid = m.from_user.id
     shell_sessions[uid] = True
+    ctrl_active[uid] = False
     info = _get_or_create_shell(uid)
     info['chat_id'] = m.chat.id
-    mk = types.InlineKeyboardMarkup()
-    mk.add(types.InlineKeyboardButton("❌ Exit Shell", callback_data="exit_shell"))
+
+    mk = build_shell_keyboard(uid)
     sent = safe_reply(m, "💻 *Shell Active*\nInitializing PTY...", 'Markdown', mk)
     info['status_msg_id'] = sent.message_id
     time.sleep(0.5)
