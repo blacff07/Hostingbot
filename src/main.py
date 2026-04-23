@@ -1651,7 +1651,7 @@ def shell_session_input(m):
         "🟢 Running", "💳 Subs", "⏳ Pending", "🤖 Clones",
         "👑 Admin", "🔒 Lock", "📁 All Files", "📜 Bot Logs"
     } or text.startswith('/') or uid in waiting_env or uid in waiting_slug:
-        return False       # let other handlers process
+        return False       # let other handlers process this message
 
     _execute_shell_command(uid, text, m.chat.id)
     return True
