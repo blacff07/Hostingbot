@@ -1284,12 +1284,22 @@ def _get_clean_pty_output(info):
 
 def _format_shell_message(command, output):
     """Format a command and its output for a new message.
-       Multi‑line commands are displayed with each line indented under the $."""
+       Automatically truncates if output exceeds Telegram's 4096 character limit."""
     separator = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
-    lines = output.splitlines()
+    MAX_MSG_LEN = 4096
+    
+    # Format the command header
+    if '\n' in command:
+        cmd_lines = command.split('\n')
+        header = "$ `" + cmd_lines[0] + "\n  " + "\n  ".join(cmd_lines[1:]) + "`"
+    else:
+        header = f"$ `{command}`"
 
-    # The first line of output is the command line (prompt + command)
-    # Keep it as the first line inside the code block
+    base_template = f"{header}\n{separator}\n```\n{{output}}\n```"
+    base_overhead = len(base_template.format(output=""))
+
+    # Clean output lines
+    lines = output.splitlines()
     cleaned_lines = []
     found_command_line = False
     for line in lines:
@@ -1300,17 +1310,20 @@ def _format_shell_message(command, output):
             cleaned_lines.append(line)
     cleaned_output = "\n".join(cleaned_lines).rstrip()
 
-    # Format the command header
-    if '\n' in command:
-        cmd_lines = command.split('\n')
-        header = "$ `" + cmd_lines[0] + "\n  " + "\n  ".join(cmd_lines[1:]) + "`"
-    else:
-        header = f"$ `{command}`"
+    if not cleaned_output:
+        return base_template.format(output="(no output)")
 
-    if cleaned_output:
-        return f"{header}\n{separator}\n```\n{cleaned_output}\n```"
-    else:
-        return f"{header}\n{separator}\n```\n(no output)\n```"
+    # Check if full output fits
+    full_msg = base_template.format(output=cleaned_output)
+    if len(full_msg) <= MAX_MSG_LEN:
+        return full_msg
+
+    # Truncate from the end
+    max_output_len = MAX_MSG_LEN - base_overhead - len("... (truncated)")
+    truncated = cleaned_output[-max_output_len:] if max_output_len > 0 else ""
+    if truncated != cleaned_output:
+        truncated = "... (truncated)\n" + truncated
+    return base_template.format(output=truncated)
 
 def build_shell_keyboard(uid):
     """Return inline keyboard for shell control."""
@@ -1488,6 +1501,20 @@ def shell_button_handler(c):
                 new_content = old_content
         else:
             new_content = old_content
+
+        # Ensure new_content does not exceed Telegram limit
+        if len(new_content) > 4096:
+            # Keep the most recent part
+            excess = len(new_content) - 4096
+            # Try to trim from the beginning of the code block
+            if '```\n' in new_content:
+                parts2 = new_content.split('```\n', 1)
+                header_part = parts2[0] + '```\n'
+                code_part = parts2[1].rsplit('\n```', 1)[0] if '\n```' in parts2[1] else parts2[1]
+                suffix = parts2[1].rsplit('\n```', 1)[1] if '\n```' in parts2[1] else ''
+                if len(code_part) > excess + 200:
+                    code_part = "... (truncated)\n" + code_part[excess+200:]
+                new_content = header_part + code_part + '\n```' + suffix
 
         mk = build_shell_keyboard(uid)
         try:
