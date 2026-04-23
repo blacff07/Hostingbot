@@ -178,6 +178,12 @@ banned_users    = set()
 ctrl_active     = {}   # uid -> bool
 alt_active      = {}   # uid -> bool
 
+# ==================== SHELL STATE ====================
+shell_procs = {}            # uid -> PTY info dict
+shell_intro_msg = {}        # uid -> message_id of the static intro (message #1)
+shell_active_msg = {}       # uid -> message_id of the latest output message (with buttons)
+shell_last_prompt = {}      # uid -> the current prompt line text (for arrow key updates)
+
 # ==================== LOGGING ====================
 logging.basicConfig(
     level=logging.INFO,
@@ -1147,32 +1153,58 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
         return False, str(e)
 
 # ==================== SHELL (REAL PTY) ====================
-shell_procs = {}
-shell_live_msg = {}      # uid -> message_id of current live shell message
-shell_content = {}       # uid -> accumulated text for live message
-shell_last_output = {}   # uid -> last command output (without prompt)
+def _kill_shell(uid):
+    """Kill the PTY process and cleanup."""
+    info = shell_procs.pop(uid, None)
+    if info:
+        try:
+            os.close(info['fd'])
+        except:
+            pass
+        try:
+            os.kill(info['pid'], 9)
+        except:
+            pass
+
+def _get_clean_pty_output(info, clear_buffer=True):
+    """Read from PTY buffer, clean ANSI escapes, return text."""
+    with info['lock']:
+        if not info['output_buffer']:
+            return ""
+        data = bytes(info['output_buffer'])
+        if clear_buffer:
+            info['output_buffer'].clear()
+
+    text = data.decode('utf-8', errors='replace')
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    text = ansi_escape.sub('', text)
+    text = re.sub(r'\x1b\[\?2004[hl]', '', text)
+    return text
 
 def _get_or_create_shell(uid):
     """Spawn a real PTY with bash, fully interactive."""
     info = shell_procs.get(uid)
-    if info and info['fd'] is not None:
+    if info and info.get('fd') is not None:
         try:
             os.kill(info['pid'], 0)
             return info
         except OSError:
-            shell_procs.pop(uid, None)
+            _kill_shell(uid)
+            info = None
 
     home = setup_user_home(uid)
     bashrc = os.path.join(home, '.bashrc')
     env = get_user_env(uid)
 
-    nvm_dir = os.path.join(home, '.nvm')
-    nvm_script = os.path.join(nvm_dir, 'nvm.sh')
-    if os.path.exists(nvm_script):
-        node_versions = os.path.join(nvm_dir, 'versions', 'node')
-        if not os.path.exists(node_versions) or not os.listdir(node_versions):
-            subprocess.run(['bash', '-c', f'source "{nvm_script}" && nvm install --lts'],
-                           cwd=home, env=env, capture_output=True, timeout=300)
+    # Ensure nvm and node are installed (background thread to avoid blocking)
+    def _install_node():
+        nvm_script = os.path.join(home, '.nvm', 'nvm.sh')
+        if os.path.exists(nvm_script):
+            node_versions = os.path.join(home, '.nvm', 'versions', 'node')
+            if not os.path.exists(node_versions) or not os.listdir(node_versions):
+                subprocess.run(['bash', '-c', f'source "{nvm_script}" && nvm install --lts'],
+                               cwd=home, env=env, capture_output=True, timeout=300)
+    threading.Thread(target=_install_node, daemon=True).start()
 
     master_fd, slave_fd = pty.openpty()
     try:
@@ -1207,7 +1239,6 @@ def _get_or_create_shell(uid):
         'lock': threading.Lock(),
         'output_buffer': bytearray(),
         'chat_id': None,
-        'last_prompt': '',
     }
     shell_procs[uid] = info
 
@@ -1224,109 +1255,41 @@ def _get_or_create_shell(uid):
                         info['output_buffer'].extend(data)
             except:
                 break
-        shell_procs.pop(uid, None)
-        try:
-            os.close(fd)
-        except:
-            pass
-        try:
-            os.kill(pid, 9)
-        except:
-            pass
-        if uid in shell_live_msg:
-            try:
-                bot.edit_message_text(
-                    f"{shell_content.get(uid, '')}\n\n⚙ *Shell Session Ended*",
-                    info['chat_id'], shell_live_msg[uid], parse_mode='Markdown'
-                )
-            except:
-                pass
-            shell_live_msg.pop(uid, None)
-            shell_content.pop(uid, None)
-            shell_last_output.pop(uid, None)
+        # Process died; cleanup will happen on next shell command or exit
 
     threading.Thread(target=reader, daemon=True).start()
     return info
 
-def _kill_shell(uid):
-    info = shell_procs.pop(uid, None)
-    if info:
-        try:
-            os.close(info['fd'])
-        except:
-            pass
-        try:
-            os.kill(info['pid'], 9)
-        except:
-            pass
-
-def _get_clean_pty_output(info):
-    """Return cleaned output and update last prompt."""
-    with info['lock']:
-        if not info['output_buffer']:
-            return ""
-        data = bytes(info['output_buffer'])
-        info['output_buffer'].clear()
-
-    text = data.decode('utf-8', errors='replace')
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    text = ansi_escape.sub('', text)
-    text = re.sub(r'\x1b\[\?2004[hl]', '', text)
-
-    lines = text.splitlines()
-    if lines:
-        last = lines[-1].strip()
-        if last and not last.startswith('$') and not last.startswith('#'):
-            info['last_prompt'] = last
-        else:
-            info['last_prompt'] = lines[-1] if lines else ''
-    return text
-
-def _format_shell_message(command, output):
-    """Format a command and its output for a new message.
-       Automatically truncates if output exceeds Telegram's 4096 character limit."""
+def _format_shell_output(command, full_output):
+    """Format command and output for a new message."""
     separator = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
     MAX_MSG_LEN = 4096
-    
-    # Format the command header
+
     if '\n' in command:
         cmd_lines = command.split('\n')
         header = "$ `" + cmd_lines[0] + "\n  " + "\n  ".join(cmd_lines[1:]) + "`"
     else:
         header = f"$ `{command}`"
 
-    base_template = f"{header}\n{separator}\n```\n{{output}}\n```"
+    base_template = f"{header}\n{separator}\n```bash\n{{output}}\n```"
     base_overhead = len(base_template.format(output=""))
 
-    # Clean output lines
-    lines = output.splitlines()
-    cleaned_lines = []
-    found_command_line = False
-    for line in lines:
-        if not found_command_line and (line.strip().endswith(command.split('\n')[0]) or command.split('\n')[0] in line):
-            found_command_line = True
-            cleaned_lines.append(line)
-        elif found_command_line:
-            cleaned_lines.append(line)
-    cleaned_output = "\n".join(cleaned_lines).rstrip()
-
-    if not cleaned_output:
+    if not full_output.strip():
         return base_template.format(output="(no output)")
 
-    # Check if full output fits
-    full_msg = base_template.format(output=cleaned_output)
+    full_msg = base_template.format(output=full_output)
     if len(full_msg) <= MAX_MSG_LEN:
         return full_msg
 
-    # Truncate from the end
-    max_output_len = MAX_MSG_LEN - base_overhead - len("... (truncated)")
-    truncated = cleaned_output[-max_output_len:] if max_output_len > 0 else ""
-    if truncated != cleaned_output:
+    # Truncate from beginning
+    max_output_len = MAX_MSG_LEN - base_overhead - len("\n... (truncated)")
+    truncated = full_output[-max_output_len:] if max_output_len > 0 else ""
+    if truncated != full_output:
         truncated = "... (truncated)\n" + truncated
     return base_template.format(output=truncated)
 
 def build_shell_keyboard(uid):
-    """Return inline keyboard for shell control."""
+    """Inline keyboard for shell control."""
     mk = types.InlineKeyboardMarkup(row_width=3)
     ctrl_text = "Ctrl ✓" if ctrl_active.get(uid, False) else "Ctrl"
     alt_text = "Alt ✓" if alt_active.get(uid, False) else "Alt"
@@ -1343,58 +1306,180 @@ def build_shell_keyboard(uid):
     )
     return mk
 
-def _remove_keyboard_from_message(chat_id, msg_id):
+def _update_prompt_line(chat_id, msg_id, new_prompt):
+    """Edit the last line of the code block in the given message to new_prompt."""
+    try:
+        msg = bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text="...",  # placeholder, will be replaced
+            parse_mode='Markdown'
+        )
+        current_text = msg.text
+    except:
+        # If we can't fetch, assume we stored it
+        return
+
+    # Find the last occurrence of a code block and replace its last line
+    parts = current_text.rsplit('```bash\n', 1)
+    if len(parts) != 2:
+        return
+    header = parts[0] + '```bash\n'
+    rest = parts[1]
+    code_parts = rest.rsplit('\n```', 1)
+    if len(code_parts) != 2:
+        return
+    code = code_parts[0]
+    suffix = '\n```' + code_parts[1]
+
+    lines = code.split('\n')
+    if lines:
+        lines[-1] = new_prompt
+    new_code = '\n'.join(lines)
+    new_text = header + new_code + suffix
+
+    try:
+        bot.edit_message_text(new_text, chat_id, msg_id, parse_mode='Markdown')
+    except:
+        pass
+
+def _remove_buttons(chat_id, msg_id):
     try:
         bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
     except:
         pass
 
+def _append_line_to_message(chat_id, msg_id, append_text):
+    """Append text to the end of a message (after the code block)."""
+    try:
+        msg = bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text="...",  # placeholder
+            parse_mode='Markdown'
+        )
+        current = msg.text
+        if not current.endswith('```'):
+            # Append after the closing ```
+            new_text = current.rstrip() + "\n" + append_text
+        else:
+            new_text = current + "\n" + append_text
+        bot.edit_message_text(new_text, chat_id, msg_id, parse_mode='Markdown')
+    except:
+        pass
+
+def _execute_shell_command(uid, command, chat_id, from_inline=False):
+    """Send command to PTY, read output, handle message flow."""
+    info = _get_or_create_shell(uid)
+    if not info:
+        safe_send(chat_id, "❌ Shell not active.")
+        return
+
+    # Clear any stale output before sending command
+    _get_clean_pty_output(info, clear_buffer=True)
+
+    # Send the command
+    os.write(info['fd'], (command + '\n').encode())
+
+    # Wait for command to finish and capture output
+    time.sleep(0.5)
+    output = ""
+    deadline = time.time() + 10  # max wait for command prompt to return
+    while time.time() < deadline:
+        chunk = _get_clean_pty_output(info, clear_buffer=True)
+        if chunk:
+            output += chunk
+        if output and ('$' in output or '#' in output):
+            # prompt returned
+            break
+        time.sleep(0.3)
+
+    # Extract the last line as the new prompt
+    lines = output.splitlines()
+    prompt_line = lines[-1] if lines else f"user@host:~$ "
+    shell_last_prompt[uid] = prompt_line
+
+    # Clean up output: remove the final prompt line (we'll add it ourselves)
+    if lines and (lines[-1].endswith('$ ') or lines[-1].endswith('# ')):
+        output = '\n'.join(lines[:-1])
+
+    # Build full output with command line
+    # The PTY echoes the command, so we can just use the output as-is
+    full_output = output.strip()
+    if not full_output:
+        full_output = command + "\n(no output)"
+
+    # Determine if this is the first command (intro message still has buttons)
+    is_first_command = (uid in shell_intro_msg and shell_intro_msg[uid] is not None)
+    prev_active = shell_active_msg.get(uid)
+
+    if is_first_command:
+        # Remove buttons from intro message
+        if shell_intro_msg[uid]:
+            _remove_buttons(chat_id, shell_intro_msg[uid])
+            shell_intro_msg[uid] = None  # mark as static
+
+    if prev_active:
+        # Remove buttons from previous output
+        _remove_buttons(chat_id, prev_active)
+
+    # Send new output message with buttons (unless exiting)
+    is_exit = command.strip().lower() in ('exit', 'quit', 'q')
+    if is_exit:
+        # Append "Shell Session Ended" to this message
+        full_output += "\n\n⚙ *Shell Session Ended*"
+        mk = None
+    else:
+        mk = build_shell_keyboard(uid)
+
+    formatted = _format_shell_output(command, full_output)
+    sent = safe_send(chat_id, formatted, 'Markdown', mk)
+    shell_active_msg[uid] = sent.message_id
+
+    if is_exit:
+        # Cleanup shell
+        _kill_shell(uid)
+        shell_sessions.pop(uid, None)
+        ctrl_active.pop(uid, None)
+        alt_active.pop(uid, None)
+        shell_intro_msg.pop(uid, None)
+        shell_active_msg.pop(uid, None)
+        shell_last_prompt.pop(uid, None)
+
+# ==================== SHELL HANDLERS ====================
 @bot.message_handler(commands=['shell'])
 def cmd_shell(message):
     uid = message.from_user.id
+    chat_id = message.chat.id
+
     parts = message.text.strip().split(' ', 1)
     if len(parts) > 1 and parts[1].strip():
+        # One-off command
         cmd_text = parts[1].strip()
-        home = setup_user_home(uid)
-        env = get_user_env(uid)
-        nvm_script = os.path.join(home, '.nvm', 'nvm.sh')
-        if os.path.exists(nvm_script):
-            full_cmd = f'source "{nvm_script}" && {cmd_text}'
-        else:
-            full_cmd = cmd_text
-        try:
-            res = subprocess.run(['bash', '-c', full_cmd], capture_output=True, text=True,
-                                 timeout=30, cwd=home, env=env, preexec_fn=resource_limits(uid))
-            output = res.stdout
-            if res.stderr:
-                output += "\n" + res.stderr
-            safe_reply(message, _format_shell_message(cmd_text, output), 'Markdown')
-        except subprocess.TimeoutExpired:
-            safe_reply(message, f"$ `{cmd_text}`\n⏱️ *Command timed out*", 'Markdown')
-        except Exception as e:
-            safe_reply(message, f"❌ `{e}`", 'Markdown')
+        info = _get_or_create_shell(uid)
+        os.write(info['fd'], (cmd_text + '\n').encode())
+        time.sleep(0.5)
+        output = _get_clean_pty_output(info, clear_buffer=True)
+        lines = output.splitlines()
+        if lines:
+            output = '\n'.join(lines[:-1])  # strip prompt
+        safe_reply(message, _format_shell_output(cmd_text, output), 'Markdown')
         return
 
+    # Interactive shell
     shell_sessions[uid] = True
     ctrl_active[uid] = False
     alt_active[uid] = False
 
-    if uid in shell_live_msg:
-        old_msg = shell_live_msg[uid]
-        old_content = shell_content.get(uid, '')
+    # Clean up any old messages
+    if uid in shell_intro_msg and shell_intro_msg[uid]:
         try:
-            bot.edit_message_text(
-                f"{old_content}\n\n⚙ *Shell Session Ended*",
-                message.chat.id, old_msg, parse_mode='Markdown'
-            )
+            bot.delete_message(chat_id, shell_intro_msg[uid])
         except:
             pass
-        shell_live_msg.pop(uid, None)
-        shell_content.pop(uid, None)
-        shell_last_output.pop(uid, None)
 
     info = _get_or_create_shell(uid)
-    info['chat_id'] = message.chat.id
+    info['chat_id'] = chat_id
 
     intro = (
         "💻 *Private VPS Shell*\n\n"
@@ -1403,29 +1488,21 @@ def cmd_shell(message):
         "• `nvm`  – manage Node.js versions\n\n"
         "Type `exit` or click the *Exit* button to close the shell.\n"
         "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        "```\n"
+        "```bash\nuser@host:~$\n```"
     )
 
-    time.sleep(0.5)
-    initial_output = _get_clean_pty_output(info)
-    if not initial_output:
-        initial_output = "user@host:~$"
-
-    content = intro + initial_output + "\n```"
     mk = build_shell_keyboard(uid)
+    sent = safe_send(chat_id, intro, 'Markdown', mk)
+    shell_intro_msg[uid] = sent.message_id
+    shell_last_prompt[uid] = "user@host:~$"
+    shell_active_msg[uid] = None  # no output yet
 
-    sent = safe_send(message.chat.id, content, 'Markdown', mk)
-    shell_live_msg[uid] = sent.message_id
-    shell_content[uid] = content
-    shell_last_output[uid] = ""
-
-# ==================== SHELL BUTTON CALLBACKS ====================
 @bot.callback_query_handler(func=lambda c: c.data.startswith('shell_'))
 def shell_button_handler(c):
     uid = int(c.data.split('_')[2])
     if c.from_user.id != uid:
         return bot.answer_callback_query(c.id, "Access denied")
-    
+
     action = c.data.split('_')[1]
     info = shell_procs.get(uid)
     if not info:
@@ -1434,10 +1511,14 @@ def shell_button_handler(c):
 
     if action == "ctrl":
         ctrl_active[uid] = not ctrl_active.get(uid, False)
-        if uid in shell_live_msg:
+        # Update keyboard of the current active message
+        active = shell_active_msg.get(uid)
+        if not active and uid in shell_intro_msg:
+            active = shell_intro_msg[uid]
+        if active:
             mk = build_shell_keyboard(uid)
             try:
-                bot.edit_message_reply_markup(c.message.chat.id, shell_live_msg[uid], reply_markup=mk)
+                bot.edit_message_reply_markup(c.message.chat.id, active, reply_markup=mk)
             except:
                 pass
         bot.answer_callback_query(c.id)
@@ -1445,10 +1526,13 @@ def shell_button_handler(c):
 
     if action == "alt":
         alt_active[uid] = not alt_active.get(uid, False)
-        if uid in shell_live_msg:
+        active = shell_active_msg.get(uid)
+        if not active and uid in shell_intro_msg:
+            active = shell_intro_msg[uid]
+        if active:
             mk = build_shell_keyboard(uid)
             try:
-                bot.edit_message_reply_markup(c.message.chat.id, shell_live_msg[uid], reply_markup=mk)
+                bot.edit_message_reply_markup(c.message.chat.id, active, reply_markup=mk)
             except:
                 pass
         bot.answer_callback_query(c.id)
@@ -1461,150 +1545,131 @@ def shell_button_handler(c):
     elif action == "down":
         os.write(info['fd'], b'\x1b[B')
     elif action == "enter":
+        # Execute the current prompt line
+        # We need to send a newline
         os.write(info['fd'], b'\n')
-    elif action == "exit":
-        shell_sessions.pop(uid, None)
-        ctrl_active.pop(uid, None)
-        alt_active.pop(uid, None)
-        _kill_shell(uid)
-        if uid in shell_live_msg:
-            old_content = shell_content.get(uid, '')
-            try:
-                bot.edit_message_text(
-                    f"{old_content}\n\n⚙ *Shell Session Ended*",
-                    c.message.chat.id, shell_live_msg[uid], parse_mode='Markdown'
-                )
-            except:
-                pass
-            shell_live_msg.pop(uid, None)
-            shell_content.pop(uid, None)
-            shell_last_output.pop(uid, None)
+        time.sleep(0.5)
+        output = _get_clean_pty_output(info, clear_buffer=True)
+        lines = output.splitlines()
+        if lines:
+            # The last line is the new prompt
+            new_prompt = lines[-1]
+            shell_last_prompt[uid] = new_prompt
+            # The rest is the command output
+            cmd_output = '\n'.join(lines[:-1])
+            # The command itself is echoed, so we can extract it
+            command_line = lines[0] if lines else ""
+        else:
+            new_prompt = "user@host:~$"
+            cmd_output = ""
+            command_line = ""
+
+        # Treat this as a command execution (like typed message)
+        # Use the same flow as _execute_shell_command but with captured output
+        chat_id = c.message.chat.id
+        prev_active = shell_active_msg.get(uid)
+        is_first = (uid in shell_intro_msg and shell_intro_msg[uid] is not None)
+
+        if is_first:
+            if shell_intro_msg[uid]:
+                _remove_buttons(chat_id, shell_intro_msg[uid])
+                shell_intro_msg[uid] = None
+        if prev_active:
+            _remove_buttons(chat_id, prev_active)
+
+        # Determine if this is exit
+        is_exit = command_line.strip().lower().startswith('exit')
+        full_output = cmd_output.strip() if cmd_output else "(no output)"
+        if is_exit:
+            full_output += "\n\n⚙ *Shell Session Ended*"
+            mk = None
+        else:
+            mk = build_shell_keyboard(uid)
+
+        formatted = _format_shell_output(command_line.strip(), full_output)
+        sent = safe_send(chat_id, formatted, 'Markdown', mk)
+        shell_active_msg[uid] = sent.message_id
+
+        if is_exit:
+            _kill_shell(uid)
+            shell_sessions.pop(uid, None)
+            ctrl_active.pop(uid, None)
+            alt_active.pop(uid, None)
+            shell_intro_msg.pop(uid, None)
+            shell_active_msg.pop(uid, None)
+            shell_last_prompt.pop(uid, None)
+
         bot.answer_callback_query(c.id)
         return
 
+    elif action == "exit":
+        # Inline exit button pressed
+        # Send exit command
+        os.write(info['fd'], b'exit\n')
+        time.sleep(0.5)
+        output = _get_clean_pty_output(info, clear_buffer=True)
+
+        # Remove buttons from current active message, append shell ended
+        active = shell_active_msg.get(uid)
+        if not active and uid in shell_intro_msg:
+            active = shell_intro_msg[uid]
+        if active:
+            _remove_buttons(c.message.chat.id, active)
+            _append_line_to_message(c.message.chat.id, active, "\n⚙ *Shell Session Ended*")
+
+        # Cleanup
+        _kill_shell(uid)
+        shell_sessions.pop(uid, None)
+        ctrl_active.pop(uid, None)
+        alt_active.pop(uid, None)
+        shell_intro_msg.pop(uid, None)
+        shell_active_msg.pop(uid, None)
+        shell_last_prompt.pop(uid, None)
+
+        bot.answer_callback_query(c.id, "Shell closed")
+        return
+
+    else:
+        bot.answer_callback_query(c.id)
+        return
+
+    # For arrow keys & esc, update the prompt line in the active message
     time.sleep(0.3)
-    new_output = _get_clean_pty_output(info)
+    new_output = _get_clean_pty_output(info, clear_buffer=False)  # peek without clearing
+    lines = new_output.splitlines()
+    if lines:
+        prompt_line = lines[-1]
+    else:
+        prompt_line = shell_last_prompt.get(uid, "user@host:~$")
+    shell_last_prompt[uid] = prompt_line
 
-    if uid in shell_live_msg:
-        old_content = shell_content.get(uid, '')
-        if '┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄' in old_content:
-            parts = old_content.split('┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄')
-            if len(parts) >= 2:
-                header = parts[0] + '┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n'
-                old_code = parts[1].split('```')[0] if '```' in parts[1] else parts[1]
-                old_lines = old_code.splitlines()
-                if old_lines:
-                    # Keep all lines except the last prompt line
-                    old_lines = old_lines[:-1]
-                new_content = header + "\n".join(old_lines) + "\n" + new_output + "\n```"
-            else:
-                new_content = old_content
-        else:
-            new_content = old_content
+    active = shell_active_msg.get(uid)
+    if not active and uid in shell_intro_msg:
+        active = shell_intro_msg[uid]
 
-        # Ensure new_content does not exceed Telegram limit
-        if len(new_content) > 4096:
-            # Keep the most recent part
-            excess = len(new_content) - 4096
-            # Try to trim from the beginning of the code block
-            if '```\n' in new_content:
-                parts2 = new_content.split('```\n', 1)
-                header_part = parts2[0] + '```\n'
-                code_part = parts2[1].rsplit('\n```', 1)[0] if '\n```' in parts2[1] else parts2[1]
-                suffix = parts2[1].rsplit('\n```', 1)[1] if '\n```' in parts2[1] else ''
-                if len(code_part) > excess + 200:
-                    code_part = "... (truncated)\n" + code_part[excess+200:]
-                new_content = header_part + code_part + '\n```' + suffix
-
-        mk = build_shell_keyboard(uid)
-        try:
-            bot.edit_message_text(new_content, c.message.chat.id, shell_live_msg[uid],
-                                  parse_mode='Markdown', reply_markup=mk)
-            shell_content[uid] = new_content
-        except Exception as e:
-            if "message is not modified" not in str(e):
-                logger.warning(f"Shell live edit failed: {e}")
-
+    if active:
+        _update_prompt_line(c.message.chat.id, active, prompt_line)
     bot.answer_callback_query(c.id)
-
-# ==================== SHELL SESSION INTERCEPT ====================
-BOT_COMMAND_TEXTS = {
-    "📂 Files", "👤 Profile", "📊 Stats", "❓ Help",
-    "📢 Channel", "📞 Contact", "💻 Shell", "🤖 Clone",
-    "🟢 Running", "💳 Subs", "⏳ Pending", "🤖 Clones",
-    "👑 Admin", "🔒 Lock", "📁 All Files", "📜 Bot Logs"
-}
 
 @bot.message_handler(func=lambda m: m.from_user and shell_sessions.get(m.from_user.id) and m.text)
 def shell_session_input(m):
     uid = m.from_user.id
     text = m.text.strip()
-    
-    if text.startswith('/') or text in BOT_COMMAND_TEXTS:
-        return
-    
-    if text.lower() in ('exit', 'quit', 'q'):
-        shell_sessions.pop(uid, None)
-        ctrl_active.pop(uid, None)
-        alt_active.pop(uid, None)
-        info = shell_procs.get(uid)
-        if info:
-            time.sleep(0.3)
-            final_output = _get_clean_pty_output(info)
-            _kill_shell(uid)
-            if uid in shell_live_msg:
-                old_content = shell_content.get(uid, '')
-                try:
-                    bot.edit_message_text(
-                        f"{old_content}\n\n⚙ *Shell Session Ended*",
-                        m.chat.id, shell_live_msg[uid], parse_mode='Markdown'
-                    )
-                except:
-                    pass
-                shell_live_msg.pop(uid, None)
-                shell_content.pop(uid, None)
-                shell_last_output.pop(uid, None)
-        safe_reply(m, "💻 *Shell closed*", 'Markdown')
+
+    # Skip if text is a bot command or menu button (handled elsewhere, but we avoid interference)
+    if text.startswith('/') or text in {
+        "📂 Files", "👤 Profile", "📊 Stats", "❓ Help",
+        "📢 Channel", "📞 Contact", "💻 Shell", "🤖 Clone",
+        "🟢 Running", "💳 Subs", "⏳ Pending", "🤖 Clones",
+        "👑 Admin", "🔒 Lock", "📁 All Files", "📜 Bot Logs"
+    }:
         return
 
-    info = shell_procs.get(uid)
-    if not info:
-        safe_reply(m, "⚠️ Shell session not active. Use /shell to start one.", 'Markdown')
-        shell_sessions.pop(uid, None)
+    # If the user is in a conversation (env or slug), let that handler take over
+    if uid in waiting_env or uid in waiting_slug:
         return
 
-    if uid in shell_live_msg:
-        _remove_keyboard_from_message(m.chat.id, shell_live_msg[uid])
-        shell_live_msg.pop(uid, None)
-        shell_content.pop(uid, None)
-
-    if ctrl_active.get(uid, False) and len(text) == 1:
-        c = text[0]
-        if 'a' <= c.lower() <= 'z':
-            ctrl_char = chr(ord(c.upper()) - 64)
-            os.write(info['fd'], ctrl_char.encode())
-            ctrl_active[uid] = False
-        else:
-            os.write(info['fd'], (text + '\n').encode())
-    elif alt_active.get(uid, False) and len(text) == 1:
-        os.write(info['fd'], b'\x1b' + text.encode())
-        alt_active[uid] = False
-    else:
-        os.write(info['fd'], (text + '\n').encode())
-
-    time.sleep(0.5)
-    output = _get_clean_pty_output(info)
-    shell_last_output[uid] = output
-
-    formatted = _format_shell_message(text, output)
-    sent = safe_send(m.chat.id, formatted, 'Markdown')
-    mk = build_shell_keyboard(uid)
-    try:
-        bot.edit_message_reply_markup(m.chat.id, sent.message_id, reply_markup=mk)
-    except:
-        pass
-    shell_live_msg[uid] = sent.message_id
-    shell_content[uid] = formatted
+    _execute_shell_command(uid, text, m.chat.id)
 
 # ==================== ENV VAR COMMANDS ====================
 def _env_file_picker(uid, chat_id, action, msg_id=None):
@@ -2900,15 +2965,12 @@ def cb_back(c):
 
 # ==================== BUTTON HANDLERS ====================
 def exit_shell_if_active(uid):
-    shell_sessions.pop(uid, None)
-    ctrl_active.pop(uid, None)
-    alt_active.pop(uid, None)
-    waiting_env.pop(uid, None)
-    waiting_slug.pop(uid, None)
+    # No longer terminating shell here; keep alive unless explicit exit
+    pass
 
 @bot.message_handler(func=lambda m: m.text == "📂 Files")
 def btn_files(m):
-    uid = m.from_user.id; exit_shell_if_active(uid)
+    uid = m.from_user.id
     files = user_files.get(uid, [])
     if not files: return safe_reply(m, "📂 *No files*\nSend a file to upload it", 'Markdown')
     text = f"📂 *Files* ({len(files)})\n"
@@ -2922,7 +2984,7 @@ def btn_files(m):
 
 @bot.message_handler(func=lambda m: m.text == "👤 Profile")
 def btn_profile(m):
-    uid = m.from_user.id; exit_shell_if_active(uid)
+    uid = m.from_user.id
     tier    = get_user_tier(uid).capitalize()
     lim     = get_user_limit(uid); lim_txt = "∞" if lim == float('inf') else str(lim)
     count   = get_user_count(uid)
@@ -2948,7 +3010,7 @@ def btn_profile(m):
 
 @bot.message_handler(func=lambda m: m.text == "📊 Stats")
 def btn_stats(m):
-    uid = m.from_user.id; exit_shell_if_active(uid)
+    uid = m.from_user.id
     running = len([s for s in scripts.values()
                    if s.get('running') and not s['key'].startswith('clone_')])
     lim     = get_user_limit(uid); lim_txt = "∞" if lim == float('inf') else str(lim)
@@ -2965,11 +3027,10 @@ def btn_stats(m):
 
 @bot.message_handler(func=lambda m: m.text == "❓ Help")
 def btn_help(m):
-    exit_shell_if_active(m.from_user.id); cmd_help(m)
+    cmd_help(m)
 
 @bot.message_handler(func=lambda m: m.text == "📢 Channel")
 def btn_channel(m):
-    exit_shell_if_active(m.from_user.id)
     mk = types.InlineKeyboardMarkup()
     mk.add(types.InlineKeyboardButton("📢 Join @BlacScriptz", url=UPDATE_CHANNEL))
     safe_reply(m,
@@ -2979,7 +3040,6 @@ def btn_channel(m):
 
 @bot.message_handler(func=lambda m: m.text == "📞 Contact")
 def btn_contact(m):
-    exit_shell_if_active(m.from_user.id)
     mk = types.InlineKeyboardMarkup(row_width=1)
     mk.add(types.InlineKeyboardButton("💳 Buy Premium", url=OWNER_TG))
     mk.add(types.InlineKeyboardButton("🐛 Report a Bug", url=OWNER_TG))
@@ -2989,7 +3049,6 @@ def btn_contact(m):
 @bot.message_handler(func=lambda m: m.text == "💳 Subs")
 def btn_subs(m):
     if m.from_user.id not in admins: return
-    exit_shell_if_active(m.from_user.id)
     active = [(uid, sub) for uid, sub in subscriptions.items() if sub['expiry'] > datetime.now()]
     if not active: return safe_reply(m, "💳 *Subscriptions*\nNone active", 'Markdown')
     text = f"💳 *Subscriptions* ({len(active)} active)\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
@@ -3000,7 +3059,6 @@ def btn_subs(m):
 @bot.message_handler(func=lambda m: m.text == "🔒 Lock")
 def btn_lock(m):
     if m.from_user.id != OWNER_ID: return
-    exit_shell_if_active(m.from_user.id)
     global bot_locked
     bot_locked = not bot_locked
     icon = "🔒" if bot_locked else "🔓"
@@ -3009,7 +3067,6 @@ def btn_lock(m):
 @bot.message_handler(func=lambda m: m.text == "🟢 Running")
 def btn_running(m):
     if m.from_user.id not in admins: return
-    exit_shell_if_active(m.from_user.id)
     running = [s for s in scripts.values() if s.get('running') and not s['key'].startswith('clone_')]
     if not running: return safe_reply(m, "🟢 *No running scripts*", 'Markdown')
     text = f"🟢 *Running* ({len(running)})\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
@@ -3024,7 +3081,6 @@ def btn_running(m):
 @bot.message_handler(func=lambda m: m.text == "⏳ Pending")
 def btn_pending(m):
     if m.from_user.id not in admins: return
-    exit_shell_if_active(m.from_user.id)
     if not pending: return safe_reply(m, "⏳ *No pending approvals*", 'Markdown')
     for fhash, info in list(pending.items()):
         mk = types.InlineKeyboardMarkup()
@@ -3045,7 +3101,6 @@ def btn_pending(m):
 @bot.message_handler(func=lambda m: m.text == "🤖 Clones")
 def btn_clones(m):
     if m.from_user.id not in admins: return
-    exit_shell_if_active(m.from_user.id)
     clones = {k: v for k, v in scripts.items() if k.startswith('clone_')}
     if not clones: return safe_reply(m, "🤖 *No active clones*", 'Markdown')
     for key, s in clones.items():
@@ -3066,7 +3121,6 @@ def btn_clones(m):
 @bot.message_handler(func=lambda m: m.text == "👑 Admin")
 def btn_admin(m):
     if m.from_user.id not in admins: return
-    exit_shell_if_active(m.from_user.id)
     total_running = len([s for s in scripts.values()
                          if s.get('running') and not s['key'].startswith('clone_')])
     clones = len([s for s in scripts.values() if s['key'].startswith('clone_')])
@@ -3083,55 +3137,11 @@ def btn_admin(m):
 
 @bot.message_handler(func=lambda m: m.text == "💻 Shell")
 def btn_shell(m):
-    uid = m.from_user.id
-    shell_sessions[uid] = True
-    ctrl_active[uid] = False
-    alt_active[uid] = False
-
-    if uid in shell_live_msg:
-        old_msg = shell_live_msg[uid]
-        old_content = shell_content.get(uid, '')
-        try:
-            bot.edit_message_text(
-                f"{old_content}\n\n⚙ *Shell Session Ended*",
-                m.chat.id, old_msg, parse_mode='Markdown'
-            )
-        except:
-            pass
-        shell_live_msg.pop(uid, None)
-        shell_content.pop(uid, None)
-        shell_last_output.pop(uid, None)
-
-    info = _get_or_create_shell(uid)
-    info['chat_id'] = m.chat.id
-
-    intro = (
-        "💻 *Private VPS Shell*\n\n"
-        "Your environment includes:\n"
-        "• `pyenv` – manage Python versions\n"
-        "• `nvm`  – manage Node.js versions\n\n"
-        "Type `exit` or click the *Exit* button to close the shell.\n"
-        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        "```\n"
-    )
-
-    time.sleep(0.5)
-    initial_output = _get_clean_pty_output(info)
-    if not initial_output:
-        initial_output = "user@host:~$"
-
-    content = intro + initial_output + "\n```"
-    mk = build_shell_keyboard(uid)
-
-    sent = safe_send(m.chat.id, content, 'Markdown', mk)
-    shell_live_msg[uid] = sent.message_id
-    shell_content[uid] = content
-    shell_last_output[uid] = ""
+    cmd_shell(m)
 
 @bot.message_handler(func=lambda m: m.text == "📁 All Files")
 def btn_all_files(m):
     if m.from_user.id != OWNER_ID: return
-    exit_shell_if_active(m.from_user.id)
     if not user_files: return safe_reply(m, "📁 *No files uploaded yet*", 'Markdown')
     text = "📁 *All User Files*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
     for uid, files in user_files.items():
@@ -3150,7 +3160,7 @@ def btn_all_files(m):
 
 @bot.message_handler(func=lambda m: m.text == "🤖 Clone")
 def btn_clone(m):
-    exit_shell_if_active(m.from_user.id); cmd_clone(m)
+    cmd_clone(m)
 
 # ==================== ENV & SLUG CONVERSATION ====================
 @bot.message_handler(func=lambda m: m.from_user and m.from_user.id in waiting_env and m.text)
