@@ -1288,14 +1288,16 @@ def _format_shell_message(command, output):
     separator = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
     lines = output.splitlines()
 
-    # Remove echoed command lines from output
+    # The first line of output is the command line (prompt + command)
+    # Keep it as the first line inside the code block
     cleaned_lines = []
-    skip_echo = True
+    found_command_line = False
     for line in lines:
-        if skip_echo and (line.strip().endswith(command.split('\n')[0]) or command.split('\n')[0] in line):
-            skip_echo = False
-            continue
-        cleaned_lines.append(line)
+        if not found_command_line and (line.strip().endswith(command.split('\n')[0]) or command.split('\n')[0] in line):
+            found_command_line = True
+            cleaned_lines.append(line)
+        elif found_command_line:
+            cleaned_lines.append(line)
     cleaned_output = "\n".join(cleaned_lines).rstrip()
 
     # Format the command header
@@ -1479,6 +1481,7 @@ def shell_button_handler(c):
                 old_code = parts[1].split('```')[0] if '```' in parts[1] else parts[1]
                 old_lines = old_code.splitlines()
                 if old_lines:
+                    # Keep all lines except the last prompt line
                     old_lines = old_lines[:-1]
                 new_content = header + "\n".join(old_lines) + "\n" + new_output + "\n```"
             else:
