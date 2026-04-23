@@ -1255,7 +1255,6 @@ def _get_or_create_shell(uid):
                         info['output_buffer'].extend(data)
             except:
                 break
-        # Process died; cleanup will happen on next shell command or exit
 
     threading.Thread(target=reader, daemon=True).start()
     return info
@@ -1281,7 +1280,6 @@ def _format_shell_output(command, full_output):
     if len(full_msg) <= MAX_MSG_LEN:
         return full_msg
 
-    # Truncate from beginning
     max_output_len = MAX_MSG_LEN - base_overhead - len("\n... (truncated)")
     truncated = full_output[-max_output_len:] if max_output_len > 0 else ""
     if truncated != full_output:
@@ -1312,15 +1310,13 @@ def _update_prompt_line(chat_id, msg_id, new_prompt):
         msg = bot.edit_message_text(
             chat_id=chat_id,
             message_id=msg_id,
-            text="...",  # placeholder, will be replaced
+            text="...",
             parse_mode='Markdown'
         )
         current_text = msg.text
     except:
-        # If we can't fetch, assume we stored it
         return
 
-    # Find the last occurrence of a code block and replace its last line
     parts = current_text.rsplit('```bash\n', 1)
     if len(parts) != 2:
         return
@@ -1355,12 +1351,11 @@ def _append_line_to_message(chat_id, msg_id, append_text):
         msg = bot.edit_message_text(
             chat_id=chat_id,
             message_id=msg_id,
-            text="...",  # placeholder
+            text="...",
             parse_mode='Markdown'
         )
         current = msg.text
         if not current.endswith('```'):
-            # Append after the closing ```
             new_text = current.rstrip() + "\n" + append_text
         else:
             new_text = current + "\n" + append_text
@@ -1375,58 +1370,45 @@ def _execute_shell_command(uid, command, chat_id, from_inline=False):
         safe_send(chat_id, "❌ Shell not active.")
         return
 
-    # Clear any stale output before sending command
     _get_clean_pty_output(info, clear_buffer=True)
 
-    # Send the command
     os.write(info['fd'], (command + '\n').encode())
 
-    # Wait for command to finish and capture output
     time.sleep(0.5)
     output = ""
-    deadline = time.time() + 10  # max wait for command prompt to return
+    deadline = time.time() + 10
     while time.time() < deadline:
         chunk = _get_clean_pty_output(info, clear_buffer=True)
         if chunk:
             output += chunk
         if output and ('$' in output or '#' in output):
-            # prompt returned
             break
         time.sleep(0.3)
 
-    # Extract the last line as the new prompt
     lines = output.splitlines()
     prompt_line = lines[-1] if lines else f"user@host:~$ "
     shell_last_prompt[uid] = prompt_line
 
-    # Clean up output: remove the final prompt line (we'll add it ourselves)
     if lines and (lines[-1].endswith('$ ') or lines[-1].endswith('# ')):
         output = '\n'.join(lines[:-1])
 
-    # Build full output with command line
-    # The PTY echoes the command, so we can just use the output as-is
     full_output = output.strip()
     if not full_output:
         full_output = command + "\n(no output)"
 
-    # Determine if this is the first command (intro message still has buttons)
     is_first_command = (uid in shell_intro_msg and shell_intro_msg[uid] is not None)
     prev_active = shell_active_msg.get(uid)
 
     if is_first_command:
-        # Remove buttons from intro message
         if shell_intro_msg[uid]:
             _remove_buttons(chat_id, shell_intro_msg[uid])
-            shell_intro_msg[uid] = None  # mark as static
+            shell_intro_msg[uid] = None
 
     if prev_active:
-        # Remove buttons from previous output
         _remove_buttons(chat_id, prev_active)
 
-    # Send new output message with buttons (unless exiting)
     is_exit = command.strip().lower() in ('exit', 'quit', 'q')
     if is_exit:
-        # Append "Shell Session Ended" to this message
         full_output += "\n\n⚙ *Shell Session Ended*"
         mk = None
     else:
@@ -1437,7 +1419,6 @@ def _execute_shell_command(uid, command, chat_id, from_inline=False):
     shell_active_msg[uid] = sent.message_id
 
     if is_exit:
-        # Cleanup shell
         _kill_shell(uid)
         shell_sessions.pop(uid, None)
         ctrl_active.pop(uid, None)
@@ -1446,32 +1427,12 @@ def _execute_shell_command(uid, command, chat_id, from_inline=False):
         shell_active_msg.pop(uid, None)
         shell_last_prompt.pop(uid, None)
 
-# ==================== SHELL HANDLERS ====================
-@bot.message_handler(commands=['shell'])
-def cmd_shell(message):
-    uid = message.from_user.id
-    chat_id = message.chat.id
-
-    parts = message.text.strip().split(' ', 1)
-    if len(parts) > 1 and parts[1].strip():
-        # One-off command
-        cmd_text = parts[1].strip()
-        info = _get_or_create_shell(uid)
-        os.write(info['fd'], (cmd_text + '\n').encode())
-        time.sleep(0.5)
-        output = _get_clean_pty_output(info, clear_buffer=True)
-        lines = output.splitlines()
-        if lines:
-            output = '\n'.join(lines[:-1])  # strip prompt
-        safe_reply(message, _format_shell_output(cmd_text, output), 'Markdown')
-        return
-
-    # Interactive shell
+# ---- NEW: start interactive shell ----
+def start_interactive_shell(uid, chat_id):
     shell_sessions[uid] = True
     ctrl_active[uid] = False
     alt_active[uid] = False
 
-    # Clean up any old messages
     if uid in shell_intro_msg and shell_intro_msg[uid]:
         try:
             bot.delete_message(chat_id, shell_intro_msg[uid])
@@ -1495,8 +1456,36 @@ def cmd_shell(message):
     sent = safe_send(chat_id, intro, 'Markdown', mk)
     shell_intro_msg[uid] = sent.message_id
     shell_last_prompt[uid] = "user@host:~$"
-    shell_active_msg[uid] = None  # no output yet
+    shell_active_msg[uid] = None
 
+# ---- Updated /shell handler ----
+@bot.message_handler(commands=['shell'])
+def cmd_shell(message):
+    uid = message.from_user.id
+    parts = message.text.strip().split(' ', 1)
+
+    # If arguments given, execute one-off command
+    if len(parts) > 1 and parts[1].strip():
+        cmd_text = parts[1].strip()
+        info = _get_or_create_shell(uid)
+        os.write(info['fd'], (cmd_text + '\n').encode())
+        time.sleep(0.5)
+        output = _get_clean_pty_output(info, clear_buffer=True)
+        lines = output.splitlines()
+        if lines:
+            output = '\n'.join(lines[:-1])
+        safe_reply(message, _format_shell_output(cmd_text, output), 'Markdown')
+        return
+
+    # No arguments → interactive shell
+    start_interactive_shell(uid, message.chat.id)
+
+# ---- Updated button handler ----
+@bot.message_handler(func=lambda m: m.text == "💻 Shell")
+def btn_shell(m):
+    start_interactive_shell(m.from_user.id, m.chat.id)
+
+# ---- Shell inline button callbacks ----
 @bot.callback_query_handler(func=lambda c: c.data.startswith('shell_'))
 def shell_button_handler(c):
     uid = int(c.data.split('_')[2])
@@ -1511,7 +1500,6 @@ def shell_button_handler(c):
 
     if action == "ctrl":
         ctrl_active[uid] = not ctrl_active.get(uid, False)
-        # Update keyboard of the current active message
         active = shell_active_msg.get(uid)
         if not active and uid in shell_intro_msg:
             active = shell_intro_msg[uid]
@@ -1545,27 +1533,20 @@ def shell_button_handler(c):
     elif action == "down":
         os.write(info['fd'], b'\x1b[B')
     elif action == "enter":
-        # Execute the current prompt line
-        # We need to send a newline
         os.write(info['fd'], b'\n')
         time.sleep(0.5)
         output = _get_clean_pty_output(info, clear_buffer=True)
         lines = output.splitlines()
         if lines:
-            # The last line is the new prompt
             new_prompt = lines[-1]
             shell_last_prompt[uid] = new_prompt
-            # The rest is the command output
             cmd_output = '\n'.join(lines[:-1])
-            # The command itself is echoed, so we can extract it
             command_line = lines[0] if lines else ""
         else:
             new_prompt = "user@host:~$"
             cmd_output = ""
             command_line = ""
 
-        # Treat this as a command execution (like typed message)
-        # Use the same flow as _execute_shell_command but with captured output
         chat_id = c.message.chat.id
         prev_active = shell_active_msg.get(uid)
         is_first = (uid in shell_intro_msg and shell_intro_msg[uid] is not None)
@@ -1577,7 +1558,6 @@ def shell_button_handler(c):
         if prev_active:
             _remove_buttons(chat_id, prev_active)
 
-        # Determine if this is exit
         is_exit = command_line.strip().lower().startswith('exit')
         full_output = cmd_output.strip() if cmd_output else "(no output)"
         if is_exit:
@@ -1603,13 +1583,13 @@ def shell_button_handler(c):
         return
 
     elif action == "exit":
-        # Inline exit button pressed
-        # Send exit command
+        # Inline exit button
         os.write(info['fd'], b'exit\n')
         time.sleep(0.5)
-        output = _get_clean_pty_output(info, clear_buffer=True)
+        # Read any remaining output
+        _get_clean_pty_output(info, clear_buffer=True)
 
-        # Remove buttons from current active message, append shell ended
+        # Remove buttons from current active message and append "ended"
         active = shell_active_msg.get(uid)
         if not active and uid in shell_intro_msg:
             active = shell_intro_msg[uid]
@@ -1617,7 +1597,6 @@ def shell_button_handler(c):
             _remove_buttons(c.message.chat.id, active)
             _append_line_to_message(c.message.chat.id, active, "\n⚙ *Shell Session Ended*")
 
-        # Cleanup
         _kill_shell(uid)
         shell_sessions.pop(uid, None)
         ctrl_active.pop(uid, None)
@@ -1628,14 +1607,13 @@ def shell_button_handler(c):
 
         bot.answer_callback_query(c.id, "Shell closed")
         return
-
     else:
         bot.answer_callback_query(c.id)
         return
 
     # For arrow keys & esc, update the prompt line in the active message
     time.sleep(0.3)
-    new_output = _get_clean_pty_output(info, clear_buffer=False)  # peek without clearing
+    new_output = _get_clean_pty_output(info, clear_buffer=False)
     lines = new_output.splitlines()
     if lines:
         prompt_line = lines[-1]
@@ -1651,12 +1629,12 @@ def shell_button_handler(c):
         _update_prompt_line(c.message.chat.id, active, prompt_line)
     bot.answer_callback_query(c.id)
 
+# ---- Shell session intercept (typed commands) ----
 @bot.message_handler(func=lambda m: m.from_user and shell_sessions.get(m.from_user.id) and m.text)
 def shell_session_input(m):
     uid = m.from_user.id
     text = m.text.strip()
 
-    # Skip if text is a bot command or menu button (handled elsewhere, but we avoid interference)
     if text.startswith('/') or text in {
         "📂 Files", "👤 Profile", "📊 Stats", "❓ Help",
         "📢 Channel", "📞 Contact", "💻 Shell", "🤖 Clone",
@@ -1665,7 +1643,6 @@ def shell_session_input(m):
     }:
         return
 
-    # If the user is in a conversation (env or slug), let that handler take over
     if uid in waiting_env or uid in waiting_slug:
         return
 
