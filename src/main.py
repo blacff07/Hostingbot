@@ -451,12 +451,11 @@ def get_user_env(uid, name=None):
 def resource_limits(uid):
     tier = get_user_tier(uid)
     
-    # Owner gets no limits
     if tier == 'owner':
         return lambda: None
     
     ram_limit = TIER_RAM[tier]
-    cpu_seconds = 3600  # 1 hour
+    cpu_seconds = 3600
     
     if tier == 'free':
         nproc = 128
@@ -464,7 +463,7 @@ def resource_limits(uid):
     elif tier == 'premium':
         nproc = 256
         nofile = 8192
-    else:  # admin
+    else:
         nproc = 512
         nofile = 16384
     
@@ -1284,20 +1283,32 @@ def _get_clean_pty_output(info):
     return text
 
 def _format_shell_message(command, output):
-    """Format a command and its output for a new message."""
+    """Format a command and its output for a new message.
+       Multi‑line commands are displayed with each line indented under the $."""
     separator = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
     lines = output.splitlines()
-    
-    # Remove the echoed command line if present
-    if lines and (lines[0].strip().endswith(command) or command in lines[0]):
-        lines = lines[1:]
-    
-    # Join back and remove trailing empty lines
-    cleaned_output = "\n".join(lines).rstrip()
-    if cleaned_output:
-        return f"$ `{command}`\n{separator}\n```\n{cleaned_output}\n```"
+
+    # Remove echoed command lines from output
+    cleaned_lines = []
+    skip_echo = True
+    for line in lines:
+        if skip_echo and (line.strip().endswith(command.split('\n')[0]) or command.split('\n')[0] in line):
+            skip_echo = False
+            continue
+        cleaned_lines.append(line)
+    cleaned_output = "\n".join(cleaned_lines).rstrip()
+
+    # Format the command header
+    if '\n' in command:
+        cmd_lines = command.split('\n')
+        header = "$ `" + cmd_lines[0] + "\n  " + "\n  ".join(cmd_lines[1:]) + "`"
     else:
-        return f"$ `{command}`\n{separator}\n```\n(no output)\n```"
+        header = f"$ `{command}`"
+
+    if cleaned_output:
+        return f"{header}\n{separator}\n```\n{cleaned_output}\n```"
+    else:
+        return f"{header}\n{separator}\n```\n(no output)\n```"
 
 def build_shell_keyboard(uid):
     """Return inline keyboard for shell control."""
@@ -1456,25 +1467,19 @@ def shell_button_handler(c):
         bot.answer_callback_query(c.id)
         return
 
-    # For arrow keys / Esc / Enter, update the live message in-place
     time.sleep(0.3)
     new_output = _get_clean_pty_output(info)
 
     if uid in shell_live_msg:
         old_content = shell_content.get(uid, '')
-        # Keep the command output section and only update the prompt
         if '┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄' in old_content:
             parts = old_content.split('┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄')
             if len(parts) >= 2:
-                # The first part is the header + separator, second part is the code block content
                 header = parts[0] + '┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n'
-                # Extract the old command output (everything before the last prompt line)
                 old_code = parts[1].split('```')[0] if '```' in parts[1] else parts[1]
                 old_lines = old_code.splitlines()
-                # Remove the old prompt line (last line) and replace with new output
                 if old_lines:
-                    old_lines = old_lines[:-1]  # remove old prompt
-                # Append new output
+                    old_lines = old_lines[:-1]
                 new_content = header + "\n".join(old_lines) + "\n" + new_output + "\n```"
             else:
                 new_content = old_content
@@ -1538,13 +1543,11 @@ def shell_session_input(m):
         shell_sessions.pop(uid, None)
         return
 
-    # Remove keyboard from old live message
     if uid in shell_live_msg:
         _remove_keyboard_from_message(m.chat.id, shell_live_msg[uid])
         shell_live_msg.pop(uid, None)
         shell_content.pop(uid, None)
 
-    # Send the command to PTY
     if ctrl_active.get(uid, False) and len(text) == 1:
         c = text[0]
         if 'a' <= c.lower() <= 'z':
@@ -1554,7 +1557,6 @@ def shell_session_input(m):
         else:
             os.write(info['fd'], (text + '\n').encode())
     elif alt_active.get(uid, False) and len(text) == 1:
-        # Send Alt+key as Escape followed by the key
         os.write(info['fd'], b'\x1b' + text.encode())
         alt_active[uid] = False
     else:
