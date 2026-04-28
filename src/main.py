@@ -1397,13 +1397,17 @@ def cb_verify_join(c):
     uid = c.from_user.id
     if user_joined_all_channels(uid):
         bot.answer_callback_query(c.id, "✅ Verified! Welcome.")
+        # Remove the join prompt to keep the chat clean
         bot.delete_message(c.message.chat.id, c.message.message_id)
-        msg = types.Message(message_id=c.message.message_id, from_user=c.from_user, chat=c.message.chat, content_type='text', json={})
-        cmd_start(msg)
+        # Trigger the normal start logic (no fake message needed)
+        cmd_start(c.message)
     else:
-        channel_username = UPDATE_CHANNEL.strip().split('/')[-1]
-        support_username = SUPPORT_CHANNEL.strip().split('/')[-1]
-        bot.answer_callback_query(c.id, f"❌ You haven't joined both channels. Join @{channel_username} and @{support_username} first.", show_alert=True)
+        upd_username = UPDATE_CHANNEL.strip().split('/')[-1]
+        sup_username = SUPPORT_CHANNEL.strip().split('/')[-1]
+        bot.answer_callback_query(c.id,
+            f"❌ You haven't joined both channels.\n"
+            f"Join @{upd_username} and @{sup_username}",
+            show_alert=True)
 
 # ==================== HELP ====================
 def get_help_text(section, uid):
