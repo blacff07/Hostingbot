@@ -35,9 +35,9 @@ TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN')
 OWNER_ID = int(os.getenv('OWNER_ID', '8760823326'))
 ADMIN_ID = int(os.getenv('ADMIN_ID', '8760823326'))
 OWNER_NAME = os.getenv('OWNER_NAME', 'Blac')
-UPDATE_CHANNEL = os.getenv('UPDATE_CHANNEL', 'https://t.me/BlacScript')
-SUPPORT_CHANNEL = os.getenv('SUPPORT_CHANNEL', 'https://t.me/BlacSupport')
-OWNER_USERNAME = 'https://t.me/NottBlac'      # kept for backward compatibility
+UPDATE_CHANNEL = os.getenv('UPDATE_CHANNEL', 'https://t.me/TechTipsCode')
+SUPPORT_CHANNEL = os.getenv('SUPPORT_CHANNEL', 'https://t.me/EliteCodeLab')
+OWNER_USERNAME = 'https://t.me/NottBlac'
 
 # Paths
 BASE_DIR    = os.path.abspath(os.path.dirname(__file__))
@@ -141,11 +141,12 @@ def run_flask():
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 def keep_alive():
-    t = Thread(target=run_flask, daemon=True)
+    t = threading.Thread(target=run_flask, daemon=True)
     t.start()
 
 def get_file_url(uid, name):
-    if not HOST_URL: return None
+    if not HOST_URL:
+        return None
     return f"{HOST_URL}/file/{uid}/{name}"
 
 def get_site_url(slug):
