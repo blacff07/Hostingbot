@@ -1328,39 +1328,31 @@ def user_joined_all_channels(uid):
     try:
         upd_username = UPDATE_CHANNEL.strip().split('/')[-1]
         sup_username = SUPPORT_CHANNEL.strip().split('/')[-1]
-
-        # Use @ username for public channels/groups
         upd_member = bot.get_chat_member(f"@{upd_username}", uid)
         sup_member = bot.get_chat_member(f"@{sup_username}", uid)
-
         upd_ok = upd_member.status not in ('left', 'kicked')
         sup_ok = sup_member.status not in ('left', 'kicked')
-
         logger.info(f"Force‑join check for {uid}: Updates={upd_ok}, Support={sup_ok}")
         return upd_ok and sup_ok
     except Exception as e:
         logger.error(f"Force‑join check error for {uid}: {e}")
         return False
 
+# ==================== COMMANDS ====================
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
     uid = message.from_user.id
-
     if uid in banned_users:
         return safe_reply(message, "🚫 *You are banned from using this bot*", 'Markdown')
 
-    # --- Owner bypass ---
+    # Owner bypass
     if uid == OWNER_ID:
-        active_users.add(uid)
-        update_user_info(message)
+        active_users.add(uid); update_user_info(message)
         name = message.from_user.first_name or "User"
-        role = get_user_tier(uid).capitalize()
-        lim = get_user_limit(uid)
-        lim_txt = "∞" if lim == float('inf') else str(lim)
+        role = get_user_tier(uid).capitalize(); lim = get_user_limit(uid); lim_txt = "∞" if lim == float('inf') else str(lim)
         welcome = f"👑 *Owner Access*\n{role}  •  `{get_user_count(uid)}/{lim_txt}` files\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nSend a file to upload and host it"
         safe_send(message.chat.id, welcome, 'Markdown', build_main_keyboard(uid))
         return
-    # --------------------
 
     if not user_joined_all_channels(uid):
         channel_username = UPDATE_CHANNEL.strip().split('/')[-1]
@@ -1377,18 +1369,13 @@ def cmd_start(message):
             'Markdown', mk)
         return
 
-    # Normal start for verified users
-    active_users.add(uid)
-    update_user_info(message)
+    active_users.add(uid); update_user_info(message)
     name = message.from_user.first_name or "User"
     sub_badge = ""
     if uid in subscriptions and subscriptions[uid]['expiry'] > datetime.now():
-        diff = subscriptions[uid]['expiry'] - datetime.now()
-        d = diff.days; h = diff.seconds // 3600; m = (diff.seconds % 3600) // 60
+        diff = subscriptions[uid]['expiry'] - datetime.now(); d = diff.days; h = diff.seconds // 3600; m = (diff.seconds % 3600) // 60
         sub_badge = f"  ⭐ {d}d {h}h {m}m" if d > 0 else f"  ⭐ {h}h {m}m"
-    role = get_user_tier(uid).capitalize()
-    lim = get_user_limit(uid)
-    lim_txt = "∞" if lim == float('inf') else str(lim)
+    role = get_user_tier(uid).capitalize(); lim = get_user_limit(uid); lim_txt = "∞" if lim == float('inf') else str(lim)
     welcome = f"👋 *{name}*{sub_badge}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n{role}  •  `{get_user_count(uid)}/{lim_txt}` files\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nSend a file to upload and host it"
     safe_send(message.chat.id, welcome, 'Markdown', build_main_keyboard(uid))
 
@@ -1397,9 +1384,7 @@ def cb_verify_join(c):
     uid = c.from_user.id
     if user_joined_all_channels(uid):
         bot.answer_callback_query(c.id, "✅ Verified! Welcome.")
-        # Remove the join prompt to keep the chat clean
         bot.delete_message(c.message.chat.id, c.message.message_id)
-        # Trigger the normal start logic (no fake message needed)
         cmd_start(c.message)
     else:
         upd_username = UPDATE_CHANNEL.strip().split('/')[-1]
@@ -2263,6 +2248,20 @@ def btn_all_files(m):
 def btn_clone(m): cmd_clone(m)
 
 # ==================== ENV VARS DEDICATED BUTTON ====================
+def _env_file_picker(uid, chat_id, action, msg_id=None):
+    """Show a file picker for environment variable operations."""
+    files = [(n, t) for n, t in user_files.get(uid, []) if t == 'executable']
+    if not files:
+        safe_send(chat_id, "❌ No executable files. Upload a script first.", 'Markdown')
+        return
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    for n, _ in files:
+        mk.add(types.InlineKeyboardButton(f"📄 {n}", callback_data=f"envpick_{action}_{uid}_{n}"))
+    if msg_id:
+        safe_edit(chat_id, msg_id, "📂 *Pick a file:*", 'Markdown', mk)
+    else:
+        safe_send(chat_id, "📂 *Pick a file:*", 'Markdown', mk)
+
 @bot.message_handler(func=lambda m: m.text == "🔧 Env Vars")
 def btn_env_vars(m):
     mk = types.InlineKeyboardMarkup(row_width=1)
