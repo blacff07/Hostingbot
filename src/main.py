@@ -1074,15 +1074,15 @@ def _get_or_create_shell(uid):
     return info
 
 def _format_shell_output(command, raw_output):
-    """Plain command header + separator + raw terminal output. No `$`."""
+    """Format: `command` + separator + bash code block containing raw output."""
     separator = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
     MAX_MSG_LEN = 4096
-    header = command
-    base = f"{header}\n{separator}\n{raw_output}"
+    header = f"`{command}`"
+    base = f"{header}\n{separator}\n```bash\n{raw_output}\n```"
     if len(base) <= MAX_MSG_LEN: return base
-    overhead = len(header) + len(separator) + 3
-    truncated = raw_output[-(MAX_MSG_LEN-overhead-3):]
-    return f"{header}\n{separator}\n... (truncated)\n{truncated}"
+    overhead = len(header) + len(separator) + 3 + len("```bash\n\n```")
+    truncated = raw_output[-(MAX_MSG_LEN-overhead):]
+    return f"{header}\n{separator}\n```bash\n... (truncated)\n{truncated}\n```"
 
 def build_shell_keyboard(uid):
     mk = types.InlineKeyboardMarkup(row_width=3)
@@ -1102,7 +1102,7 @@ def build_shell_keyboard(uid):
     return mk
 
 def _update_prompt_line(uid, new_prompt):
-    """Edit only the last line of the active shell message, preserving buttons."""
+    """Edit only the last line inside the bash code block."""
     chat_id = shell_chat_id.get(uid)
     if not chat_id: return
     active = shell_active_msg.get(uid)
@@ -1110,12 +1110,21 @@ def _update_prompt_line(uid, new_prompt):
     if not active: return
     text = shell_active_msg_text.get(uid, "")
     if not text: return
-    lines = text.split('\n')
-    if lines:
-        lines[-1] = new_prompt
-    shell_active_msg_text[uid] = '\n'.join(lines)
+    # Find the last occurrence of ```bash\n and replace the last line before closing ```
+    parts = text.rsplit('\n```bash\n', 1)
+    if len(parts) != 2: return
+    header, rest = parts
+    rest_parts = rest.rsplit('\n```', 1)
+    if len(rest_parts) != 2: return
+    code, suffix = rest_parts
+    code_lines = code.split('\n')
+    if code_lines:
+        code_lines[-1] = new_prompt
+    new_code = '\n'.join(code_lines)
+    new_text = f"{header}\n```bash\n{new_code}\n```{suffix}"
+    shell_active_msg_text[uid] = new_text
     mk = build_shell_keyboard(uid)
-    try: bot.edit_message_text('\n'.join(lines), chat_id, active, parse_mode='', reply_markup=mk)
+    try: bot.edit_message_text(new_text, chat_id, active, parse_mode='', reply_markup=mk)
     except: pass
 
 def _remove_buttons(chat_id, msg_id):
@@ -1123,7 +1132,7 @@ def _remove_buttons(chat_id, msg_id):
     except: pass
 
 def _send_shell_output(uid, command, raw_output, chat_id):
-    """Send output message, handle previous buttons, track active message."""
+    """Send output message with bash code block, handle previous buttons."""
     is_exit = command.strip().lower() in ('exit', 'quit', 'q')
     if is_exit:
         raw_output += "\n\n⚙ *Shell Session Ended*"
@@ -1144,12 +1153,13 @@ def _send_shell_output(uid, command, raw_output, chat_id):
     shell_chat_id[uid] = chat_id
     if is_exit:
         _kill_shell(uid)
-        for k in ['sessions', 'ctrl_active', 'alt_active', 'intro_msg', 'intro_text', 'active_msg', 'active_msg_text', 'last_prompt', 'chat_id']:
-            globals()[f'shell_{k}'].pop(uid, None)
+        for d in [shell_sessions, ctrl_active, alt_active, shell_intro_msg, shell_intro_text,
+                  shell_active_msg, shell_active_msg_text, shell_last_prompt, shell_chat_id]:
+            d.pop(uid, None)
     return sent
 
 def _execute_shell_command(uid, command, chat_id):
-    """Streaming engine: send command, keep editing message until prompt appears."""
+    """Streaming: send command, live edit until prompt appears."""
     info = _get_or_create_shell(uid)
     if not info:
         safe_send(chat_id, "❌ Shell not active.")
@@ -1166,7 +1176,7 @@ def _execute_shell_command(uid, command, chat_id):
         chunk = _get_clean_pty_output(info, clear_buffer=True)
         if chunk:
             output += chunk
-            if "\x03" in chunk: output += "\n"   # Ctrl+C visual
+            if "\x03" in chunk: output += "\n"
 
             formatted = _format_shell_output(command, output.strip())
             if not sent_msg:
@@ -1180,15 +1190,13 @@ def _execute_shell_command(uid, command, chat_id):
                 try: safe_edit(chat_id, sent_msg.message_id, formatted)
                 except: pass
 
-        # Stop when prompt line appears (e.g., root@container:~# )
         lines = output.splitlines()
         if lines and _is_prompt_line(lines[-1]):
             break
-        if time.time() - start_time > 120:   # timeout for long commands
+        if time.time() - start_time > 120:
             break
         time.sleep(0.1)
 
-    # Update state
     prev_active = shell_active_msg.get(uid)
     if prev_active: _remove_buttons(chat_id, prev_active)
     shell_active_msg[uid] = sent_msg.message_id
@@ -1211,7 +1219,7 @@ def start_interactive_shell(uid, chat_id):
         "• `nvm`  – manage Node.js versions\n"
         "• `exit` – close the shell\n"
         "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        "root@container:~#"
+        "```bash\nroot@container:~#\n```"
     )
     mk = build_shell_keyboard(uid)
     sent = safe_send(chat_id, intro, parse='Markdown', markup=mk)
@@ -1247,9 +1255,9 @@ def cmd_shell(message):
     start_interactive_shell(uid, message.chat.id)
 
 @bot.message_handler(func=lambda m: m.text == "💻 Shell")
-def btn_shell(m):
-    if not require_join(m): return
-    start_interactive_shell(m.from_user.id, m.chat.id)
+def btn_shell(msg):
+    if not require_join(msg): return
+    start_interactive_shell(msg.from_user.id, msg.chat.id)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('shell_'))
 def shell_button_handler(c):
@@ -1300,8 +1308,9 @@ def shell_button_handler(c):
             try: bot.edit_message_text(new_text, c.message.chat.id, active, parse_mode='Markdown')
             except: pass
         _kill_shell(uid)
-        for k in ['sessions','ctrl_active','alt_active','intro_msg','intro_text','active_msg','active_msg_text','last_prompt','chat_id']:
-            globals()[f'shell_{k}'].pop(uid, None)
+        for d in [shell_sessions, ctrl_active, alt_active, shell_intro_msg, shell_intro_text,
+                  shell_active_msg, shell_active_msg_text, shell_last_prompt, shell_chat_id]:
+            d.pop(uid, None)
         bot.answer_callback_query(c.id, "Shell closed"); return
     bot.answer_callback_query(c.id)
 
@@ -1516,9 +1525,9 @@ def cmd_botlogs(message):
     safe_reply(message, f"📜 *Bot Logs*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n```\n{display}\n```", 'Markdown', mk)
 
 @bot.message_handler(func=lambda m: m.text == "📜 Bot Logs")
-def btn_botlogs(m):
-    if m.from_user.id != OWNER_ID: return safe_reply(m, "🚫 *Owner Only*", 'Markdown')
-    cmd_botlogs(m)
+def btn_botlogs(msg):
+    if msg.from_user.id != OWNER_ID: return safe_reply(msg, "🚫 *Owner Only*", 'Markdown')
+    cmd_botlogs(msg)
 
 @bot.callback_query_handler(func=lambda c: c.data == "refresh_botlogs")
 def cb_refresh_botlogs(c):
@@ -2143,21 +2152,21 @@ def cb_back(c):
 
 # ==================== BUTTON HANDLERS ====================
 @bot.message_handler(func=lambda m: m.text == "📂 Files")
-def btn_files(m):
-    if not require_join(m): return
-    uid = m.from_user.id; files = user_files.get(uid, [])
-    if not files: return safe_reply(m, "📂 *No files*\nSend a file to upload it", 'Markdown')
+def btn_files(msg):
+    if not require_join(msg): return
+    uid = msg.from_user.id; files = user_files.get(uid, [])
+    if not files: return safe_reply(msg, "📂 *No files*\nSend a file to upload it", 'Markdown')
     text = f"📂 *Files* ({len(files)})\n"; mk = types.InlineKeyboardMarkup(row_width=1)
     for i, (n, t) in enumerate(files):
         dot = "🟢" if t == 'executable' and is_running(uid, n) else ("🌐" if t == 'site' else "⚪")
         icon = "🚀" if t == 'executable' else ("🌐" if t == 'site' else "📄"); dn = n if len(n) < 30 else n[:27] + "..."
         mk.add(types.InlineKeyboardButton(f"{dot} {icon} {dn}", callback_data=f"file_{uid}_{i}"))
-    safe_reply(m, text, 'Markdown', mk)
+    safe_reply(msg, text, 'Markdown', mk)
 
 @bot.message_handler(func=lambda m: m.text == "👤 Profile")
-def btn_profile(m):
-    if not require_join(m): return
-    uid = m.from_user.id; tier = get_user_tier(uid).capitalize(); lim = get_user_limit(uid); lim_txt = "∞" if lim == float('inf') else str(lim)
+def btn_profile(msg):
+    if not require_join(msg): return
+    uid = msg.from_user.id; tier = get_user_tier(uid).capitalize(); lim = get_user_limit(uid); lim_txt = "∞" if lim == float('inf') else str(lim)
     count = get_user_count(uid); joined = get_user_first_seen(uid); sub_line = ""
     if uid in subscriptions:
         exp = subscriptions[uid]['expiry']
@@ -2168,107 +2177,104 @@ def btn_profile(m):
     text = f"👤 *Profile*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nID: `{uid}`\nTier: {tier}\nFiles: `{count}/{lim_txt}`\nRunning: `{running_count}`\nJoined: `{joined}`{sub_line}"
     mk = types.InlineKeyboardMarkup()
     if uid not in admins and uid != OWNER_ID: mk.add(types.InlineKeyboardButton("💳 Buy Premium", url=OWNER_USERNAME))
-    safe_reply(m, text, 'Markdown', mk)
+    safe_reply(msg, text, 'Markdown', mk)
 
 @bot.message_handler(func=lambda m: m.text == "📊 Stats")
-def btn_stats(m):
-    if not require_join(m): return
-    uid = m.from_user.id; running = len([s for s in scripts.values() if s.get('running') and not s['key'].startswith('clone_')])
+def btn_stats(msg):
+    if not require_join(msg): return
+    uid = msg.from_user.id; running = len([s for s in scripts.values() if s.get('running') and not s['key'].startswith('clone_')])
     lim = get_user_limit(uid); lim_txt = "∞" if lim == float('inf') else str(lim)
     try:
         cpu = psutil.cpu_percent(interval=0.5); mem = psutil.virtual_memory()
         sys_line = f"\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nCPU: `{cpu}%`  •  RAM: `{mem.used/(1024**3):.1f}/{mem.total/(1024**3):.1f}GB`"
     except: sys_line = ""
     platform_line = f"\nPlatform: `{HOST_URL}`" if HOST_URL else ""
-
-    # Uptime & ping
     uptime_delta = datetime.now() - bot_start_time
     total_sec = int(uptime_delta.total_seconds())
-    d, rem = divmod(total_sec, 86400); h, rem = divmod(rem, 3600); m, s = divmod(rem, 60)
-    uptime_str = f"{d}d {h}h {m}m {s}s" if d else f"{h}h {m}m {s}s"
+    d, rem = divmod(total_sec, 86400); h, rem = divmod(rem, 3600); mins, sec = divmod(rem, 60)
+    uptime_str = f"{d}d {h}h {mins}m {sec}s" if d else f"{h}h {mins}m {sec}s"
     try:
         t0 = time.time(); bot.get_me(); ping_ms = int((time.time() - t0) * 1000)
         ping_str = f"`{ping_ms}ms`"
     except:
         ping_str = "`N/A`"
-
     text = (f"📊 *Stats*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             f"👥 Users: `{len(active_users)}`\n📁 Files: `{sum(len(f) for f in user_files.values())}`\n"
             f"🚀 Running: `{running}`\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             f"⏱️ Uptime: `{uptime_str}`\n📡 Ping: {ping_str}\n"
             f"Your files: `{get_user_count(uid)}/{lim_txt}`{platform_line}{sys_line}")
-    safe_reply(m, text, 'Markdown')
+    safe_reply(msg, text, 'Markdown')
 
 @bot.message_handler(func=lambda m: m.text == "❓ Help")
-def btn_help(m):
-    if not require_join(m): return
-    cmd_help(m)
+def btn_help(msg):
+    if not require_join(msg): return
+    cmd_help(msg)
 
 @bot.message_handler(func=lambda m: m.text == "📢 Channel")
-def btn_channel(m):
-    if not require_join(m): return
+def btn_channel(msg):
+    if not require_join(msg): return
     mk = types.InlineKeyboardMarkup(); mk.add(types.InlineKeyboardButton("📢 Join Channel", url=UPDATE_CHANNEL))
-    safe_reply(m, "📢 *Updates Channel*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nStay tuned for free source codes and tools.", 'Markdown', mk)
+    safe_reply(msg, "📢 *Updates Channel*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nStay tuned for free source codes and tools.", 'Markdown', mk)
 
 @bot.message_handler(func=lambda m: m.text == "📞 Contact")
-def btn_contact(m):
-    if not require_join(m): return
+def btn_contact(msg):
+    if not require_join(msg): return
     mk = types.InlineKeyboardMarkup(row_width=1)
     mk.add(types.InlineKeyboardButton("💬 Support Group", url=SUPPORT_CHANNEL))
     mk.add(types.InlineKeyboardButton("🐛 Report a Bug", url=OWNER_USERNAME))
-    safe_reply(m, "📞 *Contact & Support*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nReach out via the buttons below.", 'Markdown', mk)
+    safe_reply(msg, "📞 *Contact & Support*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nReach out via the buttons below.", 'Markdown', mk)
 
 @bot.message_handler(func=lambda m: m.text == "💳 Subs")
-def btn_subs(m):
-    if not require_join(m): return
-    if m.from_user.id not in admins: return
+def btn_subs(msg):
+    if not require_join(msg): return
+    if msg.from_user.id not in admins: return
     active = [(uid, sub) for uid, sub in subscriptions.items() if sub['expiry'] > datetime.now()]
-    if not active: return safe_reply(m, "💳 *Subscriptions*\nNone active", 'Markdown')
+    if not active: return safe_reply(msg, "💳 *Subscriptions*\nNone active", 'Markdown')
     text = f"💳 *Subscriptions* ({len(active)} active)\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
     for uid, sub in active: text += f"`{uid}` — {(sub['expiry'] - datetime.now()).days}d\n"
-    safe_reply(m, text, 'Markdown')
+    safe_reply(msg, text, 'Markdown')
 
 @bot.message_handler(func=lambda m: m.text == "🔒 Lock")
-def btn_lock(m):
-    if not require_join(m): return
-    if m.from_user.id != OWNER_ID: return
+def btn_lock(msg):
+    if not require_join(msg): return
+    if msg.from_user.id != OWNER_ID: return
     global bot_locked; bot_locked = not bot_locked
-    safe_reply(m, f"{'🔒' if bot_locked else '🔓'} *{'Locked' if bot_locked else 'Unlocked'}*", 'Markdown')
+    safe_reply(msg, f"{'🔒' if bot_locked else '🔓'} *{'Locked' if bot_locked else 'Unlocked'}*", 'Markdown')
 
 @bot.message_handler(func=lambda m: m.text == "🟢 Running")
-def btn_running(m):
-    if not require_join(m): return
-    if m.from_user.id not in admins: return
+def btn_running(msg):
+    if not require_join(msg): return
+    if msg.from_user.id not in admins: return
     running = [s for s in scripts.values() if s.get('running') and not s['key'].startswith('clone_')]
-    if not running: return safe_reply(m, "🟢 *No running scripts*", 'Markdown')
+    if not running: return safe_reply(msg, "🟢 *No running scripts*", 'Markdown')
     text = f"🟢 *Running* ({len(running)})\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
     for s in running:
         secs = int((datetime.now() - s['start']).total_seconds()); h, r = divmod(secs, 3600); mins, sec = divmod(r, 60)
         uptime = f"{h}h {mins}m" if h else f"{mins}m {sec}s"
         cpu_s, mem_s = get_process_stats(s['process'].pid) if s.get('process') else ("?","?")
         text += f"{s['icon']} `{s['name']}`\nuid `{s['uid']}`  •  {uptime}  •  CPU {cpu_s}  •  RAM {mem_s}\n\n"
-    safe_reply(m, text, 'Markdown')
+    safe_reply(msg, text, 'Markdown')
 
 @bot.message_handler(func=lambda m: m.text == "⏳ Pending")
-def btn_pending(m):
-    if not require_join(m): return
-    if m.from_user.id not in admins: return
-    if not pending: return safe_reply(m, "⏳ *No pending approvals*", 'Markdown')
+def btn_pending(msg):
+    if not require_join(msg): return
+    if msg.from_user.id not in admins: return
+    if not pending: return safe_reply(msg, "⏳ *No pending approvals*", 'Markdown')
     for fhash, info in list(pending.items()):
         mk = types.InlineKeyboardMarkup(); mk.row(types.InlineKeyboardButton("✅ Approve", callback_data=f"app_{fhash}"), types.InlineKeyboardButton("❌ Reject", callback_data=f"rej_{fhash}"))
         path = info.get('path', '')
         try:
             if os.path.exists(path):
-                with open(path, 'rb') as f: bot.send_document(m.chat.id, f, caption=f"📄 `{info['name']}`\nUser: `{info['uid']}`", parse_mode='Markdown', reply_markup=mk)
-            else: safe_send(m.chat.id, f"📄 `{info['name']}`\nUser: `{info['uid']}`\n⚠️ File missing", 'Markdown', mk)
+                with open(path, 'rb') as f: bot.send_document(msg.chat.id, f, caption=f"📄 `{info['name']}`\nUser: `{info['uid']}`", parse_mode='Markdown', reply_markup=mk)
+            else: safe_send(msg.chat.id, f"📄 `{info['name']}`\nUser: `{info['uid']}`\n⚠️ File missing", 'Markdown', mk)
         except: pass
 
 @bot.message_handler(func=lambda m: m.text == "🤖 Clones")
-def btn_clones(m):
-    if not require_join(m): return
-    if m.from_user.id not in admins: return
+def btn_clones(msg):
+    if not require_join(msg): return
+    if msg.from_user.id not in admins: return
     clones = {k: v for k, v in scripts.items() if k.startswith('clone_')}
-    if not clones: return safe_reply(m, "🤖 *No active clones*", 'Markdown')
+    if not clones: return safe_reply(msg, "🤖 *No active clones*", 'Markdown')
     for key, s in clones.items():
         secs = int((datetime.now() - s['start']).total_seconds()); h, r = divmod(secs, 3600); mins, sec = divmod(r, 60)
         alive = "🟢" if s.get('process') and s['process'].poll() is None else "🔴"
@@ -2276,24 +2282,24 @@ def btn_clones(m):
         cpu_s, mem_s = get_process_stats(s['process'].pid) if s.get('process') and s['process'].poll() is None else ("?","?")
         uid_c = s['uid']
         text = f"🤖 *Clone*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n{alive} @{s.get('bot','?')}\nOwner: `{uid_c}`  •  PID: `{pid}`\nUptime: `{h}h {mins}m`\nCPU: `{cpu_s}`  •  RAM: `{mem_s}`"
-        safe_reply(m, text, 'Markdown', _clone_remote_markup(uid_c, s))
+        safe_reply(msg, text, 'Markdown', _clone_remote_markup(uid_c, s))
 
 @bot.message_handler(func=lambda m: m.text == "👑 Admin")
-def btn_admin(m):
-    if not require_join(m): return
-    if m.from_user.id not in admins: return
+def btn_admin(msg):
+    if not require_join(msg): return
+    if msg.from_user.id not in admins: return
     total_running = len([s for s in scripts.values() if s.get('running') and not s['key'].startswith('clone_')])
     clones = len([s for s in scripts.values() if s['key'].startswith('clone_')])
     try: cpu = psutil.cpu_percent(interval=0.3); mem = psutil.virtual_memory(); sys_info = f"\nCPU: `{cpu}%`  •  RAM: `{mem.percent}%`"
     except: sys_info = ""
     text = f"👑 *Admin Panel*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nUsers: `{len(active_users)}`  •  Files: `{sum(len(f) for f in user_files.values())}`\nRunning: `{total_running}`  •  Pending: `{len(pending)}`  •  Clones: `{clones}`{sys_info}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n`/shell`  `/broadcast`  `/restart`\n`/addadmin`  `/removeadmin`\n`/addsub`  `/checksub`  `/botlogs`  `/git`"
-    safe_reply(m, text, 'Markdown')
+    safe_reply(msg, text, 'Markdown')
 
 @bot.message_handler(func=lambda m: m.text == "📁 All Files")
-def btn_all_files(m):
-    if not require_join(m): return
-    if m.from_user.id != OWNER_ID: return
-    if not user_files: return safe_reply(m, "📁 *No files uploaded yet*", 'Markdown')
+def btn_all_files(msg):
+    if not require_join(msg): return
+    if msg.from_user.id != OWNER_ID: return
+    if not user_files: return safe_reply(msg, "📁 *No files uploaded yet*", 'Markdown')
     text = "📁 *All User Files*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
     for uid, files in user_files.items():
         if not files: continue
@@ -2303,13 +2309,13 @@ def btn_all_files(m):
             icon = "🚀" if t == 'executable' else ("🌐" if t == 'site' else "📄"); dot = "🟢 " if t == 'executable' and is_running(uid, n) else ""
             text += f"  {dot}{icon} `{n}`\n"
         text += "\n"
-        if len(text) > 3500: safe_reply(m, text, 'Markdown'); text = ""
-    if text.strip(): safe_reply(m, text, 'Markdown')
+        if len(text) > 3500: safe_reply(msg, text, 'Markdown'); text = ""
+    if text.strip(): safe_reply(msg, text, 'Markdown')
 
 @bot.message_handler(func=lambda m: m.text == "🤖 Clone")
-def btn_clone(m):
-    if not require_join(m): return
-    cmd_clone(m)
+def btn_clone(msg):
+    if not require_join(msg): return
+    cmd_clone(msg)
 
 # ==================== ENV VARS DEDICATED BUTTON ====================
 def _env_file_picker(uid, chat_id, action, msg_id=None):
@@ -2327,13 +2333,13 @@ def _env_file_picker(uid, chat_id, action, msg_id=None):
         safe_send(chat_id, "📂 *Pick a file:*", 'Markdown', mk)
 
 @bot.message_handler(func=lambda m: m.text == "🔧 Env Vars")
-def btn_env_vars(m):
-    if not require_join(m): return
+def btn_env_vars(msg):
+    if not require_join(msg): return
     mk = types.InlineKeyboardMarkup(row_width=1)
     mk.add(types.InlineKeyboardButton("➕ Set Env Var", callback_data="envmenu_set"),
            types.InlineKeyboardButton("📋 List Env Vars", callback_data="envmenu_list"),
            types.InlineKeyboardButton("🗑️ Delete Env Var", callback_data="envmenu_del"))
-    safe_reply(m, "🔧 *Environment Variables*\nChoose an action:", 'Markdown', mk)
+    safe_reply(msg, "🔧 *Environment Variables*\nChoose an action:", 'Markdown', mk)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('envmenu_'))
 def cb_envmenu(c):
@@ -2346,9 +2352,9 @@ def cb_envmenu(c):
 
 # ==================== GITHUB DEDICATED BUTTON ====================
 @bot.message_handler(func=lambda m: m.text == "🌐 GitHub")
-def btn_github(m):
-    if not require_join(m): return
-    safe_reply(m, "🌐 *GitHub Clone*\n\nSend me the GitHub repository URL to clone it.", 'Markdown')
+def btn_github(msg):
+    if not require_join(msg): return
+    safe_reply(msg, "🌐 *GitHub Clone*\n\nSend me the GitHub repository URL to clone it.", 'Markdown')
 
 # ==================== ENV & SLUG CONVERSATION ====================
 @bot.message_handler(func=lambda m: m.from_user and m.from_user.id in waiting_env and m.text)
