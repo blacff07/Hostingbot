@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HostingBot — by Blac (@NottBlac)
+HostingBot — by Blac (@blcqt)
 A professional multi‑user hosting bot with isolated per‑user VPS environments.
 """
 
@@ -37,7 +37,7 @@ ADMIN_ID = int(os.getenv('ADMIN_ID', '8760823326'))
 OWNER_NAME = os.getenv('OWNER_NAME', 'Blac')
 UPDATE_CHANNEL = os.getenv('UPDATE_CHANNEL', 'https://t.me/TechTipsCode')
 SUPPORT_CHANNEL = os.getenv('SUPPORT_CHANNEL', 'https://t.me/EliteCodeLab')
-OWNER_USERNAME = 'https://t.me/NottBlac'
+OWNER_USERNAME = os.getenv('OWNER_USERNAME', 'https://t.me/blcqt')
 
 # Paths
 BASE_DIR    = os.path.abspath(os.path.dirname(__file__))
@@ -155,6 +155,7 @@ def get_site_url(slug):
 
 # ==================== BOT ====================
 bot = telebot.TeleBot(TOKEN)
+bot_start_time = datetime.now()   # uptime tracking
 
 # ==================== DATA ====================
 scripts         = {}
@@ -1072,13 +1073,10 @@ def _get_or_create_shell(uid):
     return info
 
 def _format_shell_output(command, full_output):
+    """Format command + separator + raw output. No `$` prefix."""
     separator = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
     MAX_MSG_LEN = 4096
-    if '\n' in command:
-        cmd_lines = command.split('\n')
-        header = "$ `" + cmd_lines[0] + "\n  " + "\n  ".join(cmd_lines[1:]) + "`"
-    else:
-        header = f"$ `{command}`"
+    header = command           # plain text, no `$`
     base = f"{header}\n{separator}\n{full_output}"
     if len(base) <= MAX_MSG_LEN: return base
     overhead = len(header) + len(separator) + 3
@@ -2171,7 +2169,23 @@ def btn_stats(m):
         sys_line = f"\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nCPU: `{cpu}%`  •  RAM: `{mem.used/(1024**3):.1f}/{mem.total/(1024**3):.1f}GB`"
     except: sys_line = ""
     platform_line = f"\nPlatform: `{HOST_URL}`" if HOST_URL else ""
-    text = f"📊 *Stats*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n👥 Users: `{len(active_users)}`\n📁 Files: `{sum(len(f) for f in user_files.values())}`\n🚀 Running: `{running}`\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nYour files: `{get_user_count(uid)}/{lim_txt}`{platform_line}{sys_line}"
+
+    # Uptime & ping
+    uptime_delta = datetime.now() - bot_start_time
+    total_sec = int(uptime_delta.total_seconds())
+    d, rem = divmod(total_sec, 86400); h, rem = divmod(rem, 3600); m, s = divmod(rem, 60)
+    uptime_str = f"{d}d {h}h {m}m {s}s" if d else f"{h}h {m}m {s}s"
+    try:
+        t0 = time.time(); bot.get_me(); ping_ms = int((time.time() - t0) * 1000)
+        ping_str = f"`{ping_ms}ms`"
+    except:
+        ping_str = "`N/A`"
+
+    text = (f"📊 *Stats*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"👥 Users: `{len(active_users)}`\n📁 Files: `{sum(len(f) for f in user_files.values())}`\n"
+            f"🚀 Running: `{running}`\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"⏱️ Uptime: `{uptime_str}`\n📡 Ping: {ping_str}\n"
+            f"Your files: `{get_user_count(uid)}/{lim_txt}`{platform_line}{sys_line}")
     safe_reply(m, text, 'Markdown')
 
 @bot.message_handler(func=lambda m: m.text == "❓ Help")
