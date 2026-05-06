@@ -1,7 +1,7 @@
 {
   "name": "HostingBot",
   "description": "Multi‑user hosting bot with Docker isolation",
-  "repository": "https://github.com/your-username/your-repo",
+  "repository": "https://github.com/blacff07/Hostingbot",
   "keywords": ["telegram", "bot", "hosting", "docker"],
   "stack": "container",
   "env": {
