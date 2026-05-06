@@ -1,56 +1,48 @@
-# Python
+# Bytecode
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-pythonenv*
+*.pyo
 
-# Databases
+# Environment
+.env
+*.env.local
+
+# Database
+data/
 *.db
-*.sqlite3
+*.db-journal
+*.db-wal
+
+# Uploads & generated files
+uploads/
+extracted/
+pending/
+sites/
+temp/
 
 # Logs
+logs/
 *.log
-execution_logs/
-
-# Uploads
-upload_bots/
-inf/
-
-# Environment variables
-.env
-.env.local
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
 # OS
 .DS_Store
 Thumbs.db
 
 # Docker
-.dockerignore
-Dockerfile
-docker-compose.yml
+docker-compose.override.yml
 
-# Deployment configs
-Procfile
-app.json
-render.yaml
-railway.json
-fly.toml
-ecosystem.config.js
-
-# Keep these files for deployment but ignore local copies
-!requirements.txt
-!pyproject.toml
-!.env.example
+# VPS
+src/uploads/
+src/data/
+src/logs/
+src/extracted/
+src/pending/
+src/sites/
+src/temp/
