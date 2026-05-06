@@ -1,42 +1,45 @@
 {
-  "name": "Universal File Host Bot",
-  "description": "Telegram bot for hosting files and executing code in 30+ languages",
-  "repository": "https://github.com/YOUR_USERNAME/universal-file-host-bot",
-  "logo": "https://raw.githubusercontent.com/YOUR_USERNAME/universal-file-host-bot/main/logo.png",
-  "keywords": ["telegram", "bot", "file-hosting", "code-execution", "python"],
+  "name": "HostingBot",
+  "description": "Multi‑user hosting bot with Docker isolation",
+  "repository": "https://github.com/your-username/your-repo",
+  "keywords": ["telegram", "bot", "hosting", "docker"],
+  "stack": "container",
   "env": {
     "TELEGRAM_BOT_TOKEN": {
-      "description": "Your Telegram Bot Token from @BotFather",
+      "description": "Bot token from @BotFather",
       "required": true
     },
     "OWNER_ID": {
-      "description": "Your Telegram User ID (owner)",
-      "required": true
+      "description": "Owner Telegram user ID",
+      "value": "8760823326"
     },
     "ADMIN_ID": {
-      "description": "Admin Telegram User ID",
-      "required": true
+      "description": "Admin Telegram user ID",
+      "value": "8760823326"
     },
-    "BOT_USERNAME": {
-      "description": "Your bot's username (with @)",
-      "required": true,
-      "value": "@YourBotUsername"
+    "OWNER_NAME": {
+      "description": "Display name",
+      "value": "Blac"
     },
     "UPDATE_CHANNEL": {
-      "description": "Telegram channel for updates",
-      "required": false,
-      "value": "https://t.me/YourChannel"
-    }
-  },
-  "buildpacks": [
-    {
-      "url": "heroku/python"
-    }
-  ],
-  "formation": {
-    "bot": {
-      "quantity": 1,
-      "size": "free"
+      "description": "Updates channel link (force‑join)",
+      "value": "https://t.me/TechTipsCode"
+    },
+    "SUPPORT_CHANNEL": {
+      "description": "Support channel link (force‑join)",
+      "value": "https://t.me/EliteCodeLab"
+    },
+    "OWNER_USERNAME": {
+      "description": "Owner profile link",
+      "value": "https://t.me/blcqt"
+    },
+    "USE_DOCKER": {
+      "description": "Enable Docker isolation? (true/false)",
+      "value": "true"
+    },
+    "DOCKER_IMAGE": {
+      "description": "Docker image name",
+      "value": "hostingbot-sandbox"
     }
   }
 }
