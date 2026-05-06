@@ -1,18 +1,22 @@
-version: '3.8'
+version: "3.8"
 
 services:
-  bot:
+  hostingbot:
     build: .
-    environment:
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - OWNER_ID=${OWNER_ID}
-      - ADMIN_ID=${ADMIN_ID}
-      - BOT_USERNAME=${BOT_USERNAME}
-      - UPDATE_CHANNEL=${UPDATE_CHANNEL}
+    container_name: hostingbot
+    restart: always
     ports:
       - "5000:5000"
+    env_file:
+      - .env
     volumes:
-      - ./upload_bots:/app/upload_bots
-      - ./inf:/app/inf
-      - ./execution_logs:/app/execution_logs
-    restart: unless-stopped
+      - ./uploads:/app/uploads
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./extracted:/app/extracted
+      - ./pending:/app/pending
+      - ./sites:/app/sites
+      - ./temp:/app/temp
+      - /var/run/docker.sock:/var/run/docker.sock
+    working_dir: /app
+    command: python3 src/main.py
