@@ -1,17 +1,27 @@
 services:
   - type: web
-    name: universal-file-host-bot
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python src/main.py
+    name: hostingbot
+    env: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
     envVars:
       - key: TELEGRAM_BOT_TOKEN
-        sync: false
+        sync: false           # secret – not stored in repo
       - key: OWNER_ID
-        sync: false
+        value: 8760823326
       - key: ADMIN_ID
-        sync: false
-      - key: BOT_USERNAME
-        sync: false
+        value: 8760823326
+      - key: OWNER_NAME
+        value: Blac
       - key: UPDATE_CHANNEL
-        sync: false
+        value: https://t.me/TechTipsCode
+      - key: SUPPORT_CHANNEL
+        value: https://t.me/EliteCodeLab
+      - key: OWNER_USERNAME
+        value: https://t.me/blcqt
+      - key: USE_DOCKER
+        value: "true"
+      - key: DOCKER_IMAGE
+        value: hostingbot-sandbox
+      - key: PORT
+        value: 5000
