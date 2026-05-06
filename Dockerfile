@@ -1,29 +1,74 @@
-FROM python:3.11-slim
+# ============================================================
+#  HostingBot Sandbox Image
+#  Isolated runtime environment for user scripts & shells
+# ============================================================
 
-WORKDIR /app
+FROM ubuntu:22.04
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    nodejs \
-    npm \
-    default-jdk \
+LABEL maintainer="Blac (@blcqt)"
+LABEL description="Secure sandbox container for HostingBot users"
+
+# Prevent interactive prompts during build
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install global tools & runtimes available to all users
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        wget \
+        git \
+        nano \
+        vim \
+        python3 \
+        python3-pip \
+        python3-venv \
+        nodejs \
+        npm \
+        build-essential \
+        g++ \
+        gcc \
+        default-jdk \
+        php \
+        ruby \
+        lua5.3 \
+        perl \
+        r-base \
+        unzip \
+        zip \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Pre‑install commonly used Python packages
+RUN pip3 install --no-cache-dir \
+    requests \
+    flask \
+    numpy \
+    pandas \
+    matplotlib \
+    beautifulsoup4 \
+    Pillow \
+    python-dotenv \
+    cryptography \
+    pyyaml
 
-# Copy application code
-COPY src/ ./src/
-COPY .env.example .env
+# Pre‑install commonly used Node.js packages
+RUN npm install -g --silent \
+    express \
+    axios \
+    lodash \
+    moment \
+    dotenv
 
-# Create necessary directories
-RUN mkdir -p /app/upload_bots /app/inf /app/execution_logs
+# Create non‑root sandbox user
+RUN useradd --create-home --shell /bin/bash sandbox \
+    && echo 'sandbox ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/sandbox
 
-# Expose port
-EXPOSE 5000
+# Set working directory
+WORKDIR /home/sandbox
 
-# Run the application
-CMD ["python", "src/main.py"]
+# Switch to sandbox user
+USER sandbox
+
+# Default command
+CMD ["/bin/bash"]
