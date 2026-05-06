@@ -1,7 +1,18 @@
 [project]
-name = "python-template"
-version = "0.1.0"
-description = ""
-authors = ["Your Name <you@example.com>"]
-requires-python = ">=3.11"
-dependencies = []
+name = "HostingBot"
+version = "2.0.0"
+description = "A secure multi‑user hosting bot with per‑user Docker isolation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Blac", email = "blcqt@example.com"}
+]
+dependencies = [
+    "pyTelegramBotAPI>=4.14.0",
+    "flask>=3.0.0",
+    "psutil>=5.9.0"
+]
+
+[project.urls]
+Repository = "https://github.com/your-username/your-repo"
