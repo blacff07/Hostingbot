@@ -921,7 +921,6 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
         use_docker_exec = False
         container_id = shell_procs.get(uid, {}).get('container_id')
         if USE_DOCKER and container_id:
-            # verify container still running
             try:
                 subprocess.run(['docker', 'inspect', container_id], capture_output=True, check=True)
                 use_docker_exec = True
@@ -1003,13 +1002,11 @@ def _do_execute(uid, file_path, msg, work_dir, name, ext, key, zip_name=None):
 
         # === Docker‑aware execution wrapper ===
         if use_docker_exec:
-            # Copy script and compiled binaries into container
             subprocess.run(['docker', 'cp', file_path, f"{container_id}:/home/sandbox/{name}"], check=False)
             for f in [out] if 'out' in locals() else []:
                 subprocess.run(['docker', 'cp', f, f"{container_id}:/home/sandbox/{os.path.basename(f)}"], check=False)
             exec_cmd = ['docker', 'exec', '-i'] + [f'-e {k}={v}' for k,v in env.items()] + [container_id]
             full_cmd = exec_cmd + cmd
-            # adjust cmd[0] to be relative to container home
             cmd[0] = os.path.join('/home/sandbox', os.path.basename(cmd[0]))
         else:
             full_cmd = cmd
