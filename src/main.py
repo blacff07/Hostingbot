@@ -341,7 +341,14 @@ def stop_script(uid, name):
         if scripts[key].get('process'):
             try: kill_process_tree(scripts[key]['process'].pid)
             except: pass
-    time.sleep(0.5)
+    # Wait until the process is truly gone
+    time.sleep(1)
+    # Verify
+    try:
+        if scripts.get(key) and scripts[key].get('process'):
+            if scripts[key]['process'].poll() is None:
+                kill_process_tree(scripts[key]['process'].pid)
+    except: pass
     return True
 
 def is_running(uid, name):
@@ -1075,7 +1082,6 @@ def ensure_docker_image():
         subprocess.run(['docker', 'info'], capture_output=True, check=True, timeout=5)
     except Exception as e:
         logger.warning(f"Docker unavailable – will use system‑user isolation. ({e})")
-        # Do not crash – just log and continue (shell will fall back)
         return
     try:
         subprocess.run(['docker', 'inspect', DOCKER_IMAGE], capture_output=True, check=True)
@@ -1115,13 +1121,11 @@ def _launch_shell(uid):
 
     # 1. Try Docker
     if USE_DOCKER:
-        # Check if Docker daemon is reachable
         try:
             subprocess.run(['docker', 'info'], capture_output=True, check=True, timeout=5)
         except:
             logger.info("Docker not reachable, falling back to system‑user isolation.")
         else:
-            # Docker is available, attempt container launch
             container_name = f"hostingbot_{uid}_{int(time.time())}"
             tier = get_user_tier(uid)
             ram = get_user_ram_limit(uid)
@@ -1221,7 +1225,6 @@ def _stream_pty_output(uid, chat_id, command_header):
                 chunk = os.read(fd, 4096)
                 if not chunk:
                     break
-                # Clean ANSI escapes
                 ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
                 cleaned = ansi_escape.sub('', chunk.decode('utf-8', errors='replace'))
                 output += cleaned
@@ -1331,7 +1334,7 @@ def shell_button_handler(c):
 # ==================== SHELL MESSAGE HANDLER (placed LAST) ====================
 MAIN_MENU_BUTTONS = {
     "📂 Files", "👤 Profile", "📊 Stats", "❓ Help",
-    "📢 Channel", "📞 Contact", "💻 Shell", "🤖 Clone",
+    "🎧 Owner", "📞 Contact", "💻 Shell", "🤖 Clone",
     "🔧 Env Vars", "🌐 GitHub",
     "🟢 Running", "💳 Subs", "⏳ Pending", "🤖 Clones",
     "👑 Admin", "🔒 Lock", "📁 All Files", "📜 Bot Logs"
@@ -1365,6 +1368,10 @@ def start_interactive_shell(uid, chat_id):
         try: bot.delete_message(chat_id, shell_intro_msg[uid])
         except: pass
     master_fd, pid, identifier = _launch_shell(uid)
+    if not master_fd:
+        safe_send(chat_id, "❌ Could not start shell. Docker is unavailable and system user creation failed. Run the bot as root or set USE_DOCKER=false.", 'Markdown')
+        shell_sessions.pop(uid, None)
+        return
     shell_procs[uid] = {'fd': master_fd, 'pid': pid,
                         'container_id': identifier if USE_DOCKER else None,
                         'username': identifier if not USE_DOCKER else None}
@@ -1894,7 +1901,7 @@ def cb_broadcast_confirm(c):
         except: failed += 1
     safe_edit(c.message.chat.id, c.message.message_id, f"📢 *Done*\n✅ {sent} sent  •  ❌ {failed} failed", 'Markdown')
 
-# ==================== UPLOAD HANDLER ====================
+# ==================== UPLOAD HANDLER (FIXED) ====================
 @bot.message_handler(content_types=['document'])
 def handle_upload(message):
     uid = message.from_user.id; update_user_info(message)
@@ -1907,19 +1914,23 @@ def handle_upload(message):
     try:
         data = bot.download_file(file_info.file_path); folder = get_user_folder(uid); uid_s = message.document.file_unique_id; temp = os.path.join(folder, f"temp_{uid_s}_{name}")
         with open(temp, 'wb') as f: f.write(data)
+
         old_path = os.path.join(folder, name)
         if os.path.exists(old_path):
-            if hashlib.md5(open(old_path,'rb').read()).hexdigest() == hashlib.md5(data).hexdigest():
-                os.remove(temp); safe_edit(status.chat.id, status.message_id, f"⚠️ *Same file detected*\n`{name}`\n\nTelegram served a cached copy — no changes found.\nRename the file slightly and re-upload.", 'Markdown'); return
+            # Kill old instance before removal
             old_key = f"{uid}_{name}"
-            if old_key in scripts: scripts[old_key]['stopped_intentionally'] = True
-            stop_script(uid, name)
-            for d in os.listdir(EXTRACT_DIR):
-                if d.startswith(f"{uid}_"): shutil.rmtree(os.path.join(EXTRACT_DIR, d), ignore_errors=True)
-            if old_key in scripts: del scripts[old_key]
-            time.sleep(1)
-            try: os.remove(old_path)
-            except Exception as e: logger.warning(f"Could not remove old file {old_path}: {e}")
+            if old_key in scripts:
+                scripts[old_key]['stopped_intentionally'] = True
+                stop_script(uid, name)
+                # Wait and ensure the old process is dead
+                time.sleep(1)
+                # Remove old file
+                try: os.remove(old_path)
+                except: pass  # already gone
+            else:
+                try: os.remove(old_path)
+                except: pass
+
         if uid == OWNER_ID or uid in admins: safe_file, scan = True, "Trusted"
         elif ext == '.zip': safe_file, scan = scan_zip_contents(temp)
         else: safe_file, scan = check_malicious(temp)
@@ -1939,7 +1950,9 @@ def handle_upload(message):
             try:
                 with open(pending_path, 'rb') as f: bot.send_document(OWNER_ID, f, caption=f"🚨 *Pending*\n📄 `{name}`\n{chr(10).join(user_parts)}\n⚠️ {scan}", parse_mode='Markdown', reply_markup=mk)
             except: bot.send_message(OWNER_ID, f"🚨 *Pending*\n📄 `{name}`\n{chr(10).join(user_parts)}\n⚠️ {scan}\n🆔 `{fhash}`", parse_mode='Markdown', reply_markup=mk); return
-        final = os.path.join(folder, name); shutil.move(temp, final)
+        final = os.path.join(folder, name)
+        shutil.move(temp, final)
+
         if ext == '.zip' and is_website_zip(final):
             ftype = 'site'; user_files.setdefault(uid, []); user_files[uid] = [(n, t) for n, t in user_files[uid] if n != name]; user_files[uid].append((name, ftype))
             conn = sqlite3.connect(DB_PATH); conn.execute('INSERT OR REPLACE INTO files VALUES (?,?,?)', (uid, name, ftype)); conn.commit(); conn.close()
@@ -2246,18 +2259,26 @@ def btn_help(msg):
     if not require_join(msg): return
     cmd_help(msg)
 
-@bot.message_handler(func=lambda m: m.text == "📢 Channel")
-def btn_channel(msg):
+@bot.message_handler(func=lambda m: m.text == "🎧 Owner")
+def btn_owner(msg):
     if not require_join(msg): return
-    mk = types.InlineKeyboardMarkup(); mk.add(types.InlineKeyboardButton("📢 Join Channel", url=UPDATE_CHANNEL))
-    safe_reply(msg, "📢 *Updates Channel*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nStay tuned for free source codes and tools.", 'Markdown', mk)
+    owner_msg = (
+        "🎧 *Owner's Note*\n"
+        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+        "Blac is a passionate developer building powerful tools for the community.\n"
+        "Stay tuned for more amazing projects!\n\n"
+        "– *Blac*"
+    )
+    mk = types.InlineKeyboardMarkup()
+    mk.add(types.InlineKeyboardButton("📞 Contact Owner", url=OWNER_USERNAME))
+    safe_reply(msg, owner_msg, 'Markdown', mk)
 
 @bot.message_handler(func=lambda m: m.text == "📞 Contact")
 def btn_contact(msg):
     if not require_join(msg): return
     mk = types.InlineKeyboardMarkup(row_width=1)
-    mk.add(types.InlineKeyboardButton("💬 Support Group", url=SUPPORT_CHANNEL))
-    mk.add(types.InlineKeyboardButton("🐛 Report a Bug", url=OWNER_USERNAME))
+    mk.add(types.InlineKeyboardButton("🎗 Updates", url=UPDATE_CHANNEL))
+    mk.add(types.InlineKeyboardButton("💭 Support", url=SUPPORT_CHANNEL))
     safe_reply(msg, "📞 *Contact & Support*\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nReach out via the buttons below.", 'Markdown', mk)
 
 @bot.message_handler(func=lambda m: m.text == "💳 Subs")
@@ -2464,7 +2485,7 @@ def build_main_keyboard(uid):
     mk = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     mk.row(types.KeyboardButton("📂 Files"), types.KeyboardButton("👤 Profile"))
     mk.row(types.KeyboardButton("📊 Stats"), types.KeyboardButton("❓ Help"))
-    mk.row(types.KeyboardButton("📢 Channel"), types.KeyboardButton("📞 Contact"))
+    mk.row(types.KeyboardButton("🎧 Owner"), types.KeyboardButton("📞 Contact"))
     mk.row(types.KeyboardButton("💻 Shell"), types.KeyboardButton("🤖 Clone"))
     mk.row(types.KeyboardButton("🔧 Env Vars"), types.KeyboardButton("🌐 GitHub"))
     if is_admin:
