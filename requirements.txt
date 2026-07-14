@@ -1,0 +1,21 @@
+# Core dependencies
+pyTelegramBotAPI>=4.10.0
+python-dotenv==1.0.0
+psutil==5.9.8
+requests==2.31.0
+flask==3.0.0
+pyrogram>=2.0.0
+tgcrypto>=1.2.5
+phonenumbers>=8.12.0
+
+# Additional common tools for hosting
+gunicorn==21.2.0
+redis==5.0.0
+celery==5.3.4
+sqlalchemy==2.0.23
+pymongo==4.6.1
+aiohttp==3.9.1
+websockets==12.0
+FastAPI==0.104.1
+uvicorn==0.24.0
+boto3==1.28.85
