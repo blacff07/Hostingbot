@@ -1,0 +1,21 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Bot runtime data
+uploads/
+data/
+logs/
+temp/
+extracted/
+sites/
+pending/
+clone_*/
+*.db
+
+# Docker
+*.log

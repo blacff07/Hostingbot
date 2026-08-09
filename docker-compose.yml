@@ -1,0 +1,31 @@
+services:
+  hostingbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hostingbot
+    container_name: hostingbot
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      OWNER_ID: ${OWNER_ID}
+      ADMIN_ID: ${ADMIN_ID}
+      OWNER_USERNAME: ${OWNER_USERNAME}
+      UPDATE_CHANNEL: ${UPDATE_CHANNEL}
+      SUPPORT_CHANNEL: ${SUPPORT_CHANNEL}
+      AUTO_IP: ${AUTO_IP:-true}
+      PORT: ${PORT:-5000}
+      USE_DOCKER: "true"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "${PORT:-5000}:${PORT:-5000}"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import requests; requests.get('http://localhost:${PORT:-5000}/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
