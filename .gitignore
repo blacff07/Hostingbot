@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+uploads/
+data/
+logs/
+temp/
+extracted/
+sites/
+pending/
+clone_*/
+*.db
+*.log
